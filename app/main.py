@@ -5,7 +5,7 @@ from fastapi.security import HTTPBasic
 from contextlib import asynccontextmanager
 from app.core.config import config
 from app.core.scheduler import setup_scheduler
-from app.api import stock_routes, trade_routes, portfolio_routes, watchlist_routes, strategy_routes
+from app.api import stock_routes, trade_routes, portfolio_routes, watchlist_routes, strategy_routes, kakao_routes
 from app.utils.kr_holiday import get_market_status
 from datetime import datetime
 
@@ -27,6 +27,7 @@ app.include_router(trade_routes.router)
 app.include_router(portfolio_routes.router)
 app.include_router(watchlist_routes.router)
 app.include_router(strategy_routes.router)
+app.include_router(kakao_routes.router)
 
 @app.get("/")
 async def root():

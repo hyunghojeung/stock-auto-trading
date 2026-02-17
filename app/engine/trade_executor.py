@@ -3,6 +3,7 @@ from datetime import datetime, date, timedelta
 from app.core.database import db
 from app.services.kis_stock import get_current_price, get_minute_candles, get_orderbook
 from app.services.kis_order import buy_stock, sell_stock
+from app.services.kakao_alert import kakao
 from app.engine.dip_detector import detect_dip
 from app.engine.trailing_stop import TrailingStop
 from app.engine.stop_loss import check_stop_loss
@@ -103,6 +104,7 @@ async def _check_buy(strategy, stock, is_live):
 
                 _log("매매판단", f"매수: {stock['stock_name']} {price}원 {quantity}주", sid)
                 print(f"[매수] {stock['stock_name']} {price}원 {quantity}주")
+                kakao.alert_buy(stock['stock_name'], price, quantity, ','.join(result['signals']))
 
     except Exception as e:
         print(f"[매수 확인 오류] {code}: {e}")
@@ -193,6 +195,7 @@ async def _check_sell(strategy, holding, is_live):
 
                 _log("매매판단", f"매도: {holding['stock_name']} {current_price}원 순수익:{profit['net_profit']}원 ({sell_reason})", sid)
                 print(f"[매도] {holding['stock_name']} {current_price}원 순수익:{profit['net_profit']}원")
+                kakao.alert_sell(holding['stock_name'], buy_price, current_price, quantity, profit['net_profit'], sell_reason)
 
     except Exception as e:
         print(f"[매도 확인 오류] {code}: {e}")
@@ -218,6 +221,7 @@ async def _handle_loss(sid, code, name):
             "block_reason": "당일3연속손절", "consecutive_losses": consecutive,
             "unblock_at": (datetime.now().replace(hour=23, minute=59)).isoformat(),
         }).execute()
+        kakao.alert_blocked(name, f"연속 {consecutive}회 손절 → 당일 매매 중지", "오늘 자정")
     else:
         # 3일 차단
         unblock = datetime.now() + timedelta(days=3)
@@ -226,6 +230,7 @@ async def _handle_loss(sid, code, name):
             "block_reason": "3일차단", "consecutive_losses": 1,
             "unblock_at": unblock.isoformat(),
         }).execute()
+        kakao.alert_blocked(name, "손절 → 3일 재매수 금지", unblock.strftime("%m/%d"))
 
 async def _is_blocked(sid, code):
     """차단 종목 확인"""
@@ -304,6 +309,7 @@ async def generate_daily_report():
         }).execute()
 
         print(f"[리포트] {s['name']}: 자산 {total_asset:,.0f}원, 오늘 수익 {total_profit:,.0f}원")
+        kakao.alert_daily_report(s['name'], total_asset, total_profit, wins, losses, win_rate)
 
 def _log(log_type, message, sid=None):
     try:
