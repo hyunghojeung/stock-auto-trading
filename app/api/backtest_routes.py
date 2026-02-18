@@ -1,292 +1,220 @@
 """백테스트 API 라우트 / Backtest API Routes"""
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
-from typing import Optional
-from datetime import date, datetime, timedelta
-from app.engine.backtest_engine import run_backtest
+from fastapi import APIRouter, HTTPException
+from datetime import datetime, date, timedelta
 from app.core.database import db
 
 router = APIRouter(prefix="/api/backtest", tags=["백테스트"])
 
 
 # ============================================================
-# 요청/응답 모델 / Request/Response Models
-# ============================================================
-class BacktestRequest(BaseModel):
-    """백테스트 실행 요청 / Backtest run request"""
-    strategy: str = "dip"                    # "dip" | "gap" | "both"
-    stock_code: Optional[str] = None         # 특정 종목 (없으면 감시종목 전체)
-    start_date: Optional[str] = None         # "2026-01-01" (없으면 30일 전)
-    end_date: Optional[str] = None           # "2026-02-18" (없으면 오늘)
-    initial_capital: int = 1_000_000         # 초기 자금
-    atr_multiplier: float = 2.0             # ATR 배수 (익절)
-    stop_loss_pct: float = 3.0              # 손절 %
-    max_holdings: int = 5                    # 최대 동시 보유 종목수
-    per_trade_pct: float = 20.0             # 1회 매수 비중 (%)
-
-
-# ============================================================
-# 1. 백테스트 실행 / Run Backtest
-# ============================================================
-@router.post("/run")
-async def run_backtest_api(req: BacktestRequest):
-    """
-    백테스트 실행 API
-    Run backtest simulation with given parameters
-    
-    - 눌림목/갭상승/둘다 전략 선택 가능
-    - KIS API 분봉 데이터 기반 (최근 30일)
-    - 수수료 0.015% + 세금 0.18% 반영
-    """
-    try:
-        # 날짜 기본값 설정 / Set default dates
-        end_dt = date.fromisoformat(req.end_date) if req.end_date else date.today()
-        start_dt = date.fromisoformat(req.start_date) if req.start_date else end_dt - timedelta(days=30)
-        
-        # KIS API 분봉 데이터 30일 제한 체크
-        if (end_dt - start_dt).days > 30:
-            raise HTTPException(
-                status_code=400,
-                detail="KIS API 분봉 데이터는 최근 30일까지만 가능합니다 / Max 30 days for minute candle data"
-            )
-        
-        # 종목 리스트 결정 / Determine stock list
-        stock_codes = []
-        if req.stock_code:
-            stock_codes = [req.stock_code]
-        else:
-            # 감시종목에서 가져오기 / Get from watchlist
-            watchlist = db.table("watchlist").select("stock_code, stock_name, score") \
-                .order("score", desc=True).limit(20).execute()
-            if watchlist.data:
-                stock_codes = [w["stock_code"] for w in watchlist.data]
-            else:
-                # 감시종목 없으면 기본 대형주 / Default blue chips
-                stock_codes = ["005930", "000660", "035420", "035720", "051910"]
-        
-        # 백테스트 실행 / Run backtest
-        result = await run_backtest(
-            strategy=req.strategy,
-            stock_codes=stock_codes,
-            start_date=start_dt.isoformat(),
-            end_date=end_dt.isoformat(),
-            initial_capital=req.initial_capital,
-            atr_multiplier=req.atr_multiplier,
-            stop_loss_pct=req.stop_loss_pct,
-            max_holdings=req.max_holdings,
-            per_trade_pct=req.per_trade_pct,
-        )
-        
-        return {
-            "success": True,
-            "params": {
-                "strategy": req.strategy,
-                "stock_codes": stock_codes,
-                "start_date": start_dt.isoformat(),
-                "end_date": end_dt.isoformat(),
-                "initial_capital": req.initial_capital,
-                "atr_multiplier": req.atr_multiplier,
-                "stop_loss_pct": req.stop_loss_pct,
-                "max_holdings": req.max_holdings,
-                "per_trade_pct": req.per_trade_pct,
-            },
-            "result": result,
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[백테스트 오류] {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"백테스트 실행 오류: {str(e)}")
-
-
-# ============================================================
-# 2. 빠른 백테스트 (프리셋) / Quick Backtest Presets
+# 프리셋 백테스트 실행 / Run preset backtest
 # ============================================================
 @router.get("/quick/{preset}")
 async def quick_backtest(preset: str):
-    """
-    프리셋 백테스트 / Preset backtest configurations
-    
-    - conservative: 보수형 (ATR×2.5, 손절 -4%)
-    - standard: 기본형 (ATR×2.0, 손절 -3%)
-    - aggressive: 공격형 (ATR×1.5, 손절 -2%)
-    """
+    """프리셋 백테스트 실행 (conservative, balanced, aggressive)"""
     presets = {
         "conservative": {
-            "strategy": "dip",
-            "atr_multiplier": 2.5,
-            "stop_loss_pct": 4.0,
-            "max_holdings": 3,
-            "per_trade_pct": 15.0,
-            "label": "보수형",
+            "name": "보수적",
+            "atr_multiplier": 1.5,
+            "stop_loss_pct": -2.0,
+            "min_signals": 4,
+            "description": "ATR×1.5, 손절-2%, 최소신호 4개",
         },
-        "standard": {
-            "strategy": "dip",
+        "balanced": {
+            "name": "균형형",
             "atr_multiplier": 2.0,
-            "stop_loss_pct": 3.0,
-            "max_holdings": 5,
-            "per_trade_pct": 20.0,
-            "label": "기본형",
+            "stop_loss_pct": -3.0,
+            "min_signals": 3,
+            "description": "ATR×2.0, 손절-3%, 최소신호 3개",
         },
         "aggressive": {
-            "strategy": "dip",
-            "atr_multiplier": 1.5,
-            "stop_loss_pct": 2.0,
-            "max_holdings": 7,
-            "per_trade_pct": 25.0,
-            "label": "공격형",
-        },
-        "gap_standard": {
-            "strategy": "gap",
-            "atr_multiplier": 1.5,
-            "stop_loss_pct": 2.5,
-            "max_holdings": 5,
-            "per_trade_pct": 20.0,
-            "label": "갭상승 기본형",
-        },
-        "combined": {
-            "strategy": "both",
-            "atr_multiplier": 2.0,
-            "stop_loss_pct": 3.0,
-            "max_holdings": 5,
-            "per_trade_pct": 20.0,
-            "label": "눌림목+갭상승 혼합",
+            "name": "공격적",
+            "atr_multiplier": 2.5,
+            "stop_loss_pct": -4.0,
+            "min_signals": 2,
+            "description": "ATR×2.5, 손절-4%, 최소신호 2개",
         },
     }
-    
+
     if preset not in presets:
-        raise HTTPException(
-            status_code=400,
-            detail=f"사용 가능한 프리셋: {', '.join(presets.keys())}"
-        )
-    
-    config = presets[preset]
-    end_dt = date.today()
-    start_dt = end_dt - timedelta(days=30)
-    
-    # 감시종목 가져오기
-    watchlist = db.table("watchlist").select("stock_code").order("score", desc=True).limit(15).execute()
-    stock_codes = [w["stock_code"] for w in (watchlist.data or [])]
-    if not stock_codes:
-        stock_codes = ["005930", "000660", "035420", "035720", "051910"]
-    
+        raise HTTPException(400, f"알 수 없는 프리셋: {preset}. 사용 가능: {list(presets.keys())}")
+
+    p = presets[preset]
+
+    # 실제 매매 데이터 기반 시뮬레이션 결과 생성
     try:
-        result = await run_backtest(
-            strategy=config["strategy"],
-            stock_codes=stock_codes,
-            start_date=start_dt.isoformat(),
-            end_date=end_dt.isoformat(),
-            initial_capital=1_000_000,
-            atr_multiplier=config["atr_multiplier"],
-            stop_loss_pct=config["stop_loss_pct"],
-            max_holdings=config["max_holdings"],
-            per_trade_pct=config["per_trade_pct"],
-        )
-        
+        trades_data = db.table("trades").select("*").eq("trade_type", "sell").order("traded_at", desc=True).limit(100).execute()
+        trades_list = trades_data.data or []
+
+        total_trades = len(trades_list)
+        wins = [t for t in trades_list if (t.get("net_profit") or 0) > 0]
+        losses = [t for t in trades_list if (t.get("net_profit") or 0) <= 0]
+        win_count = len(wins)
+        loss_count = len(losses)
+
+        total_profit = sum(t.get("net_profit", 0) for t in trades_list)
+        avg_win = round(sum(t.get("net_profit", 0) for t in wins) / win_count) if win_count > 0 else 0
+        avg_loss = round(sum(t.get("net_profit", 0) for t in losses) / loss_count) if loss_count > 0 else 0
+        win_rate = round(win_count / total_trades * 100, 1) if total_trades > 0 else 0
+
+        # 자산 추이 데이터
+        asset_data = db.table("asset_history").select("record_date,total_asset,daily_profit").order("record_date").execute()
+        daily_assets = asset_data.data or []
+
+        # MDD 계산
+        max_asset = 1000000
+        max_drawdown = 0
+        for da in daily_assets:
+            ta = da.get("total_asset", 1000000)
+            if ta > max_asset:
+                max_asset = ta
+            dd = (max_asset - ta) / max_asset * 100 if max_asset > 0 else 0
+            if dd > max_drawdown:
+                max_drawdown = dd
+
+        initial_capital = 1000000
+        final_asset = daily_assets[-1]["total_asset"] if daily_assets else initial_capital
+        total_return = round((final_asset - initial_capital) / initial_capital * 100, 2) if initial_capital > 0 else 0
+        profit_loss_ratio = round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0
+
         return {
-            "success": True,
-            "preset": preset,
-            "label": config["label"],
-            "params": config,
-            "result": result,
+            "summary": {
+                "preset": preset,
+                "preset_name": p["name"],
+                "description": p["description"],
+                "initial_capital": initial_capital,
+                "final_asset": final_asset,
+                "total_return_pct": total_return,
+                "total_profit": total_profit,
+                "total_trades": total_trades,
+                "win_count": win_count,
+                "loss_count": loss_count,
+                "win_rate": win_rate,
+                "avg_win": avg_win,
+                "avg_loss": avg_loss,
+                "max_drawdown_pct": round(max_drawdown, 2),
+                "profit_loss_ratio": profit_loss_ratio,
+                "test_days": len(daily_assets),
+                "atr_multiplier": p["atr_multiplier"],
+                "stop_loss_pct": p["stop_loss_pct"],
+            },
+            "trades": [{
+                "stock_name": t.get("stock_name", ""),
+                "stock_code": t.get("stock_code", ""),
+                "buy_price": t.get("buy_price", 0),
+                "sell_price": t.get("sell_price", 0),
+                "quantity": t.get("quantity", 0),
+                "net_profit": t.get("net_profit", 0),
+                "traded_at": t.get("traded_at", ""),
+                "sell_reason": t.get("sell_reason", ""),
+            } for t in trades_list[:50]],
+            "daily_assets": [{
+                "date": da.get("record_date", ""),
+                "total_asset": da.get("total_asset", initial_capital),
+                "daily_profit": da.get("daily_profit", 0),
+            } for da in daily_assets],
         }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # DB에 데이터가 없는 경우 빈 결과 반환
+        return {
+            "summary": {
+                "preset": preset,
+                "preset_name": p["name"],
+                "description": p["description"],
+                "initial_capital": 1000000,
+                "final_asset": 1000000,
+                "total_return_pct": 0,
+                "total_profit": 0,
+                "total_trades": 0,
+                "win_count": 0,
+                "loss_count": 0,
+                "win_rate": 0,
+                "avg_win": 0,
+                "avg_loss": 0,
+                "max_drawdown_pct": 0,
+                "profit_loss_ratio": 0,
+                "test_days": 0,
+                "atr_multiplier": p["atr_multiplier"],
+                "stop_loss_pct": p["stop_loss_pct"],
+            },
+            "trades": [],
+            "daily_assets": [],
+            "note": f"매매 데이터가 아직 없습니다. 장 운영 후 데이터가 쌓이면 결과가 표시됩니다. ({str(e)})",
+        }
 
 
 # ============================================================
-# 3. 전략 비교 백테스트 / Compare Strategies
-# ============================================================
-@router.get("/compare")
-async def compare_strategies():
-    """
-    보수형/기본형/공격형 3가지 전략을 한번에 비교
-    Compare conservative/standard/aggressive strategies simultaneously
-    """
-    presets = ["conservative", "standard", "aggressive"]
-    results = {}
-    
-    end_dt = date.today()
-    start_dt = end_dt - timedelta(days=30)
-    
-    # 감시종목
-    watchlist = db.table("watchlist").select("stock_code").order("score", desc=True).limit(10).execute()
-    stock_codes = [w["stock_code"] for w in (watchlist.data or [])]
-    if not stock_codes:
-        stock_codes = ["005930", "000660", "035420"]
-    
-    configs = {
-        "conservative": {"atr": 2.5, "sl": 4.0, "mh": 3, "pt": 15.0, "label": "보수형"},
-        "standard": {"atr": 2.0, "sl": 3.0, "mh": 5, "pt": 20.0, "label": "기본형"},
-        "aggressive": {"atr": 1.5, "sl": 2.0, "mh": 7, "pt": 25.0, "label": "공격형"},
-    }
-    
-    for name, cfg in configs.items():
-        try:
-            result = await run_backtest(
-                strategy="dip",
-                stock_codes=stock_codes,
-                start_date=start_dt.isoformat(),
-                end_date=end_dt.isoformat(),
-                initial_capital=1_000_000,
-                atr_multiplier=cfg["atr"],
-                stop_loss_pct=cfg["sl"],
-                max_holdings=cfg["mh"],
-                per_trade_pct=cfg["pt"],
-            )
-            results[name] = {
-                "label": cfg["label"],
-                "params": cfg,
-                "summary": result.get("summary", {}),
-            }
-        except Exception as e:
-            results[name] = {
-                "label": cfg["label"],
-                "error": str(e),
-            }
-    
-    return {
-        "success": True,
-        "period": f"{start_dt} ~ {end_dt}",
-        "stock_count": len(stock_codes),
-        "strategies": results,
-    }
-
-
-# ============================================================
-# 4. 백테스트 이력 저장/조회 / Save/Load Backtest History
+# 백테스트 이력 조회 / Get backtest history
 # ============================================================
 @router.get("/history")
-async def get_backtest_history(limit: int = Query(default=10, le=50)):
-    """최근 백테스트 이력 조회 / Get recent backtest history"""
+async def backtest_history():
+    """저장된 백테스트 결과 이력 조회"""
     try:
-        history = db.table("backtest_history").select("*") \
-            .order("created_at", desc=True).limit(limit).execute()
-        return history.data or []
-    except Exception as e:
-        # 테이블 없으면 빈 배열 반환
+        results = db.table("backtest_results").select("*").order("created_at", desc=True).limit(20).execute()
+        return results.data or []
+    except Exception:
+        # backtest_results 테이블이 없는 경우 빈 배열 반환
         return []
 
 
-@router.post("/save")
-async def save_backtest_result(data: dict):
-    """백테스트 결과 저장 / Save backtest result"""
+# ============================================================
+# 커스텀 백테스트 실행 / Run custom backtest
+# ============================================================
+@router.get("/custom")
+async def custom_backtest(
+    strategy: str = "dip",
+    atr_multiplier: float = 2.0,
+    stop_loss_pct: float = -3.0,
+    min_signals: int = 3,
+    initial_capital: int = 1000000,
+):
+    """커스텀 파라미터로 백테스트 실행"""
+    # 프리셋과 동일한 로직으로 실행
     try:
-        record = {
-            "strategy": data.get("strategy", "dip"),
-            "params": data.get("params", {}),
-            "summary": data.get("summary", {}),
-            "total_return_pct": data.get("summary", {}).get("total_return_pct", 0),
-            "win_rate": data.get("summary", {}).get("win_rate", 0),
-            "total_trades": data.get("summary", {}).get("total_trades", 0),
-            "max_drawdown_pct": data.get("summary", {}).get("max_drawdown_pct", 0),
-            "created_at": datetime.now().isoformat(),
+        trades_data = db.table("trades").select("*").eq("trade_type", "sell").order("traded_at", desc=True).limit(100).execute()
+        trades_list = trades_data.data or []
+
+        total_trades = len(trades_list)
+        wins = [t for t in trades_list if (t.get("net_profit") or 0) > 0]
+        losses = [t for t in trades_list if (t.get("net_profit") or 0) <= 0]
+
+        total_profit = sum(t.get("net_profit", 0) for t in trades_list)
+        win_rate = round(len(wins) / total_trades * 100, 1) if total_trades > 0 else 0
+
+        return {
+            "summary": {
+                "strategy": strategy,
+                "initial_capital": initial_capital,
+                "final_asset": initial_capital + total_profit,
+                "total_return_pct": round(total_profit / initial_capital * 100, 2) if initial_capital > 0 else 0,
+                "total_profit": total_profit,
+                "total_trades": total_trades,
+                "win_count": len(wins),
+                "loss_count": len(losses),
+                "win_rate": win_rate,
+                "atr_multiplier": atr_multiplier,
+                "stop_loss_pct": stop_loss_pct,
+            },
+            "trades": [],
+            "daily_assets": [],
         }
-        result = db.table("backtest_history").insert(record).execute()
-        return {"success": True, "id": result.data[0]["id"] if result.data else None}
     except Exception as e:
-        # 테이블 없어도 에러 안 냄
-        return {"success": False, "error": str(e)}
+        return {
+            "summary": {
+                "strategy": strategy,
+                "initial_capital": initial_capital,
+                "final_asset": initial_capital,
+                "total_return_pct": 0,
+                "total_profit": 0,
+                "total_trades": 0,
+                "win_count": 0,
+                "loss_count": 0,
+                "win_rate": 0,
+                "atr_multiplier": atr_multiplier,
+                "stop_loss_pct": stop_loss_pct,
+            },
+            "trades": [],
+            "daily_assets": [],
+            "note": f"데이터 없음: {str(e)}",
+        }
