@@ -66,11 +66,7 @@ async def trigger_scan(password: str = ""):
         return {"success": True, "message": f"스캔 완료: 후보 {len(candidates)}개", "count": len(candidates)}
     except Exception as e:
         return {"success": False, "error": str(e)}
-```
 
-Commit 후 Railway 배포가 완료되면, 브라우저에서 아래 URL로 접속하세요:
-```
-https://web-production-139e9.up.railway.app/api/scan/trigger?password=4332
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=config.PORT)
