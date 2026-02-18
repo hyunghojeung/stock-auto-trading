@@ -9,7 +9,8 @@ from app.api import stock_routes, trade_routes, portfolio_routes, watchlist_rout
 from app.utils.kr_holiday import get_market_status, is_market_open_now, get_holiday_name, get_next_market_day
 from datetime import datetime
 from app.api.backtest_routes import router as backtest_router
-
+from app.api.swing_routes import router as swing_router
+app.include_router(swing_router)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
