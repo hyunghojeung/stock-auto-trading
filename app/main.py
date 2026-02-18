@@ -33,7 +33,7 @@ app.include_router(kakao_routes.router)
 async def root():
     return {"name": "10억 만들기", "status": "running", "market": get_market_status()}
 
-@app.post("/api/auth")
+@app.get("/api/auth")
 async def authenticate(password: str):
     if password == config.SITE_PASSWORD:
         return {"authenticated": True}
