@@ -14,8 +14,9 @@ def is_trading_day():
 # ============================================================
 
 async def night_scan_job():
-    """전날 18시: 전종목 정밀 분석"""
-    if not is_market_open_day(datetime.now().date()):
+    from datetime import timedelta
+    tomorrow = datetime.now().date() + timedelta(days=1)
+    if not is_market_open_day(tomorrow):
         return
     from app.engine.scanner import scan_all_stocks
     from app.engine.scorer import score_and_select
