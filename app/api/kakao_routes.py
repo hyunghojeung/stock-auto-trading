@@ -53,8 +53,8 @@ async def kakao_callback(code: str = Query(...)):
         return {
             "success": True,
             "message": "카카오 알림 연결 완료!",
-            "access_token": result["access_token"][:20] + "...",
-            "refresh_token": result.get("refresh_token", "")[:20] + "...",
+            "access_token": result["access_token"],
+            "refresh_token": result.get("refresh_token", ""),
             "note": "이 토큰들을 Railway 환경변수에 저장하세요: KAKAO_ACCESS_TOKEN, KAKAO_REFRESH_TOKEN"
         }
     
@@ -73,7 +73,17 @@ async def kakao_status():
     }
 
 
-@router.post("/test")
+@router.get("/tokens")
+async def kakao_tokens():
+    """현재 저장된 토큰 확인"""
+    from app.services.kakao_alert import kakao
+    return {
+        "access_token": kakao.access_token,
+        "refresh_token": kakao.refresh_token,
+    }
+
+
+@router.get("/test")
 async def kakao_test():
     """테스트 메시지 전송"""
     from app.services.kakao_alert import kakao
