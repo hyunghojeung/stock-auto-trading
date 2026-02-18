@@ -11,6 +11,8 @@ from datetime import datetime
 from app.api.backtest_routes import router as backtest_router
 from app.api.swing_routes import router as swing_router
 
+app.include_router(backtest_router)
+app.include_router(swing_router)   
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
