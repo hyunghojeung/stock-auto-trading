@@ -2,7 +2,7 @@
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
-from app.utils.kr_holiday import is_market_open_day
+from app.utils.kr_holiday import is_market_open_day, is_market_open_now
 
 scheduler = AsyncIOScheduler(timezone="Asia/Seoul")
 
@@ -41,10 +41,8 @@ async def market_scan_job():
 
 async def trading_job():
     """장중 1분 간격: 눌림목 감지 및 자동매매"""
-    if not is_trading_day():
-        return
-    now = datetime.now()
-    if now.hour < 9 or (now.hour == 15 and now.minute > 30) or now.hour > 15:
+    # ★ 공휴일 + 주말 + 장시간 종합 체크 / Comprehensive market check
+    if not is_market_open_now():
         return
     from app.engine.trade_executor import execute_trading_cycle
     await execute_trading_cycle()

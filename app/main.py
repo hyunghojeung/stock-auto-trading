@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from app.core.config import config
 from app.core.scheduler import setup_scheduler
 from app.api import stock_routes, trade_routes, portfolio_routes, watchlist_routes, strategy_routes, kakao_routes
-from app.utils.kr_holiday import get_market_status
+from app.utils.kr_holiday import get_market_status, is_market_open_now, get_holiday_name, get_next_market_day
 from datetime import datetime
 
 @asynccontextmanager
@@ -42,11 +42,15 @@ async def authenticate(password: str):
 @app.get("/api/system/status")
 async def system_status():
     now = datetime.now()
+    holiday = get_holiday_name(now.date())
     return {
         "datetime": now.isoformat(),
         "date_kr": now.strftime("%Y년 %m월 %d일 (%a)"),
         "time_kr": now.strftime("%H:%M:%S"),
         "market_status": get_market_status(now),
+        "is_market_open": is_market_open_now(now),
+        "holiday": holiday,
+        "next_market_day": str(get_next_market_day(now.date())) if not is_market_open_now(now) else None,
     }
 
 if __name__ == "__main__":
