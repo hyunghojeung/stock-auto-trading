@@ -27,6 +27,15 @@ async def quick_backtest(preset: str):
             "min_signals": 2,
             "description": "ATR×1.5, 손절-2.5%, 갭상승전략",
         },
+         "gap_standard": {
+        "name": "갭상승",
+        "strategy": "gap",
+        "atr_multiplier": 1.5,
+        "stop_loss_pct": 2.5,
+        "max_holdings": 5,
+        "per_trade_pct": 20.0,
+        "description": "ATR×1.5, 손절-2.5%, 갭상승전략",
+    },
         "combined": {
             "name": "혼합",
             "atr_multiplier": 2.0,
