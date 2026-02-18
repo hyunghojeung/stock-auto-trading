@@ -53,7 +53,24 @@ async def system_status():
         "holiday": holiday,
         "next_market_day": str(get_next_market_day(now.date())) if not is_market_open_now(now) else None,
     }
+@app.get("/api/scan/trigger")
+async def trigger_scan(password: str = ""):
+    """수동 전종목 스캔 트리거"""
+    if password != config.SITE_PASSWORD:
+        raise HTTPException(403, "비밀번호가 틀렸습니다")
+    try:
+        from app.engine.scanner import scan_all_stocks
+        from app.engine.scorer import score_and_select
+        stocks = await scan_all_stocks()
+        candidates = await score_and_select(stocks, top_n=30)
+        return {"success": True, "message": f"스캔 완료: 후보 {len(candidates)}개", "count": len(candidates)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+```
 
+Commit 후 Railway 배포가 완료되면, 브라우저에서 아래 URL로 접속하세요:
+```
+https://web-production-139e9.up.railway.app/api/scan/trigger?password=4332
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=config.PORT)
