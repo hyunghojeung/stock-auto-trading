@@ -10,6 +10,7 @@ from app.utils.kr_holiday import get_market_status, is_market_open_now, get_holi
 from datetime import datetime
 from app.api.backtest_routes import router as backtest_router
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_scheduler()
@@ -17,10 +18,15 @@ async def lifespan(app: FastAPI):
     yield
     print("[서버] 서버 종료")
 
-app = FastAPI(title="10억 만들기 - 주식 자동매매", version="1.0.0", lifespan=lifespan)
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="10억 만들기 - 주식 자동매매", version="1.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # API 라우터 등록
 app.include_router(stock_routes.router)
@@ -30,15 +36,19 @@ app.include_router(watchlist_routes.router)
 app.include_router(strategy_routes.router)
 app.include_router(kakao_routes.router)
 app.include_router(backtest_router)
+
+
 @app.get("/")
 async def root():
     return {"name": "10억 만들기", "status": "running", "market": get_market_status()}
+
 
 @app.get("/api/auth")
 async def authenticate(password: str):
     if password == config.SITE_PASSWORD:
         return {"authenticated": True}
     raise HTTPException(403, "비밀번호가 틀렸습니다")
+
 
 @app.get("/api/system/status")
 async def system_status():
@@ -53,6 +63,8 @@ async def system_status():
         "holiday": holiday,
         "next_market_day": str(get_next_market_day(now.date())) if not is_market_open_now(now) else None,
     }
+
+
 @app.get("/api/scan/trigger")
 async def trigger_scan(password: str = ""):
     """수동 전종목 스캔 트리거"""
@@ -66,6 +78,7 @@ async def trigger_scan(password: str = ""):
         return {"success": True, "message": f"스캔 완료: 후보 {len(candidates)}개", "count": len(candidates)}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
 
 if __name__ == "__main__":
     import uvicorn
