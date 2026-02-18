@@ -1,4 +1,4 @@
-"""전략 관리 API"""
+"""전략 관리 API (눌림목 + 갭상승전략 통합)"""
 from fastapi import APIRouter, HTTPException
 from app.core.database import db
 from app.core.config import config
@@ -23,7 +23,6 @@ async def toggle_live(sid: int, password: str = ""):
     if not r.data: raise HTTPException(404)
     current = r.data[0]["is_live"]
     if not current:
-        # 다른 실전 전략 확인
         live = db.table("strategies").select("id").eq("is_live", True).execute()
         if live.data:
             raise HTTPException(400, "이미 실전 매매 중인 전략이 있습니다")
@@ -32,7 +31,7 @@ async def toggle_live(sid: int, password: str = ""):
 
 @router.get("/compare/all")
 async def compare_strategies():
-    strategies = db.table("strategies").select("*").eq("is_active", True).execute().data or []
+    strategies = db.table("strategies").select("*").execute().data or []
     result = []
     for s in strategies:
         sid = s["id"]
@@ -46,10 +45,53 @@ async def compare_strategies():
 
         result.append({
             "strategy": s,
-            "total_asset": asset.data[0]["total_asset"] if asset.data else s["initial_capital"],
+            "total_asset": asset.data[0]["total_asset"] if asset.data else s.get("initial_capital", 1000000),
             "total_profit": total_profit,
             "total_trades": total_trades,
             "win_rate": round(wins/total_trades*100, 2) if total_trades > 0 else 0,
             "daily_reports": daily.data or [],
         })
     return result
+
+# ============================================================
+# 갭상승전략 실시간 상태 API (신규)
+# ============================================================
+
+@router.get("/gap/status")
+async def get_gap_status():
+    """갭상승전략 현재 상태 조회"""
+    try:
+        from app.engine.gap_scheduler import gap_phase, gap_filtered_stocks, gap_holdings
+        return {
+            "phase": gap_phase,
+            "filtered_count": len(gap_filtered_stocks),
+            "holdings_count": len(gap_holdings),
+            "filtered_stocks": [
+                {
+                    "code": s.get("code", ""),
+                    "name": s.get("name", ""),
+                    "gap_pct": s.get("gap_pct", 0),
+                    "gap_type": s.get("gap_type", ""),
+                }
+                for s in gap_filtered_stocks
+            ],
+            "holdings": [
+                {
+                    "code": h.get("code", ""),
+                    "name": h.get("name", ""),
+                    "strategy": h.get("strategy", ""),
+                    "entry_price": h.get("entry_price", 0),
+                    "quantity": h.get("quantity", 0),
+                }
+                for h in gap_holdings.values()
+            ],
+        }
+    except Exception as e:
+        return {
+            "phase": "idle",
+            "filtered_count": 0,
+            "holdings_count": 0,
+            "filtered_stocks": [],
+            "holdings": [],
+            "error": str(e),
+        }
