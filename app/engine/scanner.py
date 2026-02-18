@@ -25,7 +25,19 @@ def _fetch_krx_stocks(market="STK"):
     """KRX에서 종목 데이터 크롤링"""
     url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
     headers = {"User-Agent": "Mozilla/5.0", "Content-Type": "application/x-www-form-urlencoded"}
-    today = datetime.now().strftime("%Y%m%d")
+    # 마지막 거래일 찾기 (오늘 장 전이면 이전 거래일 사용)
+    from app.utils.kr_holiday import is_market_open_day
+    from datetime import timedelta
+    check_date = datetime.now().date()
+    for _ in range(10):
+        if is_market_open_day(check_date):
+            now = datetime.now()
+            if check_date == now.date() and now.hour < 16:
+                check_date -= timedelta(days=1)
+                continue
+            break
+        check_date -= timedelta(days=1)
+    today = check_date.strftime("%Y%m%d")
     data = {
         "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
         "mktId": market,
