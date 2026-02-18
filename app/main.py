@@ -8,7 +8,7 @@ from app.core.scheduler import setup_scheduler
 from app.api import stock_routes, trade_routes, portfolio_routes, watchlist_routes, strategy_routes, kakao_routes
 from app.utils.kr_holiday import get_market_status, is_market_open_now, get_holiday_name, get_next_market_day
 from datetime import datetime
-
+from app.api.backtest_routes import router as backtest_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_scheduler()
