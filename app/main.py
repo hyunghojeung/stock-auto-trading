@@ -28,7 +28,7 @@ app.include_router(portfolio_routes.router)
 app.include_router(watchlist_routes.router)
 app.include_router(strategy_routes.router)
 app.include_router(kakao_routes.router)
-app.include_router(backtest_router)
+# app.include_router(backtest_router)
 @app.get("/")
 async def root():
     return {"name": "10억 만들기", "status": "running", "market": get_market_status()}
