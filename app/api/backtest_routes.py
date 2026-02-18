@@ -9,7 +9,7 @@ router = APIRouter(prefix="/api/backtest", tags=["백테스트"])
 # ============================================================
 # 프리셋 백테스트 실행 / Run preset backtest
 # ============================================================
-@router.get("/quick/{preset}")
+@router.api_route("/quick/{preset}", methods=["GET", "POST"])
 async def quick_backtest(preset: str):
     """프리셋 백테스트 실행 (conservative, balanced, aggressive)"""
     presets = {
@@ -147,7 +147,7 @@ async def quick_backtest(preset: str):
 # ============================================================
 # 백테스트 이력 조회 / Get backtest history
 # ============================================================
-@router.get("/history")
+@router.api_route("/history", methods=["GET", "POST"])
 async def backtest_history():
     """저장된 백테스트 결과 이력 조회"""
     try:
@@ -161,7 +161,7 @@ async def backtest_history():
 # ============================================================
 # 커스텀 백테스트 실행 / Run custom backtest
 # ============================================================
-@router.get("/custom")
+@router.api_route("/custom", methods=["GET", "POST"])
 async def custom_backtest(
     strategy: str = "dip",
     atr_multiplier: float = 2.0,
