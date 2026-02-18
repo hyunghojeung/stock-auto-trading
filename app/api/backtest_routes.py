@@ -13,7 +13,7 @@ router = APIRouter(prefix="/api/backtest", tags=["백테스트"])
 async def quick_backtest(preset: str):
     """프리셋 백테스트 실행 (conservative, balanced, aggressive)"""
     presets = {
-  "standard": {
+        "standard": {
             "name": "기본형",
             "atr_multiplier": 2.0,
             "stop_loss_pct": -3.0,
@@ -27,15 +27,15 @@ async def quick_backtest(preset: str):
             "min_signals": 2,
             "description": "ATR×1.5, 손절-2.5%, 갭상승전략",
         },
-         "gap_standard": {
-        "name": "갭상승",
-        "strategy": "gap",
-        "atr_multiplier": 1.5,
-        "stop_loss_pct": 2.5,
-        "max_holdings": 5,
-        "per_trade_pct": 20.0,
-        "description": "ATR×1.5, 손절-2.5%, 갭상승전략",
-    },
+        "gap_standard": {
+            "name": "갭상승",
+            "strategy": "gap",
+            "atr_multiplier": 1.5,
+            "stop_loss_pct": 2.5,
+            "max_holdings": 5,
+            "per_trade_pct": 20.0,
+            "description": "ATR×1.5, 손절-2.5%, 갭상승전략",
+        },
         "combined": {
             "name": "혼합",
             "atr_multiplier": 2.0,
@@ -200,7 +200,6 @@ async def custom_backtest(
     initial_capital: int = 1000000,
 ):
     """커스텀 파라미터로 백테스트 실행"""
-    # 프리셋과 동일한 로직으로 실행
     try:
         trades_data = db.table("trades").select("*").eq("trade_type", "sell").order("traded_at", desc=True).limit(100).execute()
         trades_list = trades_data.data or []
