@@ -6,24 +6,41 @@ from app.utils.kr_holiday import is_market_open_day
 
 scheduler = AsyncIOScheduler(timezone="Asia/Seoul")
 
+
 def is_trading_day():
     return is_market_open_day(datetime.now().date())
+
+
+def _next_trading_day():
+    """다음 거래일 찾기 / Find next trading day"""
+    check = datetime.now().date() + timedelta(days=1)
+    for _ in range(10):
+        if is_market_open_day(check):
+            return check
+        check += timedelta(days=1)
+    return check
+
 
 # ============================================================
 # 눌림목전략 작업 (기존)
 # ============================================================
 
 async def night_scan_job():
-    from datetime import timedelta
-    tomorrow = datetime.now().date() + timedelta(days=1)
-    if not is_market_open_day(tomorrow):
+    """전날 18시: 전종목 정밀 분석 (다음 거래일 대비)
+    금요일 → 월요일 / 연휴 전날 → 연휴 후 첫 거래일
+    """
+    next_day = _next_trading_day()
+    days_ahead = (next_day - datetime.now().date()).days
+    if days_ahead > 4:
+        print(f"[야간스캔] 다음 거래일({next_day})이 4일 이상 후 → 스킵")
         return
     from app.engine.scanner import scan_all_stocks
     from app.engine.scorer import score_and_select
-    print(f"[{datetime.now()}] 야간 전종목 스캔 시작")
+    print(f"[{datetime.now()}] 야간 전종목 스캔 시작 (다음 거래일: {next_day})")
     stocks = await scan_all_stocks()
     candidates = await score_and_select(stocks, top_n=30)
     print(f"[{datetime.now()}] 야간 스캔 완료: 후보 {len(candidates)}개")
+
 
 async def pre_market_job():
     """장전 08:30: 최종 감시종목 확정"""
@@ -33,6 +50,7 @@ async def pre_market_job():
     print(f"[{datetime.now()}] 장전 최종 확인 시작")
     await refine_watchlist()
     print(f"[{datetime.now()}] 감시종목 확정 완료")
+
 
 async def market_scan_job():
     """장중 30분 간격: 전종목 재스캔"""
@@ -44,6 +62,7 @@ async def market_scan_job():
     stocks = await scan_all_stocks()
     await score_and_select(stocks, top_n=10)
 
+
 async def trading_job():
     """장중 1분 간격: 눌림목 감지 및 자동매매"""
     if not is_trading_day():
@@ -54,6 +73,7 @@ async def trading_job():
     from app.engine.trade_executor import execute_trading_cycle
     await execute_trading_cycle()
 
+
 async def daily_report_job():
     """장 마감 후 16시: 일일 리포트 생성"""
     if not is_trading_day():
@@ -62,18 +82,22 @@ async def daily_report_job():
     print(f"[{datetime.now()}] 일일 리포트 생성")
     await generate_daily_report()
 
+
 # ============================================================
 # 갭상승전략 작업 (신규)
 # ============================================================
 
 async def gap_night_precompute_job():
     """전날 18시: 갭상승전략용 데이터 사전 계산"""
-    tomorrow = date.today() + timedelta(days=1)
-    if not is_market_open_day(tomorrow):
-        print(f"[갭전략 야간] 내일({tomorrow})은 휴장일 → 스킵")
+    next_day = _next_trading_day()
+    days_ahead = (next_day - datetime.now().date()).days
+    if days_ahead > 4:
+        print(f"[갭전략 야간] 다음 거래일({next_day})이 4일 이상 후 → 스킵")
         return
+    print(f"[갭전략 야간] 다음 거래일: {next_day} — 사전 계산 시작")
     from app.engine.gap_scheduler import gap_night_precompute_job as job
     await job()
+
 
 async def gap_scan_job():
     """09:00: 갭 탐지 + 유형 분류 + 1차 필터링"""
@@ -82,12 +106,14 @@ async def gap_scan_job():
     from app.engine.gap_scheduler import gap_scan_job as job
     await job()
 
+
 async def gap_orb_collect_job():
     """09:01~09:30: ORB 범위 수집"""
     if not is_trading_day():
         return
     from app.engine.gap_scheduler import gap_orb_collect_job as job
     await job()
+
 
 async def gap_entry_check_job():
     """09:30~: 갭전략 진입 판단"""
@@ -96,6 +122,7 @@ async def gap_entry_check_job():
     from app.engine.gap_scheduler import gap_entry_check_job as job
     await job()
 
+
 async def gap_exit_check_job():
     """09:30~15:00: 갭전략 매도 관리"""
     if not is_trading_day():
@@ -103,12 +130,14 @@ async def gap_exit_check_job():
     from app.engine.gap_scheduler import gap_exit_check_job as job
     await job()
 
+
 async def gap_close_job():
     """15:00: 갭전략 장마감 정리"""
     if not is_trading_day():
         return
     from app.engine.gap_scheduler import gap_close_job as job
     await job()
+
 
 # ============================================================
 # 스케줄러 설정 (눌림목 + 갭상승 통합)
