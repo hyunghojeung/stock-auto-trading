@@ -394,31 +394,41 @@ async def test_single_stock(code: str,
         trades = run_swing_backtest(candles, params)
         stats = analyze_timing_patterns(trades)
 
-        # 매매 포인트 (차트 표시용)
+        # ★ 캔들 슬라이스: 최근 120일 (또는 전체가 120 이하면 전부)
+        slice_start = max(0, len(candles) - 120)
+        sliced_candles = candles[slice_start:]
+
+        # ★ 매매 포인트 (idx를 슬라이스 기준으로 보정)
         trade_points = []
         for t in trades:
-            trade_points.append({
-                "type": "buy",
-                "date": t.entry_date,
-                "price": t.entry_price,
-                "idx": t.entry_idx,
-            })
-            trade_points.append({
-                "type": "sell",
-                "date": t.exit_date,
-                "price": t.exit_price,
-                "idx": t.exit_idx,
-                "profit_pct": t.profit_pct,
-                "is_win": t.is_win,
-                "reason": t.exit_reason,
-            })
+            buy_idx = t.entry_idx - slice_start
+            sell_idx = t.exit_idx - slice_start
+
+            # 슬라이스 범위 내의 매매만 표시
+            if buy_idx >= 0:
+                trade_points.append({
+                    "type": "buy",
+                    "date": t.entry_date,
+                    "price": t.entry_price,
+                    "idx": buy_idx,
+                })
+            if sell_idx >= 0:
+                trade_points.append({
+                    "type": "sell",
+                    "date": t.exit_date,
+                    "price": t.exit_price,
+                    "idx": sell_idx,
+                    "profit_pct": t.profit_pct,
+                    "is_win": t.is_win,
+                    "reason": t.exit_reason,
+                })
 
         return {
             "code": code,
             "name": stock_name,  # ★ 추가: 종목명
             "data_source": "naver",
             "total_candles": len(candles),
-            "candles": candles[-120:],  # 최근 120일만
+            "candles": sliced_candles,
             "trade_points": trade_points,
             "stats": _serialize_pattern_stats(stats),
             "params": params,
@@ -427,6 +437,164 @@ async def test_single_stock(code: str,
     except Exception as e:
         print(f"[스윙 단일테스트] {code} 오류: {traceback.format_exc()}")
         return {"error": str(e)}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 6. 종목 검색 / Stock Search
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/search")
+async def search_stocks(
+    q: str = Query("", min_length=1),
+    source: str = Query("candidates", description="candidates=발굴종목, all=전체시장")
+):
+    """
+    종목명 또는 코드로 검색 (자동완성용)
+    source=candidates → DB + 대표종목에서 검색
+    source=all → 네이버 금융 자동완성 API (전체 상장종목)
+    """
+    try:
+        query = q.strip()
+
+        # ── 전체 시장 검색: 네이버 금융 자동완성 API ──
+        if source == "all":
+            return await _search_naver_autocomplete(query)
+
+        # ── 발굴 종목 검색: DB + 대표종목 ──
+        query_upper = query.upper()
+        results = []
+
+        # 1) DB candidates 검색
+        try:
+            data = db.table("candidates").select("code, name, market").execute().data
+            if data:
+                for s in data:
+                    name = (s.get("name") or "").upper()
+                    code = (s.get("code") or "").upper()
+                    if query_upper in name or query_upper in code:
+                        results.append(s)
+        except Exception:
+            pass
+
+        # 2) 하드코딩 대표 종목
+        fallback_stocks = _get_fallback_stocks()
+        existing_codes = {r["code"] for r in results}
+        for s in fallback_stocks:
+            if s["code"] in existing_codes:
+                continue
+            name = (s.get("name") or "").upper()
+            code = (s.get("code") or "").upper()
+            if query_upper in name or query_upper in code:
+                results.append(s)
+
+        return {"results": results[:20], "source": "candidates"}
+
+    except Exception as e:
+        return {"results": [], "error": str(e)}
+
+
+async def _search_naver_autocomplete(query: str):
+    """
+    네이버 금융 자동완성 API 호출
+    전체 코스피/코스닥 상장종목 검색 가능
+    """
+    import urllib.parse
+    import urllib.request
+
+    try:
+        encoded = urllib.parse.quote(query, encoding="euc-kr")
+        url = f"https://ac.finance.naver.com/ac?q={encoded}&q_enc=euc-kr&st=111&frm=stock&r_format=json&r_enc=utf-8&r_unicode=0&t_koreng=1&r_lt=111"
+
+        # httpx 또는 urllib fallback
+        data = None
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url)
+                data = resp.json()
+        except ImportError:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+        if not data:
+            return {"results": [], "source": "naver"}
+
+        items = data.get("items", [[]])[0] if data.get("items") else []
+        results = []
+        for item in items[:20]:
+            if len(item) >= 2:
+                name = item[0][0] if isinstance(item[0], list) else str(item[0])
+                code = item[1][0] if isinstance(item[1], list) else str(item[1])
+                # 6자리 종목코드만 (ETF, 선물 등 제외)
+                if len(code) == 6 and code.isdigit():
+                    results.append({
+                        "code": code,
+                        "name": name,
+                        "market": "stock",
+                    })
+
+        return {"results": results[:20], "source": "naver"}
+
+    except Exception as e:
+        print(f"[네이버 자동완성] 오류: {e}")
+        return {"results": [], "source": "naver", "error": str(e)}
+
+
+def _get_fallback_stocks():
+    """대표 종목 리스트 (검색용)"""
+    return [
+        {"code": "005930", "name": "삼성전자", "market": "kospi"},
+        {"code": "000660", "name": "SK하이닉스", "market": "kospi"},
+        {"code": "373220", "name": "LG에너지솔루션", "market": "kospi"},
+        {"code": "207940", "name": "삼성바이오로직스", "market": "kospi"},
+        {"code": "005380", "name": "현대차", "market": "kospi"},
+        {"code": "006400", "name": "삼성SDI", "market": "kospi"},
+        {"code": "035420", "name": "NAVER", "market": "kospi"},
+        {"code": "000270", "name": "기아", "market": "kospi"},
+        {"code": "068270", "name": "셀트리온", "market": "kospi"},
+        {"code": "035720", "name": "카카오", "market": "kospi"},
+        {"code": "051910", "name": "LG화학", "market": "kospi"},
+        {"code": "105560", "name": "KB금융", "market": "kospi"},
+        {"code": "055550", "name": "신한지주", "market": "kospi"},
+        {"code": "003670", "name": "포스코퓨처엠", "market": "kospi"},
+        {"code": "096770", "name": "SK이노베이션", "market": "kospi"},
+        {"code": "028260", "name": "삼성물산", "market": "kospi"},
+        {"code": "012330", "name": "현대모비스", "market": "kospi"},
+        {"code": "066570", "name": "LG전자", "market": "kospi"},
+        {"code": "003550", "name": "LG", "market": "kospi"},
+        {"code": "034730", "name": "SK", "market": "kospi"},
+        {"code": "015760", "name": "한국전력", "market": "kospi"},
+        {"code": "032830", "name": "삼성생명", "market": "kospi"},
+        {"code": "011200", "name": "HMM", "market": "kospi"},
+        {"code": "010130", "name": "고려아연", "market": "kospi"},
+        {"code": "033780", "name": "KT&G", "market": "kospi"},
+        {"code": "009150", "name": "삼성전기", "market": "kospi"},
+        {"code": "018260", "name": "삼성에스디에스", "market": "kospi"},
+        {"code": "086790", "name": "하나금융지주", "market": "kospi"},
+        {"code": "316140", "name": "우리금융지주", "market": "kospi"},
+        {"code": "017670", "name": "SK텔레콤", "market": "kospi"},
+        {"code": "030200", "name": "KT", "market": "kospi"},
+        {"code": "010950", "name": "S-Oil", "market": "kospi"},
+        {"code": "247540", "name": "에코프로비엠", "market": "kosdaq"},
+        {"code": "086520", "name": "에코프로", "market": "kosdaq"},
+        {"code": "377300", "name": "카카오페이", "market": "kospi"},
+        {"code": "259960", "name": "크래프톤", "market": "kospi"},
+        {"code": "352820", "name": "하이브", "market": "kospi"},
+        {"code": "263750", "name": "펄어비스", "market": "kospi"},
+        {"code": "112040", "name": "위메이드", "market": "kosdaq"},
+        {"code": "041510", "name": "에스엠", "market": "kosdaq"},
+        {"code": "293490", "name": "카카오게임즈", "market": "kosdaq"},
+        {"code": "036570", "name": "엔씨소프트", "market": "kospi"},
+        {"code": "251270", "name": "넷마블", "market": "kospi"},
+        {"code": "180640", "name": "한진칼", "market": "kospi"},
+        {"code": "090430", "name": "아모레퍼시픽", "market": "kospi"},
+        {"code": "003490", "name": "대한항공", "market": "kospi"},
+        {"code": "161390", "name": "한국타이어앤테크놀로지", "market": "kospi"},
+        {"code": "000810", "name": "삼성화재", "market": "kospi"},
+        {"code": "036460", "name": "한국가스공사", "market": "kospi"},
+        {"code": "267260", "name": "HD현대일렉트릭", "market": "kospi"},
+    ]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
