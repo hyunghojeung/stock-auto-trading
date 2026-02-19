@@ -3,6 +3,13 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 과거 1년 일봉 데이터에서 "성공한 진입점"을 역추적하여
 어떤 조건에서 진입했을 때 승률이 높은지 통계적으로 분석합니다.
+
+[변경사항 / Changes]
+- MDD 계산: 단순 % 합산 → 자본금 기반 복리 계산 (절대 -100% 초과 안 함)
+- Equity Curve: 자본금 기반 누적 수익률로 변경
+- total_return: equity curve 기반으로 일관성 있게 계산
+
+파일 경로: app/engine/swing_pattern_stats.py
 """
 
 from typing import List, Dict, Optional, Tuple
@@ -252,7 +259,13 @@ def _get_entry_conditions(candles, idx, closes, ma5, ma20, ma60,
             weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
             conds["weekday"] = weekday_names[dt.weekday()]
         except:
-            pass
+            # "20260219" 형식 지원
+            try:
+                dt = datetime.strptime(date_str[:8], "%Y%m%d")
+                weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
+                conds["weekday"] = weekday_names[dt.weekday()]
+            except:
+                pass
 
     return conds
 
@@ -272,6 +285,39 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
     wins = [t for t in all_trades if t.is_win]
     losses = [t for t in all_trades if not t.is_win]
 
+    # ── 자본금 기반 에퀴티 커브 (★ 수정) ──
+    # 각 매매를 순차적으로 적용하여 복리 수익률 계산
+    sorted_trades = sorted(all_trades, key=lambda x: x.entry_idx)
+    capital = 100.0  # 100% = 초기 자본금
+    equity = [0.0]   # 누적 수익률 (%) 기준
+    for t in sorted_trades:
+        # 복리 적용: 현재 자본에 매매 수익률 반영
+        capital = capital * (1 + t.profit_pct / 100)
+        # equity curve는 누적 수익률(%) 표시
+        equity.append(round(capital - 100, 2))
+
+    # ── MDD 계산 (자본금 기반) (★ 수정) ──
+    # 자본금 곡선에서 고점 대비 최대 낙폭 계산
+    capital_curve = [100.0]
+    cap = 100.0
+    for t in sorted_trades:
+        cap = cap * (1 + t.profit_pct / 100)
+        capital_curve.append(cap)
+
+    peak_capital = capital_curve[0]
+    max_drawdown = 0.0
+    for c in capital_curve:
+        if c > peak_capital:
+            peak_capital = c
+        if peak_capital > 0:
+            dd = (c - peak_capital) / peak_capital * 100
+            if dd < max_drawdown:
+                max_drawdown = dd
+
+    # 최종 총 수익률 (복리 기반)
+    final_capital = capital_curve[-1] if capital_curve else 100.0
+    total_return_compound = round(final_capital - 100, 2)
+
     # ── 전체 요약 ──
     summary = {
         "total_trades": total,
@@ -284,7 +330,8 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
         "max_profit": round(max(t.profit_pct for t in all_trades), 2),
         "max_loss": round(min(t.profit_pct for t in all_trades), 2),
         "avg_holding_days": round(sum(t.holding_days for t in all_trades) / total, 1),
-        "total_return": round(sum(t.profit_pct for t in all_trades), 2),
+        "total_return": total_return_compound,  # ★ 수정: 복리 기반
+        "mdd": round(max_drawdown, 2),          # ★ 수정: 자본금 기반 (-100% 초과 불가)
     }
 
     # ── 눌림 % 구간별 승률 ──
@@ -350,19 +397,6 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
         }.get(t.exit_reason, t.exit_reason)
     )
 
-    # ── MDD 계산 ──
-    equity = [0]
-    for t in sorted(all_trades, key=lambda x: x.entry_idx):
-        equity.append(equity[-1] + t.profit_pct)
-    peak = equity[0]
-    mdd = 0
-    for e in equity:
-        peak = max(peak, e)
-        dd = e - peak
-        mdd = min(mdd, dd)
-
-    summary["mdd"] = round(mdd, 2)
-
     # ── 샤프 비율 ──
     profits = [t.profit_pct for t in all_trades]
     if len(profits) > 1:
@@ -371,6 +405,14 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
         summary["sharpe_ratio"] = round(avg_ret / std_ret, 2) if std_ret > 0 else 0
     else:
         summary["sharpe_ratio"] = 0
+
+    # ── 손익비 (★ 추가) ──
+    if summary["avg_loss"] != 0:
+        summary["profit_loss_ratio"] = round(
+            abs(summary["avg_win"] / summary["avg_loss"]), 2
+        )
+    else:
+        summary["profit_loss_ratio"] = 0
 
     # ── 종목별 성과 통계 / Per-Stock Performance ──
     stock_groups = defaultdict(list)
@@ -381,7 +423,13 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
     stock_stats = []
     for code, trades_list in stock_groups.items():
         s_wins = [t for t in trades_list if t.is_win]
-        s_total_return = sum(t.profit_pct for t in trades_list)
+
+        # ★ 수정: 종목별도 복리 수익률 계산
+        s_capital = 100.0
+        for t in sorted(trades_list, key=lambda x: x.entry_idx):
+            s_capital = s_capital * (1 + t.profit_pct / 100)
+        s_total_return = round(s_capital - 100, 2)
+
         s_dates = sorted([t.entry_date for t in trades_list if t.entry_date]
                          + [t.exit_date for t in trades_list if t.exit_date])
         # 매매 기간 계산 (첫 진입 ~ 마지막 청산)
@@ -389,21 +437,32 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
         if len(s_dates) >= 2:
             try:
                 from datetime import datetime as _dt
-                d1 = _dt.strptime(s_dates[0][:10], "%Y-%m-%d")
-                d2 = _dt.strptime(s_dates[-1][:10], "%Y-%m-%d")
+                # "20260219" 또는 "2026-02-19" 형식 모두 지원
+                d1_str = s_dates[0][:10].replace("-", "")
+                d2_str = s_dates[-1][:10].replace("-", "")
+                d1 = _dt.strptime(d1_str[:8], "%Y%m%d")
+                d2 = _dt.strptime(d2_str[:8], "%Y%m%d")
                 trade_days = (d2 - d1).days
             except:
                 trade_days = sum(t.holding_days for t in trades_list)
 
+        # ★ 수정: stock_name 가져오기 (fallback: code)
+        stock_name = code
+        for t in trades_list:
+            name = t.entry_conditions.get("stock_name", "")
+            if name and name != code:
+                stock_name = name
+                break
+
         stock_stats.append({
             "code": code,
-            "name": trades_list[0].entry_conditions.get("stock_name", code),
+            "name": stock_name,  # ★ 수정: 종목명 올바르게 표시
             "total_trades": len(trades_list),
             "win_count": len(s_wins),
             "loss_count": len(trades_list) - len(s_wins),
             "win_rate": round(len(s_wins) / len(trades_list) * 100, 1),
-            "total_return": round(s_total_return, 2),
-            "avg_profit": round(s_total_return / len(trades_list), 2),
+            "total_return": s_total_return,  # ★ 수정: 복리 기반
+            "avg_profit": round(sum(t.profit_pct for t in trades_list) / len(trades_list), 2),
             "max_profit": round(max(t.profit_pct for t in trades_list), 2),
             "max_loss": round(min(t.profit_pct for t in trades_list), 2),
             "trade_period_days": trade_days,
@@ -425,7 +484,7 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
         "ma_stats": ma_stats,
         "bb_stats": bb_stats,
         "exit_stats": exit_stats,
-        "equity_curve": equity,
+        "equity_curve": equity,  # ★ 수정: 자본금 기반 누적 수익률
         "stock_stats": stock_stats,
     }
 
@@ -526,17 +585,21 @@ def auto_calibrate(candles_dict: Dict[str, List[Dict]],
         total = len(all_trades)
         win_rate = len(wins) / total
         avg_profit = sum(t.profit_pct for t in all_trades) / total
-        total_return = sum(t.profit_pct for t in all_trades)
 
-        # MDD
-        equity = [0]
-        for t in sorted(all_trades, key=lambda x: x.entry_idx):
-            equity.append(equity[-1] + t.profit_pct)
-        peak = 0
+        # ★ 수정: 자본금 기반 수익률/MDD 계산
+        cap = 100.0
+        peak = 100.0
         mdd = 0
-        for e in equity:
-            peak = max(peak, e)
-            mdd = min(mdd, e - peak)
+        for t in sorted(all_trades, key=lambda x: x.entry_idx):
+            cap = cap * (1 + t.profit_pct / 100)
+            if cap > peak:
+                peak = cap
+            if peak > 0:
+                dd = (cap - peak) / peak * 100
+                if dd < mdd:
+                    mdd = dd
+
+        total_return = round(cap - 100, 2)
 
         # 종합 점수: 수익률 * 승률 - MDD 패널티
         score = total_return * win_rate - abs(mdd) * 0.5
@@ -545,7 +608,7 @@ def auto_calibrate(candles_dict: Dict[str, List[Dict]],
             "total_trades": total,
             "win_rate": round(win_rate * 100, 1),
             "avg_profit": round(avg_profit, 2),
-            "total_return": round(total_return, 2),
+            "total_return": total_return,
             "mdd": round(mdd, 2),
         }
 
