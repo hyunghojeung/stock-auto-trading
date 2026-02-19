@@ -71,10 +71,13 @@ async def market_scan_job():
 
 async def trading_job():
     """장중 1분 간격: 눌림목 감지 및 자동매매"""
+    print(f"[trading_job] 호출됨 - is_trading_day={is_trading_day()}, now={now_kst()}")
     if not is_trading_day():
+        print("[trading_job] 거래일 아님 → 스킵")
         return
     now = now_kst()
     if now.hour < 9 or (now.hour == 15 and now.minute > 30) or now.hour > 15:
+        print(f"[trading_job] 장외 시간 → 스킵 (hour={now.hour})")
         return
     from app.engine.trade_executor import execute_trading_cycle
     await execute_trading_cycle()
