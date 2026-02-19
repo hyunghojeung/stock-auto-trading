@@ -56,29 +56,34 @@ def _get_next_trading_date():
 
 
 def _fetch_krx_stocks(market="STK"):
-    """KRX에서 종목 데이터 크롤링 / Crawl stock data from KRX"""
+    """KRX에서 종목 데이터 크롤링 / Crawl stock data from KRX
+    
+    ★ Replit 작동 코드(kiwoom-api.ts fetchKRXStocksByMarket)와 100% 동일하게 맞춤
+    - Referer: menuId=MDC0201020101 (전종목 시세 페이지)
+    - X-Requested-With 헤더 없음
+    - locale 파라미터 없음
+    """
     url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
 
-    # KRX는 Referer와 User-Agent가 없으면 차단할 수 있음
+    # ★ Replit 작동 코드와 동일한 헤더 (순서까지 맞춤)
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0101",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "X-Requested-With": "XMLHttpRequest",
         "Origin": "http://data.krx.co.kr",
+        "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101",
     }
 
     trading_date = _get_last_trading_date()
-    today = trading_date.strftime("%Y%m%d")
-    print(f"[스캐너] KRX 요청 날짜: {today} ({market})")
+    trd_dd = trading_date.strftime("%Y%m%d")
+    print(f"[스캐너] KRX 요청 날짜: {trd_dd} ({market})")
 
+    # ★ Replit 작동 코드와 동일한 파라미터 (locale 없음)
     data = {
         "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
-        "locale": "ko_KR",
         "mktId": market,
-        "trdDd": today,
+        "trdDd": trd_dd,
         "share": "1",
         "money": "1",
         "csvxls_isNo": "false",
@@ -87,7 +92,13 @@ def _fetch_krx_stocks(market="STK"):
     # 최대 3번 재시도 (날짜를 하루씩 앞당기며)
     for attempt in range(3):
         try:
+            print(f"[KRX] 시도 {attempt+1}/3 — URL: {url}, 날짜: {data['trdDd']}, 시장: {market}")
+            
             r = requests.post(url, headers=headers, data=data, timeout=30)
+
+            # ★ 디버그: 응답 상태 + 헤더 + 본문 앞부분
+            print(f"[KRX] HTTP {r.status_code} — Content-Type: {r.headers.get('Content-Type', 'N/A')}")
+            print(f"[KRX] 응답 크기: {len(r.text)} bytes, 처음 300자: {r.text[:300]}")
 
             # 응답 상태 확인
             if r.status_code != 200:
@@ -102,9 +113,9 @@ def _fetch_krx_stocks(market="STK"):
             # JSON 파싱 시도
             try:
                 json_data = r.json()
-            except Exception:
+            except Exception as json_err:
                 # JSON이 아닌 응답 (HTML 등) — 처음 200자 로그
-                print(f"[KRX] JSON 파싱 실패 — 응답 처음 200자: {r.text[:200]}")
+                print(f"[KRX] JSON 파싱 실패 ({json_err}) — 응답 처음 200자: {r.text[:200]}")
                 # 날짜 하루 앞당기고 재시도
                 trading_date -= timedelta(days=1)
                 while not _is_weekday(trading_date):
@@ -114,6 +125,8 @@ def _fetch_krx_stocks(market="STK"):
                 continue
 
             items = json_data.get("OutBlock_1", [])
+            print(f"[KRX] JSON 키: {list(json_data.keys())}, OutBlock_1 항목 수: {len(items)}")
+            
             if not items:
                 print(f"[KRX] OutBlock_1 비어있음 (날짜: {data['trdDd']}) — 재시도 {attempt+1}/3")
                 trading_date -= timedelta(days=1)
@@ -121,6 +134,10 @@ def _fetch_krx_stocks(market="STK"):
                     trading_date -= timedelta(days=1)
                 data["trdDd"] = trading_date.strftime("%Y%m%d")
                 continue
+
+            # ★ 첫 번째 항목의 키 구조 로그 (디버그용)
+            if items:
+                print(f"[KRX] 첫 항목 키: {list(items[0].keys())}")
 
             stocks = []
             for item in items:
@@ -159,6 +176,8 @@ def _fetch_krx_stocks(market="STK"):
             print(f"[KRX] 타임아웃 — 재시도 {attempt+1}/3")
         except Exception as e:
             print(f"[KRX 크롤링 오류] {market}: {e}")
+            import traceback
+            traceback.print_exc()
 
     print(f"[KRX] {market} 3회 재시도 모두 실패")
     return []
