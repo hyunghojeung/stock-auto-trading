@@ -20,8 +20,8 @@ import json
 import traceback
 
 from app.core.database import db
-# ★ 변경: KIS → 네이버 일봉 수집기
-from app.services.naver_stock import get_daily_candles_naver
+# ★ 변경: KIS → 네이버 일봉 수집기 (종목명 포함)
+from app.services.naver_stock import get_daily_candles_naver, get_daily_candles_with_name
 
 router = APIRouter(prefix="/api/swing", tags=["스윙백테스트"])
 
@@ -99,12 +99,14 @@ async def _run_analysis_task(rise_threshold=30.0, generations=10, top_n=20):
         total = len(stocks)
         for i, stock in enumerate(stocks):
             try:
-                # ★ 변경: KIS → 네이버 일봉 수집
-                candles = get_daily_candles_naver(stock["code"], count=250)
+                # ★ 변경: 일봉 + 종목명 동시 수집 (추가 API 호출 없음)
+                candles, naver_name = get_daily_candles_with_name(stock["code"], count=250)
                 if candles and len(candles) >= 60:
+                    # 종목명 우선순위: 네이버에서 가져온 이름 > 기존 이름 > 코드
+                    stock_name = naver_name if (naver_name and naver_name != stock["code"]) else stock.get("name", stock["code"])
                     all_stocks_data.append({
                         "code": stock["code"],
-                        "name": stock.get("name", stock["code"]),
+                        "name": stock_name,
                         "market": stock.get("market", ""),
                         "candles": candles,
                     })
@@ -196,7 +198,7 @@ async def _run_analysis_task(rise_threshold=30.0, generations=10, top_n=20):
         result = {
             "timestamp": datetime.now().isoformat(),
             "stocks_analyzed": len(all_stocks_data),
-            "data_source": "naver",  # ★ 추가: 데이터 소스 표시
+            "data_source": "naver",
             "winner_profile": {
                 "total_winners": winner_profile.get("total_winners", 0),
                 "rise_threshold": rise_threshold,
@@ -211,6 +213,22 @@ async def _run_analysis_task(rise_threshold=30.0, generations=10, top_n=20):
                 "generations": calibration["generations"],
             },
             "final_stats": _serialize_pattern_stats(final_stats),
+            # ★ 추가: 개별 매매 데이터 (프론트엔드 기간 필터링용)
+            "trades_summary": [
+                {
+                    "entry_date": t.entry_date,
+                    "exit_date": t.exit_date,
+                    "profit_pct": t.profit_pct,
+                    "stock_code": t.entry_conditions.get("stock_code", ""),
+                    "stock_name": t.entry_conditions.get("stock_name", ""),
+                    "is_win": t.is_win,
+                    "holding_days": t.holding_days,
+                    "exit_reason": t.exit_reason,
+                    "entry_price": t.entry_price,
+                    "exit_price": t.exit_price,
+                }
+                for t in final_trades
+            ],
         }
 
         # DB에 저장
@@ -361,8 +379,8 @@ async def test_single_stock(code: str,
     from app.engine.swing_pattern_stats import run_swing_backtest, analyze_timing_patterns
 
     try:
-        # ★ 변경: KIS → 네이버 일봉
-        candles = get_daily_candles_naver(code, count=250)
+        # ★ 변경: 네이버 일봉 + 종목명
+        candles, stock_name = get_daily_candles_with_name(code, count=250)
         if not candles or len(candles) < 60:
             return {"error": f"일봉 데이터가 부족합니다 ({len(candles) if candles else 0}개)"}
 
@@ -397,7 +415,8 @@ async def test_single_stock(code: str,
 
         return {
             "code": code,
-            "data_source": "naver",  # ★ 추가
+            "name": stock_name,  # ★ 추가: 종목명
+            "data_source": "naver",
             "total_candles": len(candles),
             "candles": candles[-120:],  # 최근 120일만
             "trade_points": trade_points,
