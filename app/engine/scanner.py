@@ -183,6 +183,11 @@ def _parse_naver_item(item, market="STK"):
         return None
 
     try:
+        # ETF, ETN 등 제외 — 보통주만
+        end_type = item.get("stockEndType", "stock")
+        if end_type in ("etf", "etn", "elw"):
+            return None
+
         # 종목코드 (다양한 필드명)
         code = str(
             item.get("itemCode") or item.get("stockCode") or
@@ -190,11 +195,11 @@ def _parse_naver_item(item, market="STK"):
             item.get("symbolCode") or item.get("reutersCode", "")
         ).strip()
 
-        # 6자리 숫자 코드만 허용
+        # 6자리 숫자 코드만 허용 (0126Z0 같은 비숫자 코드 제외)
         # reutersCode 형식: "005930.KS" → "005930"
         if "." in code:
             code = code.split(".")[0]
-        if not code.isdigit() or len(code) != 6:
+        if len(code) != 6 or not code.isdigit():
             return None
 
         # 종목명
