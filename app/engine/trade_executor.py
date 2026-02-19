@@ -26,7 +26,8 @@ async def execute_trading_cycle():
         # 감시종목 가져오기
         today = date.today().isoformat()
         watchlist = db.table("watchlist").select("*").eq("scan_date", today).eq("status", "감시중").execute()
-
+        print(f"[매매사이클] 전략 {len(strategies.data)}개, 감시종목 {len(watchlist.data or [])}개")
+        
         for strategy in strategies.data:
             await _process_strategy(strategy, watchlist.data or [])
 
