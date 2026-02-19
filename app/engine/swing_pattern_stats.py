@@ -274,9 +274,16 @@ def _get_entry_conditions(candles, idx, closes, ma5, ma20, ma60,
 # 패턴 통계 분석 / Pattern Statistics Analysis
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
+def analyze_timing_patterns(all_trades: List[TradeSimulation],
+                           max_positions: int = 5) -> Dict:
     """
     전체 시뮬레이션 결과에서 타이밍 패턴별 승률/수익률 통계를 추출한다.
+
+    ★ 포트폴리오 시뮬레이션 방식:
+    - 동시 최대 max_positions 종목 보유
+    - 자본금을 빈 슬롯 수로 분할하여 투입
+    - 매도 시 원금+수익이 현금으로 복귀
+    - 같은 날짜: 매도 먼저 → 매수 (슬롯 확보 후 투입)
     """
     if not all_trades:
         return {"total_trades": 0}
@@ -285,43 +292,78 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
     wins = [t for t in all_trades if t.is_win]
     losses = [t for t in all_trades if not t.is_win]
 
-    # ── 자본금 기반 에퀴티 커브 (★ 수정) ──
-    # 각 매매를 순차적으로 적용하여 복리 수익률 계산
-    sorted_trades = sorted(all_trades, key=lambda x: x.entry_idx)
-    capital = 100.0  # 100% = 초기 자본금
-    equity = [0.0]   # 누적 수익률 (%) 기준
-    for t in sorted_trades:
-        # 복리 적용: 현재 자본에 매매 수익률 반영
-        capital = capital * (1 + t.profit_pct / 100)
-        # equity curve는 누적 수익률(%) 표시
-        equity.append(round(capital - 100, 2))
+    # ── 포트폴리오 시뮬레이션 (★ 전면 교체) ──
+    # 1) 매매 이벤트 생성 (진입/청산)
+    events = []
+    for i, t in enumerate(all_trades):
+        entry_d = t.entry_date[:8].replace("-", "") if t.entry_date else "00000000"
+        exit_d = t.exit_date[:8].replace("-", "") if t.exit_date else "99999999"
+        # 같은 날짜면 매도(0)를 매수(1)보다 먼저 처리
+        events.append(("entry", entry_d, i, t))
+        events.append(("exit", exit_d, i, t))
 
-    # ── MDD 계산 (자본금 기반) (★ 수정) ──
-    # 자본금 곡선에서 고점 대비 최대 낙폭 계산
-    capital_curve = [100.0]
-    cap = 100.0
-    for t in sorted_trades:
-        cap = cap * (1 + t.profit_pct / 100)
-        capital_curve.append(cap)
+    events.sort(key=lambda e: (e[1], 0 if e[0] == "exit" else 1))
 
-    peak_capital = capital_curve[0]
+    INITIAL_CAPITAL = 100.0
+    cash = INITIAL_CAPITAL
+    active = {}  # trade_index → invested_amount
+    portfolio_values = [INITIAL_CAPITAL]
+    executed_trades = 0
+    skipped_trades = 0
+
+    for event_type, date_str, trade_idx, trade in events:
+        if event_type == "exit" and trade_idx in active:
+            # ── 매도: 원금 + 수익 현금화 ──
+            invested = active.pop(trade_idx)
+            returned = invested * (1 + trade.profit_pct / 100)
+            cash += returned
+            executed_trades += 1
+
+            # 포트폴리오 가치 기록 (매도 시점)
+            total_value = cash + sum(active.values())
+            portfolio_values.append(round(total_value, 4))
+
+        elif event_type == "entry" and trade_idx not in active:
+            # ── 매수: 빈 슬롯이 있고 현금이 있을 때만 ──
+            if len(active) < max_positions and cash > 1.0:
+                # 현금을 빈 슬롯 수로 분할
+                available_slots = max_positions - len(active)
+                invest_amount = cash / available_slots
+                active[trade_idx] = invest_amount
+                cash -= invest_amount
+            else:
+                skipped_trades += 1
+
+    # 남은 포지션 강제 청산 (시뮬레이션 종료)
+    for trade_idx, invested in list(active.items()):
+        # 해당 매매의 수익률 적용
+        trade = all_trades[trade_idx]
+        returned = invested * (1 + trade.profit_pct / 100)
+        cash += returned
+    active.clear()
+
+    final_capital = cash
+    total_return_compound = round(final_capital - INITIAL_CAPITAL, 2)
+
+    # ── 에퀴티 커브 (% 기준) ──
+    equity = [round(v - INITIAL_CAPITAL, 2) for v in portfolio_values]
+
+    # ── MDD 계산 (포트폴리오 가치 기반) ──
+    peak = portfolio_values[0]
     max_drawdown = 0.0
-    for c in capital_curve:
-        if c > peak_capital:
-            peak_capital = c
-        if peak_capital > 0:
-            dd = (c - peak_capital) / peak_capital * 100
+    for v in portfolio_values:
+        if v > peak:
+            peak = v
+        if peak > 0:
+            dd = (v - peak) / peak * 100
             if dd < max_drawdown:
                 max_drawdown = dd
 
-    # 최종 총 수익률 (복리 기반)
-    final_capital = capital_curve[-1] if capital_curve else 100.0
-    total_return_compound = round(final_capital - 100, 2)
-
-    # ── 매매 기간 계산 (실제 날짜 기반) (★ 추가) ──
+    # ── 매매 기간 계산 (실제 날짜 기반) ──
     trading_period_days = 0
     first_date_str = ""
     last_date_str = ""
+    sorted_trades = sorted(all_trades, key=lambda x: x.entry_date if x.entry_date else "")
     if sorted_trades:
         all_dates = []
         for t in sorted_trades:
@@ -341,16 +383,19 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
             except:
                 trading_period_days = 0
 
-    # ── 연환산 수익률 (★ 추가) ──
+    # ── 연환산 수익률 ──
     annualized_return = 0.0
     if trading_period_days > 30 and final_capital > 0:
         years = trading_period_days / 365
         if years > 0:
-            annualized_return = round(
-                ((final_capital / 100) ** (1 / years) - 1) * 100, 2
-            )
+            try:
+                annualized_return = round(
+                    ((final_capital / INITIAL_CAPITAL) ** (1 / years) - 1) * 100, 2
+                )
+            except:
+                annualized_return = 0.0
 
-    # ── 일평균 수익률 (★ 추가) ──
+    # ── 일평균 수익률 ──
     daily_return = 0.0
     if trading_period_days > 0:
         daily_return = round(total_return_compound / trading_period_days, 4)
@@ -358,6 +403,9 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
     # ── 전체 요약 ──
     summary = {
         "total_trades": total,
+        "executed_trades": executed_trades,          # ★ 추가: 실제 체결된 매매
+        "skipped_trades": skipped_trades,            # ★ 추가: 슬롯 부족으로 건너뛴 매매
+        "max_positions": max_positions,              # ★ 추가: 동시 최대 종목 수
         "win_count": len(wins),
         "loss_count": len(losses),
         "win_rate": round(len(wins) / total * 100, 1),
@@ -367,13 +415,13 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
         "max_profit": round(max(t.profit_pct for t in all_trades), 2),
         "max_loss": round(min(t.profit_pct for t in all_trades), 2),
         "avg_holding_days": round(sum(t.holding_days for t in all_trades) / total, 1),
-        "total_return": total_return_compound,       # ★ 복리 기반
-        "mdd": round(max_drawdown, 2),               # ★ 자본금 기반
-        "trading_period_days": trading_period_days,   # ★ 추가: 실제 매매 기간 (일)
-        "first_trade_date": first_date_str,           # ★ 추가: 첫 매매일
-        "last_trade_date": last_date_str,             # ★ 추가: 마지막 매매일
-        "annualized_return": annualized_return,       # ★ 추가: 연환산 수익률
-        "daily_return": daily_return,                 # ★ 추가: 일평균 수익률
+        "total_return": total_return_compound,       # ★ 포트폴리오 시뮬레이션 기반
+        "mdd": round(max_drawdown, 2),               # ★ 포트폴리오 가치 기반
+        "trading_period_days": trading_period_days,
+        "first_trade_date": first_date_str,
+        "last_trade_date": last_date_str,
+        "annualized_return": annualized_return,
+        "daily_return": daily_return,
     }
 
     # ── 눌림 % 구간별 승률 ──
@@ -614,10 +662,12 @@ def auto_calibrate(candles_dict: Dict[str, List[Dict]],
         return new_params
 
     def evaluate(params):
-        """파라미터로 전체 백테스트 실행 → 점수 계산"""
+        """파라미터로 전체 백테스트 실행 → 점수 계산 (포트폴리오 시뮬레이션)"""
         all_trades = []
         for code, candles in candles_dict.items():
             trades = run_swing_backtest(candles, params)
+            for t in trades:
+                t.entry_conditions["stock_code"] = code
             all_trades.extend(trades)
 
         if len(all_trades) < 5:
@@ -628,20 +678,43 @@ def auto_calibrate(candles_dict: Dict[str, List[Dict]],
         win_rate = len(wins) / total
         avg_profit = sum(t.profit_pct for t in all_trades) / total
 
-        # ★ 수정: 자본금 기반 수익률/MDD 계산
-        cap = 100.0
-        peak = 100.0
-        mdd = 0
-        for t in sorted(all_trades, key=lambda x: x.entry_idx):
-            cap = cap * (1 + t.profit_pct / 100)
-            if cap > peak:
-                peak = cap
-            if peak > 0:
-                dd = (cap - peak) / peak * 100
-                if dd < mdd:
-                    mdd = dd
+        # ★ 포트폴리오 시뮬레이션 (동시 최대 5종목)
+        MAX_POS = 5
+        events = []
+        for i, t in enumerate(all_trades):
+            ed = t.entry_date[:8].replace("-", "") if t.entry_date else "00000000"
+            xd = t.exit_date[:8].replace("-", "") if t.exit_date else "99999999"
+            events.append(("entry", ed, i, t))
+            events.append(("exit", xd, i, t))
+        events.sort(key=lambda e: (e[1], 0 if e[0] == "exit" else 1))
 
-        total_return = round(cap - 100, 2)
+        cash = 100.0
+        active = {}
+        peak = 100.0
+        mdd = 0.0
+
+        for etype, _, tidx, trade in events:
+            if etype == "exit" and tidx in active:
+                invested = active.pop(tidx)
+                cash += invested * (1 + trade.profit_pct / 100)
+                total_val = cash + sum(active.values())
+                if total_val > peak:
+                    peak = total_val
+                if peak > 0:
+                    dd = (total_val - peak) / peak * 100
+                    if dd < mdd:
+                        mdd = dd
+            elif etype == "entry" and tidx not in active:
+                if len(active) < MAX_POS and cash > 1.0:
+                    avail = MAX_POS - len(active)
+                    amt = cash / avail
+                    active[tidx] = amt
+                    cash -= amt
+
+        # 남은 포지션 청산
+        for tidx, inv in list(active.items()):
+            cash += inv * (1 + all_trades[tidx].profit_pct / 100)
+        total_return = round(cash - 100, 2)
 
         # 종합 점수: 수익률 * 승률 - MDD 패널티
         score = total_return * win_rate - abs(mdd) * 0.5
