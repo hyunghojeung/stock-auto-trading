@@ -3,6 +3,16 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 과거 1년간 크게 상승한 종목들의 "상승 직전" 공통 특징을 통계적으로 분석하여
 현재 같은 조건을 충족하는 종목을 자동으로 발굴합니다.
+
+[변경사항 / Changes]
+- 점수 체계 전면 개편: 가중치 곱셈 → 기본점수 + 위너 보너스
+- 최소 기준 40점 → 25점
+- 조건별 점수 현실화 (상호 모순 조건 고려)
+- RSI 구간 확장 (30~65)
+- 눌림 구간 확장 (2~12%)
+- 볼린저 구간 확장 (0.4 미만)
+
+파일 경로: app/engine/swing_discoverer.py
 """
 
 import requests
@@ -182,6 +192,17 @@ def detect_candle_pattern(candles: List[Dict], idx: int) -> str:
     if (c_upper > c_body * 2 and c_lower < c_body * 0.5
             and not p_is_bull):
         return "역망치형"
+
+    # ★ 추가: 도지형 (Doji) — 시장 반전 신호
+    if c_body > 0 and (c["high"] - c["low"]) > 0:
+        if c_body / (c["high"] - c["low"]) < 0.1:
+            return "도지형"
+
+    # ★ 추가: 양봉 반전 (전일 음봉 → 금일 강한 양봉)
+    if (not p_is_bull and c_is_bull
+            and c_body > p_body * 0.8
+            and c["close"] > p["open"]):
+        return "양봉반전"
 
     return ""
 
@@ -372,16 +393,26 @@ def build_winner_profile(all_stocks_data: List[Dict],
     vol_above_1_5 = sum(1 for v in vol_surges if v >= 1.5)
     stats["거래량 1.5배 이상"] = round(vol_above_1_5 / total * 100, 1)
 
+    # ★ 추가: 거래량 1.2배 이상 (완화된 기준)
+    vol_above_1_2 = sum(1 for v in vol_surges if v >= 1.2)
+    stats["거래량 1.2배 이상"] = round(vol_above_1_2 / total * 100, 1)
+
     # RSI 구간
     rsi_vals = [c.get("rsi", 50) for c in all_conditions if c.get("rsi") is not None]
     if rsi_vals:
         rsi_40_60 = sum(1 for r in rsi_vals if 40 <= r <= 60)
         stats["RSI 40~60 구간"] = round(rsi_40_60 / len(rsi_vals) * 100, 1)
+        # ★ 추가: 확장 RSI 구간
+        rsi_30_65 = sum(1 for r in rsi_vals if 30 <= r <= 65)
+        stats["RSI 30~65 구간"] = round(rsi_30_65 / len(rsi_vals) * 100, 1)
 
     # 눌림 %
     pullbacks = [c.get("pullback_pct", 0) for c in all_conditions]
     pb_3_8 = sum(1 for p in pullbacks if 3 <= p <= 8)
     stats["눌림 3~8%"] = round(pb_3_8 / total * 100, 1)
+    # ★ 추가: 확장 눌림 구간
+    pb_2_12 = sum(1 for p in pullbacks if 2 <= p <= 12)
+    stats["눌림 2~12%"] = round(pb_2_12 / total * 100, 1)
 
     # 볼린저 위치
     bb_vals = [c.get("bb_position", 0.5) for c in all_conditions
@@ -389,6 +420,9 @@ def build_winner_profile(all_stocks_data: List[Dict],
     if bb_vals:
         bb_lower = sum(1 for b in bb_vals if b < 0.3)
         stats["볼린저밴드 하단(0.3 미만)"] = round(bb_lower / len(bb_vals) * 100, 1)
+        # ★ 추가: 확장 볼린저 구간
+        bb_mid_lower = sum(1 for b in bb_vals if b < 0.5)
+        stats["볼린저밴드 중하단(0.5 미만)"] = round(bb_mid_lower / len(bb_vals) * 100, 1)
 
     # 봉 패턴
     patterns = [c.get("candle_pattern", "") for c in all_conditions if c.get("candle_pattern")]
@@ -397,6 +431,14 @@ def build_winner_profile(all_stocks_data: List[Dict],
         pattern_counts = Counter(patterns)
         for p_name, count in pattern_counts.most_common(5):
             stats[f"패턴: {p_name}"] = round(count / total * 100, 1)
+
+    # ★ 추가: 20일 이내 MA5 골든크로스 발생 비율
+    ma5_cross = 0
+    for c in all_conditions:
+        # 이 정보는 개별 조건에 없으므로 MA5>MA20 여부로 대체
+        if c.get("ma5_above_ma20", False):
+            ma5_cross += 1
+    # 이미 위에서 계산됨
 
     # 상위 조건 정렬
     top_conditions = sorted(
@@ -422,7 +464,11 @@ def build_winner_profile(all_stocks_data: List[Dict],
 def score_stock_for_swing(candles: List[Dict],
                           winner_profile: Dict) -> Tuple[float, List[str], Dict]:
     """
-    한 종목의 현재 상태를 위너 프로필과 비교하여 점수를 매긴다.
+    ★ 개편된 점수 체계:
+    - 기본 점수: 조건 충족 시 고정 점수 부여
+    - 위너 보너스: 위너 프로필 비율이 높을수록 추가 점수
+    - 조건 구간 완화: RSI 30~65, 눌림 2~12%, 볼린저 0.5 미만
+    - 최대 점수: 100점
 
     Returns: (score, matched_conditions, details)
     """
@@ -447,74 +493,137 @@ def score_stock_for_swing(candles: List[Dict],
     details = {}
     stats = winner_profile.get("condition_stats", {})
 
-    # 1) MA5 > MA20 체크
-    if ma5[idx] and ma20[idx] and ma5[idx] > ma20[idx]:
-        weight = stats.get("MA5 > MA20", 50) / 100
-        score += 15 * weight
-        matched.append("MA5 > MA20 (단기 상승 추세)")
-        details["ma5_above_ma20"] = True
+    def _bonus(stat_key: str) -> float:
+        """위너 프로필 비율 기반 보너스 (0~5점)"""
+        pct = stats.get(stat_key, 0)
+        return min(5, pct / 20)  # 100%면 +5점, 60%면 +3점, 20%면 +1점
 
-    # 2) MA20 > MA60 체크
+    # ── 1) MA 정배열 (중기) ── 기본 12점
     if ma20[idx] and ma60[idx] and ma20[idx] > ma60[idx]:
-        weight = stats.get("MA20 > MA60", 50) / 100
-        score += 15 * weight
+        base = 12
+        bonus = _bonus("MA20 > MA60")
+        score += base + bonus
         matched.append("MA20 > MA60 (중기 상승 추세)")
         details["ma20_above_ma60"] = True
 
-    # 3) 거래량 서지
+    # ── 2) MA 정배열 (단기) ── 기본 10점
+    if ma5[idx] and ma20[idx] and ma5[idx] > ma20[idx]:
+        base = 10
+        bonus = _bonus("MA5 > MA20")
+        score += base + bonus
+        matched.append("MA5 > MA20 (단기 상승 추세)")
+        details["ma5_above_ma20"] = True
+    # ★ 추가: 역배열이지만 MA5가 MA20에 근접 (수렴 중) → 부분 점수
+    elif ma5[idx] and ma20[idx]:
+        gap_pct = abs(ma5[idx] - ma20[idx]) / ma20[idx] * 100
+        if gap_pct < 2.0:  # 2% 미만 차이
+            score += 5
+            matched.append(f"MA5 ≈ MA20 (수렴 중, 차이 {gap_pct:.1f}%)")
+            details["ma_converging"] = True
+
+    # ── 3) 거래량 ── 기본 8~15점 (구간별)
     if idx >= 20:
         vol_5 = sum(volumes[idx - 4:idx + 1]) / 5
         vol_20 = sum(volumes[idx - 19:idx + 1]) / 20
         vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 1.0
         details["volume_ratio"] = round(vol_ratio, 2)
-        if vol_ratio >= 1.5:
-            weight = stats.get("거래량 1.5배 이상", 50) / 100
-            score += 20 * weight
-            matched.append(f"거래량 급증 ({vol_ratio:.1f}배)")
 
-    # 4) RSI 40~60 구간
+        if vol_ratio >= 2.0:
+            score += 15 + _bonus("거래량 1.5배 이상")
+            matched.append(f"거래량 폭증 ({vol_ratio:.1f}배)")
+        elif vol_ratio >= 1.5:
+            score += 12 + _bonus("거래량 1.5배 이상")
+            matched.append(f"거래량 급증 ({vol_ratio:.1f}배)")
+        elif vol_ratio >= 1.2:
+            score += 8 + _bonus("거래량 1.2배 이상")
+            matched.append(f"거래량 증가 ({vol_ratio:.1f}배)")
+
+    # ── 4) RSI 구간 ── 기본 8~12점 (구간별)
     if rsi[idx] is not None:
         details["rsi"] = round(rsi[idx], 1)
         if 40 <= rsi[idx] <= 60:
-            weight = stats.get("RSI 40~60 구간", 50) / 100
-            score += 15 * weight
-            matched.append(f"RSI 적정 구간 ({rsi[idx]:.0f})")
+            score += 12 + _bonus("RSI 40~60 구간")
+            matched.append(f"RSI 최적 구간 ({rsi[idx]:.0f})")
+        elif 30 <= rsi[idx] < 40:
+            score += 10
+            matched.append(f"RSI 반등 가능 ({rsi[idx]:.0f})")
+        elif 60 < rsi[idx] <= 65:
+            score += 8
+            matched.append(f"RSI 상승 추세 ({rsi[idx]:.0f})")
 
-    # 5) 눌림 3~8%
+    # ── 5) 눌림 구간 ── 기본 8~15점 (구간별)
     lookback = 20
     recent_high = max(closes[max(0, idx - lookback):idx + 1])
     pullback = (recent_high - closes[idx]) / recent_high * 100
     details["pullback_pct"] = round(pullback, 2)
-    if 3 <= pullback <= 8:
-        weight = stats.get("눌림 3~8%", 50) / 100
-        score += 20 * weight
-        matched.append(f"적정 눌림 ({pullback:.1f}%)")
 
-    # 6) 볼린저밴드 하단
+    if 3 <= pullback <= 8:
+        score += 15 + _bonus("눌림 3~8%")
+        matched.append(f"최적 눌림 ({pullback:.1f}%)")
+    elif 2 <= pullback < 3:
+        score += 10
+        matched.append(f"경미한 눌림 ({pullback:.1f}%)")
+    elif 8 < pullback <= 12:
+        score += 10
+        matched.append(f"깊은 눌림 ({pullback:.1f}%)")
+    elif pullback < 2 and ma5[idx] and ma20[idx] and ma5[idx] > ma20[idx]:
+        score += 6
+        matched.append(f"상승 지속 중 (눌림 {pullback:.1f}%)")
+
+    # ── 6) 볼린저밴드 위치 ── 기본 5~10점
     if bb_pos[idx] is not None:
         details["bb_position"] = round(bb_pos[idx], 3)
-        if bb_pos[idx] < 0.3:
-            weight = stats.get("볼린저밴드 하단(0.3 미만)", 50) / 100
-            score += 10 * weight
+        if bb_pos[idx] < 0.2:
+            score += 10 + _bonus("볼린저밴드 하단(0.3 미만)")
+            matched.append(f"볼린저 극하단 ({bb_pos[idx]:.2f})")
+        elif bb_pos[idx] < 0.3:
+            score += 8 + _bonus("볼린저밴드 하단(0.3 미만)")
             matched.append(f"볼린저 하단 ({bb_pos[idx]:.2f})")
+        elif bb_pos[idx] < 0.5:
+            score += 5
+            matched.append(f"볼린저 중하단 ({bb_pos[idx]:.2f})")
 
-    # 7) 봉 패턴
+    # ── 7) 봉 패턴 ── 기본 8점
     pattern = detect_candle_pattern(candles, idx)
     if pattern:
         details["candle_pattern"] = pattern
-        score += 10
+        score += 8
         matched.append(f"봉 패턴: {pattern}")
+    # ★ 추가: 최근 3일 이내 패턴 확인 (당일뿐 아니라)
+    elif idx >= 3:
+        for k in range(1, 4):
+            p = detect_candle_pattern(candles, idx - k)
+            if p:
+                details["recent_pattern"] = f"{p} ({k}일 전)"
+                score += 4
+                matched.append(f"최근 패턴: {p} ({k}일 전)")
+                break
 
-    # 8) ATR 변동성
+    # ── 8) 추가 조건들 ──
+
+    # 20일선 지지 (현재가가 MA20 부근)
+    if ma20[idx] and closes[idx] > 0:
+        ma20_gap = abs(closes[idx] - ma20[idx]) / closes[idx] * 100
+        if ma20_gap < 2.0 and closes[idx] >= ma20[idx]:
+            score += 5
+            matched.append(f"20일선 지지 (차이 {ma20_gap:.1f}%)")
+            details["ma20_support"] = True
+
+    # ATR 변동성
     if atr[idx]:
         atr_pct = atr[idx] / closes[idx] * 100
         details["atr_pct"] = round(atr_pct, 2)
+        if 2 <= atr_pct <= 5:
+            score += 3
+            matched.append(f"적정 변동성 (ATR {atr_pct:.1f}%)")
+
+    # ── 최종 점수 조정 ──
+    score = min(score, 100)
 
     # 신호 강도
-    score = min(score, 100)
-    if score >= 70:
+    if score >= 60:
         signal = "강"
-    elif score >= 50:
+    elif score >= 40:
         signal = "중"
     else:
         signal = "약"
@@ -528,6 +637,7 @@ def discover_swing_candidates(all_stocks_data: List[Dict],
     """
     전체 종목을 스캔하여 스윙 후보 종목을 발굴한다.
 
+    ★ 변경: 최소 점수 40 → 25 (더 많은 후보를 보여주고 점수로 구분)
     Returns: 점수 상위 top_n개 종목
     """
     candidates = []
@@ -539,7 +649,7 @@ def discover_swing_candidates(all_stocks_data: List[Dict],
 
         score, matched, details = score_stock_for_swing(candles, winner_profile)
 
-        if score >= 40:  # 최소 점수 기준
+        if score >= 25:  # ★ 변경: 40 → 25 (더 많은 후보)
             candidates.append({
                 "code": stock["code"],
                 "name": stock["name"],
@@ -553,4 +663,9 @@ def discover_swing_candidates(all_stocks_data: List[Dict],
 
     # 점수 내림차순 정렬
     candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    print(f"[발굴] 전체 {len(all_stocks_data)}종목 중 "
+          f"25점 이상: {len(candidates)}개, "
+          f"상위 {min(top_n, len(candidates))}개 반환")
+
     return candidates[:top_n]
