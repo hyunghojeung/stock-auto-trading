@@ -61,7 +61,6 @@ def get_minute_candles(code, count=30, is_live=False):
     except Exception as e:
         print(f"[분봉 오류] {code}: {e}")
     return []
-
 def get_orderbook(code, is_live=False):
     auth = get_kis(is_live)
     h = auth.get_headers()
