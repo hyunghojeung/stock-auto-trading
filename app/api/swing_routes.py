@@ -150,6 +150,7 @@ async def _run_analysis_task(rise_threshold=30.0, generations=10, top_n=20):
 
         all_trades_sim = []
         candles_dict = {}
+        name_map = {}  # ★ 추가: 종목코드 → 종목명 매핑
         for stock in all_stocks_data[:100]:  # 상위 100종목만
             candles = stock["candles"]
             trades = run_swing_backtest(candles)
@@ -158,6 +159,7 @@ async def _run_analysis_task(rise_threshold=30.0, generations=10, top_n=20):
                 t.entry_conditions["stock_name"] = stock["name"]
             all_trades_sim.extend(trades)
             candles_dict[stock["code"]] = candles
+            name_map[stock["code"]] = stock["name"]  # ★ 추가
 
         pattern_stats = analyze_timing_patterns(all_trades_sim)
         _update_progress("백테스트", 80,
@@ -185,6 +187,7 @@ async def _run_analysis_task(rise_threshold=30.0, generations=10, top_n=20):
             trades = run_swing_backtest(candles, best_params)
             for t in trades:
                 t.entry_conditions["stock_code"] = code
+                t.entry_conditions["stock_name"] = name_map.get(code, code)  # ★ 수정: 종목명 추가
             final_trades.extend(trades)
 
         final_stats = analyze_timing_patterns(final_trades)
