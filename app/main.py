@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic
 from contextlib import asynccontextmanager
-from app.core.config import config
+from app.core.config import config, KST
 from app.core.scheduler import setup_scheduler
 from app.api import stock_routes, trade_routes, portfolio_routes, watchlist_routes, strategy_routes, kakao_routes
 from app.utils.kr_holiday import get_market_status, is_market_open_now, get_holiday_name, get_next_market_day
@@ -21,6 +21,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="10억 만들기 - 주식 자동매매", version="1.0.0", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,12 +38,13 @@ app.include_router(watchlist_routes.router)
 app.include_router(strategy_routes.router)
 app.include_router(kakao_routes.router)
 app.include_router(backtest_router)
-app.include_router(swing_router)   
+app.include_router(swing_router)
 
 
 @app.get("/")
 async def root():
-    return {"name": "10억 만들기", "status": "running", "market": get_market_status()}
+    now = datetime.now(KST)
+    return {"name": "10억 만들기", "status": "running", "market": get_market_status(now)}
 
 
 @app.get("/api/auth")
@@ -54,7 +56,7 @@ async def authenticate(password: str):
 
 @app.get("/api/system/status")
 async def system_status():
-    now = datetime.now()
+    now = datetime.now(KST)
     holiday = get_holiday_name(now.date())
     return {
         "datetime": now.isoformat(),
