@@ -132,10 +132,23 @@ def _fetch_naver_json_api(market="STK"):
             if len(stocks_list) == 0:
                 break
 
+            # 첫 페이지 첫 항목 디버그
+            if page == 1 and stocks_list:
+                first = stocks_list[0]
+                print(f"[네이버API] 첫 종목 전체 키: {list(first.keys()) if isinstance(first, dict) else 'not dict'}")
+                # marketValue 필드 확인
+                mv = first.get("marketValue") if isinstance(first, dict) else None
+                print(f"[네이버API] marketValue 필드값: {mv}")
+
+            parsed_count = 0
             for item in stocks_list:
                 stock = _parse_naver_item(item, market)
                 if stock:
                     all_stocks.append(stock)
+                    # 첫 파싱 성공 종목의 market_cap 로그
+                    if parsed_count == 0 and page == 1:
+                        print(f"[네이버API] 첫 파싱 종목: {stock['name']} / price={stock['price']} / market_cap={stock['market_cap']:,}")
+                    parsed_count += 1
 
             # 마지막 페이지
             if len(stocks_list) < page_size:
@@ -241,11 +254,23 @@ def _parse_naver_item(item, market="STK"):
         if volume <= 0:
             return None
 
-        # 시가총액
-        mktcap = _safe_int(
+        # 시가총액 — 네이버 API는 억원 단위 (예: 11,176,276 = 1,117조6,276억원)
+        # scorer는 원 단위로 비교하므로 × 100,000,000 변환
+        mktcap_raw = _safe_int(
             item.get("marketValue") or item.get("marketCap") or
-            item.get("mv") or item.get("mktCap") or 0
+            item.get("mv") or item.get("mktCap") or
+            item.get("marketTotalAmount") or item.get("totalMarketValue") or 0
         )
+        if mktcap_raw > 0:
+            mktcap = mktcap_raw * 100_000_000
+        else:
+            # marketValue 필드가 없는 경우 → 거래대금으로 추정
+            trade_val = _safe_int(item.get("accumulatedTradingValue") or 0)
+            if trade_val > 0:
+                # 거래대금(백만원 단위) → 원 변환 (대략적 시총 추정용)
+                mktcap = trade_val * 1_000_000
+            else:
+                mktcap = 0
 
         return {
             "code": code,
