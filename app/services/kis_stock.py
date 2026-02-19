@@ -50,7 +50,7 @@ def get_minute_candles(code, count=30, is_live=False):
         r = requests.get(f"{auth.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice", headers=h, params=p, timeout=10)
         d = r.json()
         if d.get("rt_cd") == "0":
-       output2 = d.get("output2", [])
+            output2 = d.get("output2", [])
             if not isinstance(output2, list):
                 print(f"[분봉] {code}: output2가 리스트 아님 - {type(output2)}")
                 return []
