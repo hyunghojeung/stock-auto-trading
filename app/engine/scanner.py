@@ -2,6 +2,7 @@
 import requests
 from datetime import datetime, date, timedelta
 from app.core.database import db
+from app.core.config import KST
 
 
 async def scan_all_stocks():
@@ -23,14 +24,15 @@ def _get_last_trading_date():
     """마지막 거래일 찾기 / Find last trading date with KRX data"""
     from app.utils.kr_holiday import is_market_open_day
 
-    now = datetime.now()
+    now = datetime.now(KST)
     check_date = now.date()
 
     # 오늘이 거래일이고 16시 이후면 → 오늘 데이터 사용
     if is_market_open_day(check_date) and now.hour >= 16:
         return check_date
 
-    # 그 외: 이전 거래일 찾기 (오늘 포함하지 않음)
+    # 장중(9시~16시)이면 → 전일 데이터 사용 (당일 데이터는 장 마감 후 확정)
+    # 장 전(~9시)이면 → 전일 데이터 사용
     check_date -= timedelta(days=1)
     for _ in range(10):
         if is_market_open_day(check_date):
@@ -45,7 +47,7 @@ def _get_next_trading_date():
     """다음 거래일 찾기 / Find next trading date (for night scan)"""
     from app.utils.kr_holiday import is_market_open_day
 
-    check_date = datetime.now().date() + timedelta(days=1)
+    check_date = datetime.now(KST).date() + timedelta(days=1)
     for _ in range(10):
         if is_market_open_day(check_date):
             return check_date
@@ -56,9 +58,16 @@ def _get_next_trading_date():
 def _fetch_krx_stocks(market="STK"):
     """KRX에서 종목 데이터 크롤링 / Crawl stock data from KRX"""
     url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+
+    # KRX는 Referer와 User-Agent가 없으면 차단할 수 있음
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Content-Type": "application/x-www-form-urlencoded",
+        "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0101",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "http://data.krx.co.kr",
     }
 
     trading_date = _get_last_trading_date()
@@ -67,56 +76,105 @@ def _fetch_krx_stocks(market="STK"):
 
     data = {
         "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
+        "locale": "ko_KR",
         "mktId": market,
         "trdDd": today,
         "share": "1",
         "money": "1",
         "csvxls_isNo": "false",
     }
-    try:
-        r = requests.post(url, headers=headers, data=data, timeout=30)
-        items = r.json().get("OutBlock_1", [])
-        stocks = []
-        for item in items:
-            try:
-                code = item.get("ISU_SRT_CD", "")
-                name = item.get("ISU_ABBRV", "")
-                price = int(item.get("TDD_CLSPRC", "0").replace(",", ""))
-                volume = int(item.get("ACC_TRDVOL", "0").replace(",", ""))
 
-                # 기본 필터: 가격 0원, 거래량 0 제외
-                if price <= 0 or volume <= 0:
-                    continue
-                # ETF, ETN, 리츠 등 제외 (코드가 숫자 6자리가 아닌 것)
-                if not code.isdigit() or len(code) != 6:
-                    continue
-                # 관리종목/정리매매 제외 (이름에 특수문자 포함)
-                if any(x in name for x in ["스팩", "SPAC"]):
-                    continue
+    # 최대 3번 재시도 (날짜를 하루씩 앞당기며)
+    for attempt in range(3):
+        try:
+            r = requests.post(url, headers=headers, data=data, timeout=30)
 
-                stocks.append({
-                    "code": code,
-                    "name": name,
-                    "market": "kospi" if market == "STK" else "kosdaq",
-                    "price": price,
-                    "change_pct": float(item.get("FLUC_RT", "0").replace(",", "")),
-                    "volume": volume,
-                    "market_cap": int(item.get("MKTCAP", "0").replace(",", "")),
-                })
-            except:
+            # 응답 상태 확인
+            if r.status_code != 200:
+                print(f"[KRX] HTTP {r.status_code} — 재시도 {attempt+1}/3")
+                # 날짜 하루 앞당기기
+                trading_date -= timedelta(days=1)
+                while not _is_weekday(trading_date):
+                    trading_date -= timedelta(days=1)
+                data["trdDd"] = trading_date.strftime("%Y%m%d")
                 continue
-        print(f"[스캐너] {market} 필터 후 {len(stocks)}개 종목")
-        return stocks
-    except Exception as e:
-        print(f"[KRX 크롤링 오류] {market}: {e}")
-        return []
+
+            # JSON 파싱 시도
+            try:
+                json_data = r.json()
+            except Exception:
+                # JSON이 아닌 응답 (HTML 등) — 처음 200자 로그
+                print(f"[KRX] JSON 파싱 실패 — 응답 처음 200자: {r.text[:200]}")
+                # 날짜 하루 앞당기고 재시도
+                trading_date -= timedelta(days=1)
+                while not _is_weekday(trading_date):
+                    trading_date -= timedelta(days=1)
+                data["trdDd"] = trading_date.strftime("%Y%m%d")
+                print(f"[KRX] 날짜 변경하여 재시도: {data['trdDd']}")
+                continue
+
+            items = json_data.get("OutBlock_1", [])
+            if not items:
+                print(f"[KRX] OutBlock_1 비어있음 (날짜: {data['trdDd']}) — 재시도 {attempt+1}/3")
+                trading_date -= timedelta(days=1)
+                while not _is_weekday(trading_date):
+                    trading_date -= timedelta(days=1)
+                data["trdDd"] = trading_date.strftime("%Y%m%d")
+                continue
+
+            stocks = []
+            for item in items:
+                try:
+                    code = item.get("ISU_SRT_CD", "")
+                    name = item.get("ISU_ABBRV", "")
+                    price = int(item.get("TDD_CLSPRC", "0").replace(",", ""))
+                    volume = int(item.get("ACC_TRDVOL", "0").replace(",", ""))
+
+                    # 기본 필터: 가격 0원, 거래량 0 제외
+                    if price <= 0 or volume <= 0:
+                        continue
+                    # ETF, ETN, 리츠 등 제외 (코드가 숫자 6자리가 아닌 것)
+                    if not code.isdigit() or len(code) != 6:
+                        continue
+                    # 관리종목/정리매매 제외
+                    if any(x in name for x in ["스팩", "SPAC"]):
+                        continue
+
+                    stocks.append({
+                        "code": code,
+                        "name": name,
+                        "market": "kospi" if market == "STK" else "kosdaq",
+                        "price": price,
+                        "change_pct": float(item.get("FLUC_RT", "0").replace(",", "")),
+                        "volume": volume,
+                        "market_cap": int(item.get("MKTCAP", "0").replace(",", "")),
+                    })
+                except:
+                    continue
+
+            print(f"[스캐너] {market} 날짜 {data['trdDd']} — 필터 후 {len(stocks)}개 종목")
+            return stocks
+
+        except requests.exceptions.Timeout:
+            print(f"[KRX] 타임아웃 — 재시도 {attempt+1}/3")
+        except Exception as e:
+            print(f"[KRX 크롤링 오류] {market}: {e}")
+
+    print(f"[KRX] {market} 3회 재시도 모두 실패")
+    return []
+
+
+def _is_weekday(d):
+    """주말이 아닌지 확인 (간단 체크)"""
+    return d.weekday() < 5
 
 
 async def refine_watchlist():
     """장전 최종 감시종목 확정 / Pre-market final watchlist confirmation"""
     try:
         # 최근 3일 이내 스캔 결과만 조회 (오래된 데이터 제외)
-        recent_date = (date.today() - timedelta(days=3)).isoformat()
+        now = datetime.now(KST)
+        recent_date = (now.date() - timedelta(days=3)).isoformat()
         result = (
             db.table("watchlist")
             .select("*")

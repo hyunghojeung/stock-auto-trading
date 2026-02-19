@@ -7,6 +7,7 @@
 """
 from datetime import datetime, date, timedelta
 from app.core.database import db
+from app.core.config import KST
 
 
 async def score_and_select(stocks, top_n=10):
@@ -80,7 +81,7 @@ def _get_scan_date():
     """
     from app.utils.kr_holiday import is_market_open_day
 
-    now = datetime.now()
+    now = datetime.now(KST)
 
     if now.hour >= 16:
         # 야간: 다음 거래일
@@ -90,7 +91,7 @@ def _get_scan_date():
                 return check.isoformat()
             check += timedelta(days=1)
 
-    return date.today().isoformat()
+    return now.date().isoformat()
 
 
 def _passes_filter(stock):
@@ -154,9 +155,7 @@ def calculate_score(stock):
 
 
 def _volume_score(stock):
-    """거래량 활성도 점수 (25점) — 회전율(거래대금/시총) 기반
-    회전율이 높을수록 시장 관심이 높은 종목
-    """
+    """거래량 활성도 점수 (25점) — 회전율(거래대금/시총) 기반"""
     volume = stock.get("volume", 0)
     price = stock.get("price", 0)
     market_cap = stock.get("market_cap", 0)
@@ -164,13 +163,11 @@ def _volume_score(stock):
     if market_cap <= 0 or price <= 0:
         return 0
 
-    # 회전율 = 거래대금 / 시가총액 (%)
     trade_value = volume * price
     turnover = trade_value / market_cap * 100
 
-    # 회전율 기반 점수
     if turnover > 5.0:
-        return 25  # 매우 활발 (시총 5% 이상 거래)
+        return 25
     elif turnover > 2.0:
         return 20
     elif turnover > 1.0:
@@ -185,10 +182,7 @@ def _volume_score(stock):
 
 
 def _trend_score(stock):
-    """눌림목 후보 점수 (30점) — 핵심 점수!
-    눌림목 전략에 적합한 종목: 소폭 하락(-1%~-5%) + 높은 거래량
-    급등 종목보다 '적절히 눌린' 종목에 높은 점수
-    """
+    """눌림목 후보 점수 (30점) — 핵심 점수!"""
     change = stock.get("change_pct", 0)
     volume = stock.get("volume", 0)
     price = stock.get("price", 0)
@@ -196,65 +190,49 @@ def _trend_score(stock):
 
     score = 0
 
-    # 핵심: 소폭 하락 + 거래량 동반 = 눌림목 후보
     if -5.0 <= change <= -1.0:
-        # 눌림목 최적 구간!
         score = 22
-        # 거래량 동반 시 가점
         if market_cap > 0:
             turnover = (volume * price) / market_cap * 100
             if turnover > 1.0:
-                score = 30  # 거래량 동반 눌림 = 최고점
+                score = 30
             elif turnover > 0.5:
                 score = 26
-
     elif -1.0 < change <= 0:
-        # 보합~소폭 하락 (관망 구간)
         score = 12
-
     elif 0 < change <= 2.0:
-        # 소폭 상승 (반등 초기 가능)
         score = 15
-
     elif 2.0 < change <= 5.0:
-        # 중폭 상승 (추세 확인 필요)
         score = 10
-
     elif change > 5.0:
-        # 급등 (추격 매수 위험)
         score = 5
-
     elif change < -5.0:
-        # 급락 (낙폭 과대, 위험)
         score = 3
 
     return score
 
 
 def _theme_score(stock):
-    """거래대금 활성도 점수 (15점) / Trading value activity score"""
+    """거래대금 활성도 점수 (15점)"""
     volume = stock.get("volume", 0)
     price = stock.get("price", 0)
-    trade_value = volume * price  # 거래대금
+    trade_value = volume * price
 
-    # 거래대금 기준 (원)
-    if trade_value > 100_000_000_000:    # 1000억 이상
+    if trade_value > 100_000_000_000:
         return 15
-    elif trade_value > 50_000_000_000:   # 500억
+    elif trade_value > 50_000_000_000:
         return 12
-    elif trade_value > 10_000_000_000:   # 100억
+    elif trade_value > 10_000_000_000:
         return 9
-    elif trade_value > 5_000_000_000:    # 50억
+    elif trade_value > 5_000_000_000:
         return 6
-    elif trade_value > 1_000_000_000:    # 10억
+    elif trade_value > 1_000_000_000:
         return 3
     return 1
 
 
 def _technical_score(stock):
-    """기술적 복합 점수 (20점) — 변동률 + 거래량 + 가격대 복합 판단
-    단순 change_pct > 0 대신, 복합 조건으로 판단
-    """
+    """기술적 복합 점수 (20점)"""
     change = stock.get("change_pct", 0)
     volume = stock.get("volume", 0)
     price = stock.get("price", 0)
@@ -262,60 +240,54 @@ def _technical_score(stock):
 
     score = 0
 
-    # 조건 1: 거래량 동반 여부 (기본 +5)
     if volume > 500000:
         score += 5
     elif volume > 200000:
         score += 3
 
-    # 조건 2: 적정 변동 범위 (-3% ~ +3%) 내이면 안정적 (+5)
     if -3.0 <= change <= 3.0:
         score += 5
     elif -5.0 <= change <= 5.0:
         score += 2
 
-    # 조건 3: 적정 가격대 (5,000 ~ 100,000원) 매매 활발 구간 (+5)
     if 5000 <= price <= 100000:
         score += 5
     elif 3000 <= price <= 200000:
         score += 3
 
-    # 조건 4: 시가총액 적정 규모 (1000억~5조) (+5)
     if 100_000_000_000 <= market_cap <= 5_000_000_000_000:
         score += 5
     elif 50_000_000_000 <= market_cap <= 10_000_000_000_000:
         score += 3
 
-    return min(score, 20)  # 최대 20점
+    return min(score, 20)
 
 
 def _supply_score(stock):
-    """시가총액/유동성 점수 (10점) / Market cap & liquidity score"""
+    """시가총액/유동성 점수 (10점)"""
     market_cap = stock.get("market_cap", 0)
     volume = stock.get("volume", 0)
     price = stock.get("price", 0)
 
     score = 0
 
-    # 시가총액 규모 (안정성)
-    if market_cap > 1_000_000_000_000:    # 1조 이상
+    if market_cap > 1_000_000_000_000:
         score += 5
-    elif market_cap > 500_000_000_000:    # 5000억
+    elif market_cap > 500_000_000_000:
         score += 4
-    elif market_cap > 100_000_000_000:    # 1000억
+    elif market_cap > 100_000_000_000:
         score += 3
     else:
         score += 1
 
-    # 유동성 (일평균 거래대금)
     trade_value = volume * price
-    if trade_value > 10_000_000_000:     # 100억 이상
+    if trade_value > 10_000_000_000:
         score += 5
-    elif trade_value > 5_000_000_000:    # 50억
+    elif trade_value > 5_000_000_000:
         score += 4
-    elif trade_value > 1_000_000_000:    # 10억
+    elif trade_value > 1_000_000_000:
         score += 3
     else:
         score += 1
 
-    return min(score, 10)  # 최대 10점
+    return min(score, 10)
