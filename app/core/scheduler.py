@@ -3,17 +3,23 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime, date, timedelta
 from app.utils.kr_holiday import is_market_open_day
+from app.core.config import KST
 
 scheduler = AsyncIOScheduler(timezone="Asia/Seoul")
 
 
+def now_kst():
+    """항상 KST 기준 현재 시간 반환"""
+    return datetime.now(KST)
+
+
 def is_trading_day():
-    return is_market_open_day(datetime.now().date())
+    return is_market_open_day(now_kst().date())
 
 
 def _next_trading_day():
     """다음 거래일 찾기 / Find next trading day"""
-    check = datetime.now().date() + timedelta(days=1)
+    check = now_kst().date() + timedelta(days=1)
     for _ in range(10):
         if is_market_open_day(check):
             return check
@@ -30,16 +36,16 @@ async def night_scan_job():
     금요일 → 월요일 / 연휴 전날 → 연휴 후 첫 거래일
     """
     next_day = _next_trading_day()
-    days_ahead = (next_day - datetime.now().date()).days
+    days_ahead = (next_day - now_kst().date()).days
     if days_ahead > 4:
         print(f"[야간스캔] 다음 거래일({next_day})이 4일 이상 후 → 스킵")
         return
     from app.engine.scanner import scan_all_stocks
     from app.engine.scorer import score_and_select
-    print(f"[{datetime.now()}] 야간 전종목 스캔 시작 (다음 거래일: {next_day})")
+    print(f"[{now_kst()}] 야간 전종목 스캔 시작 (다음 거래일: {next_day})")
     stocks = await scan_all_stocks()
     candidates = await score_and_select(stocks, top_n=30)
-    print(f"[{datetime.now()}] 야간 스캔 완료: 후보 {len(candidates)}개")
+    print(f"[{now_kst()}] 야간 스캔 완료: 후보 {len(candidates)}개")
 
 
 async def pre_market_job():
@@ -47,9 +53,9 @@ async def pre_market_job():
     if not is_trading_day():
         return
     from app.engine.scanner import refine_watchlist
-    print(f"[{datetime.now()}] 장전 최종 확인 시작")
+    print(f"[{now_kst()}] 장전 최종 확인 시작")
     await refine_watchlist()
-    print(f"[{datetime.now()}] 감시종목 확정 완료")
+    print(f"[{now_kst()}] 감시종목 확정 완료")
 
 
 async def market_scan_job():
@@ -58,7 +64,7 @@ async def market_scan_job():
         return
     from app.engine.scanner import scan_all_stocks
     from app.engine.scorer import score_and_select
-    print(f"[{datetime.now()}] 장중 재스캔")
+    print(f"[{now_kst()}] 장중 재스캔")
     stocks = await scan_all_stocks()
     await score_and_select(stocks, top_n=10)
 
@@ -67,7 +73,7 @@ async def trading_job():
     """장중 1분 간격: 눌림목 감지 및 자동매매"""
     if not is_trading_day():
         return
-    now = datetime.now()
+    now = now_kst()
     if now.hour < 9 or (now.hour == 15 and now.minute > 30) or now.hour > 15:
         return
     from app.engine.trade_executor import execute_trading_cycle
@@ -79,7 +85,7 @@ async def daily_report_job():
     if not is_trading_day():
         return
     from app.engine.trade_executor import generate_daily_report
-    print(f"[{datetime.now()}] 일일 리포트 생성")
+    print(f"[{now_kst()}] 일일 리포트 생성")
     await generate_daily_report()
 
 
@@ -90,7 +96,7 @@ async def daily_report_job():
 async def gap_night_precompute_job():
     """전날 18시: 갭상승전략용 데이터 사전 계산"""
     next_day = _next_trading_day()
-    days_ahead = (next_day - datetime.now().date()).days
+    days_ahead = (next_day - now_kst().date()).days
     if days_ahead > 4:
         print(f"[갭전략 야간] 다음 거래일({next_day})이 4일 이상 후 → 스킵")
         return
