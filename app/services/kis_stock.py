@@ -55,8 +55,7 @@ def get_minute_candles(code, count=30, is_live=False):
         if d.get("rt_cd") == "0":
             output2 = d.get("output2", [])
             if isinstance(output2, dict):
-                print(f"[분봉] {code}: output2 dict 키: {list(output2.keys())[:5]}, 값: {str(output2)[:200]}")
-                return []
+                output2 = [output2]
             if not isinstance(output2, list):
                 return []
             return [{"time": i.get("stck_cntg_hour",""), "open": int(i.get("stck_oprc",0)),
