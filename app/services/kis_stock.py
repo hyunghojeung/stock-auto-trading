@@ -50,10 +50,14 @@ def get_minute_candles(code, count=30, is_live=False):
         r = requests.get(f"{auth.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice", headers=h, params=p, timeout=10)
         d = r.json()
         if d.get("rt_cd") == "0":
+       output2 = d.get("output2", [])
+            if not isinstance(output2, list):
+                print(f"[분봉] {code}: output2가 리스트 아님 - {type(output2)}")
+                return []
             return [{"time": i.get("stck_cntg_hour",""), "open": int(i.get("stck_oprc",0)),
                      "high": int(i.get("stck_hgpr",0)), "low": int(i.get("stck_lwpr",0)),
                      "close": int(i.get("stck_prpr",0)), "volume": int(i.get("cntg_vol",0))}
-                    for i in d.get("output2", [])[:count]]
+                    for i in output2[:count]]
     except Exception as e:
         print(f"[분봉 오류] {code}: {e}")
     return []
