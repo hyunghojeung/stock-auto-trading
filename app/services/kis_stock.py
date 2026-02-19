@@ -3,6 +3,7 @@ import requests
 from datetime import datetime, timedelta
 from app.services.kis_auth import get_kis
 
+
 def get_current_price(code, is_live=False):
     auth = get_kis(is_live)
     h = auth.get_headers()
@@ -19,6 +20,7 @@ def get_current_price(code, is_live=False):
     except Exception as e:
         print(f"[현재가 오류] {code}: {e}")
     return None
+
 
 def get_daily_candles(code, period=30, is_live=False):
     auth = get_kis(is_live)
@@ -40,6 +42,7 @@ def get_daily_candles(code, period=30, is_live=False):
         print(f"[일봉 오류] {code}: {e}")
     return []
 
+
 def get_minute_candles(code, count=30, is_live=False):
     auth = get_kis(is_live)
     h = auth.get_headers()
@@ -50,9 +53,9 @@ def get_minute_candles(code, count=30, is_live=False):
         r = requests.get(f"{auth.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice", headers=h, params=p, timeout=10)
         d = r.json()
         if d.get("rt_cd") == "0":
-           output2 = d.get("output2", [])
+            output2 = d.get("output2", [])
             if isinstance(output2, dict):
-                print(f"[분봉] {code}: output2 dict 키: {list(output2.keys())[:5]}, 값 샘플: {str(output2)[:200]}")
+                print(f"[분봉] {code}: output2 dict 키: {list(output2.keys())[:5]}, 값: {str(output2)[:200]}")
                 return []
             if not isinstance(output2, list):
                 return []
@@ -63,6 +66,8 @@ def get_minute_candles(code, count=30, is_live=False):
     except Exception as e:
         print(f"[분봉 오류] {code}: {e}")
     return []
+
+
 def get_orderbook(code, is_live=False):
     auth = get_kis(is_live)
     h = auth.get_headers()
