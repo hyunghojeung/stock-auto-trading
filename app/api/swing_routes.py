@@ -3,6 +3,13 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 기존 라우트를 전혀 수정하지 않는 독립 API 모듈입니다.
 main.py에 app.include_router(swing_router) 한 줄만 추가하면 됩니다.
+
+[변경사항 / Changes]
+- KIS API get_daily_candles → 네이버 get_daily_candles_naver 교체
+- 배치 수집 시 delay 추가 (네이버 서버 보호)
+- 종목 리스트 수집 안정화 (fallback 강화)
+
+파일 경로: app/api/swing_routes.py
 """
 
 from fastapi import APIRouter, BackgroundTasks, Query
@@ -13,7 +20,8 @@ import json
 import traceback
 
 from app.core.database import db
-from app.services.kis_stock import get_daily_candles
+# ★ 변경: KIS → 네이버 일봉 수집기
+from app.services.naver_stock import get_daily_candles_naver
 
 router = APIRouter(prefix="/api/swing", tags=["스윙백테스트"])
 
@@ -39,7 +47,7 @@ async def run_swing_analysis(background_tasks: BackgroundTasks,
                              top_n: int = 20):
     """
     전체 스윙 분석을 백그라운드로 실행한다.
-    1) 전종목 일봉 수집
+    1) 전종목 일봉 수집 (네이버 금융)
     2) 과거 우승 종목 프로필 구축
     3) 현재 후보 종목 발굴
     4) 백테스트 + 패턴 통계
@@ -75,8 +83,8 @@ async def _run_analysis_task(rise_threshold=30.0, generations=10, top_n=20):
             run_swing_backtest, analyze_timing_patterns, auto_calibrate
         )
 
-        # ── Step 1: 전종목 일봉 데이터 수집 ──
-        _update_progress("데이터 수집", 5, "KRX에서 종목 목록을 가져옵니다...")
+        # ── Step 1: 전종목 일봉 데이터 수집 (네이버 금융) ──
+        _update_progress("데이터 수집", 5, "종목 목록을 가져옵니다...")
         stocks = await _fetch_stock_list()
 
         if not stocks:
@@ -85,29 +93,37 @@ async def _run_analysis_task(rise_threshold=30.0, generations=10, top_n=20):
             return
 
         _update_progress("데이터 수집", 10,
-                         f"{len(stocks)}개 종목의 일봉 데이터를 수집합니다...")
+                         f"{len(stocks)}개 종목의 일봉 데이터를 네이버에서 수집합니다...")
 
         all_stocks_data = []
-        batch_size = 10
-        for i in range(0, len(stocks), batch_size):
-            batch = stocks[i:i + batch_size]
-            for stock in batch:
-                try:
-                    candles = get_daily_candles(stock["code"], period=250)
-                    if candles and len(candles) >= 60:
-                        all_stocks_data.append({
-                            "code": stock["code"],
-                            "name": stock["name"],
-                            "market": stock.get("market", ""),
-                            "candles": candles,
-                        })
-                except Exception as e:
-                    pass  # 개별 종목 실패는 무시
+        total = len(stocks)
+        for i, stock in enumerate(stocks):
+            try:
+                # ★ 변경: KIS → 네이버 일봉 수집
+                candles = get_daily_candles_naver(stock["code"], count=250)
+                if candles and len(candles) >= 60:
+                    all_stocks_data.append({
+                        "code": stock["code"],
+                        "name": stock.get("name", stock["code"]),
+                        "market": stock.get("market", ""),
+                        "candles": candles,
+                    })
+            except Exception as e:
+                print(f"[스윙] {stock['code']} 일봉 수집 실패: {e}")
 
-            pct = 10 + int((i / len(stocks)) * 30)
-            _update_progress("데이터 수집", pct,
-                             f"{len(all_stocks_data)}/{len(stocks)} 종목 수집 완료")
-            await asyncio.sleep(0.1)  # Rate limit 방지
+            # 진행률 업데이트 (10개마다)
+            if (i + 1) % 10 == 0 or i == total - 1:
+                pct = 10 + int((i / total) * 30)
+                _update_progress("데이터 수집", pct,
+                                 f"{len(all_stocks_data)}/{i + 1} 종목 수집 완료")
+
+            # ★ 네이버 서버 보호 (0.05초 간격)
+            await asyncio.sleep(0.05)
+
+        if not all_stocks_data:
+            _progress["status"] = "error"
+            _progress["error"] = "일봉 데이터를 수집하지 못했습니다"
+            return
 
         _update_progress("데이터 수집", 40,
                          f"총 {len(all_stocks_data)}개 종목 데이터 수집 완료")
@@ -177,6 +193,7 @@ async def _run_analysis_task(rise_threshold=30.0, generations=10, top_n=20):
         result = {
             "timestamp": datetime.now().isoformat(),
             "stocks_analyzed": len(all_stocks_data),
+            "data_source": "naver",  # ★ 추가: 데이터 소스 표시
             "winner_profile": {
                 "total_winners": winner_profile.get("total_winners", 0),
                 "rise_threshold": rise_threshold,
@@ -201,8 +218,8 @@ async def _run_analysis_task(rise_threshold=30.0, generations=10, top_n=20):
                 "best_params": json.dumps(calibration["best_params"]),
                 "created_at": datetime.now().isoformat(),
             }).execute()
-        except Exception:
-            pass  # DB 저장 실패해도 메모리에는 결과 있음
+        except Exception as e:
+            print(f"[스윙] DB 저장 실패 (무시): {e}")
 
         _progress["status"] = "done"
         _progress["pct"] = 100
@@ -341,9 +358,10 @@ async def test_single_stock(code: str,
     from app.engine.swing_pattern_stats import run_swing_backtest, analyze_timing_patterns
 
     try:
-        candles = get_daily_candles(code, period=250)
+        # ★ 변경: KIS → 네이버 일봉
+        candles = get_daily_candles_naver(code, count=250)
         if not candles or len(candles) < 60:
-            return {"error": "일봉 데이터가 부족합니다"}
+            return {"error": f"일봉 데이터가 부족합니다 ({len(candles) if candles else 0}개)"}
 
         params = {
             "trailing_pct": trailing_pct,
@@ -376,6 +394,8 @@ async def test_single_stock(code: str,
 
         return {
             "code": code,
+            "data_source": "naver",  # ★ 추가
+            "total_candles": len(candles),
             "candles": candles[-120:],  # 최근 120일만
             "trade_points": trade_points,
             "stats": _serialize_pattern_stats(stats),
@@ -383,6 +403,7 @@ async def test_single_stock(code: str,
         }
 
     except Exception as e:
+        print(f"[스윙 단일테스트] {code} 오류: {traceback.format_exc()}")
         return {"error": str(e)}
 
 
@@ -391,21 +412,98 @@ async def test_single_stock(code: str,
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def _fetch_stock_list() -> List[Dict]:
-    """전종목 리스트 가져오기 (기존 스캐너 활용)"""
+    """
+    전종목 리스트 가져오기
+    우선순위: 1) scanner.py → 2) DB watchlist → 3) 하드코딩 대표 종목
+
+    Returns: [{"code": "005930", "name": "삼성전자", "market": "kospi"}, ...]
+    """
+    # 방법 1: 기존 스캐너 활용
     try:
         from app.engine.scanner import scan_all_stocks
         stocks = await scan_all_stocks()
-        # 기본 필터: 거래량 10만주 이상, 가격 1000원 이상
-        filtered = [
-            s for s in stocks
-            if s.get("volume", 0) >= 100000 and s.get("price", 0) >= 1000
-        ]
-        return filtered[:200]  # 상위 200종목만 (서버 부하 방지)
+        if stocks and len(stocks) > 0:
+            # 기본 필터: 거래량 10만주 이상, 가격 1000원 이상
+            filtered = [
+                s for s in stocks
+                if s.get("volume", 0) >= 100000 and s.get("price", 0) >= 1000
+            ]
+            if filtered:
+                result = filtered[:200]  # 상위 200종목 (서버 부하 방지)
+                print(f"[스윙] 스캐너에서 {len(result)}개 종목 확보")
+                return result
     except Exception as e:
-        print(f"[스윙] 종목 리스트 가져오기 실패: {e}")
-        # fallback: DB의 watchlist에서
-        try:
-            data = db.table("watchlist").select("code, name, market").execute().data
-            return data or []
-        except:
-            return []
+        print(f"[스윙] 스캐너 실패: {e}")
+
+    # 방법 2: DB watchlist
+    try:
+        data = db.table("watchlist").select("code, name, market").execute().data
+        if data and len(data) > 0:
+            print(f"[스윙] DB watchlist에서 {len(data)}개 종목 확보")
+            return data
+    except Exception as e:
+        print(f"[스윙] DB watchlist 실패: {e}")
+
+    # 방법 3: DB candidates (이전 분석 결과)
+    try:
+        data = db.table("candidates").select("code, name, market").execute().data
+        if data and len(data) > 0:
+            print(f"[스윙] DB candidates에서 {len(data)}개 종목 확보")
+            return data
+    except Exception:
+        pass
+
+    # 방법 4: 대표 종목 하드코딩 (최후의 수단)
+    print("[스윙] 종목 목록 fallback: 대표 50종목 사용")
+    return [
+        {"code": "005930", "name": "삼성전자", "market": "kospi"},
+        {"code": "000660", "name": "SK하이닉스", "market": "kospi"},
+        {"code": "373220", "name": "LG에너지솔루션", "market": "kospi"},
+        {"code": "207940", "name": "삼성바이오로직스", "market": "kospi"},
+        {"code": "005380", "name": "현대차", "market": "kospi"},
+        {"code": "006400", "name": "삼성SDI", "market": "kospi"},
+        {"code": "035420", "name": "NAVER", "market": "kospi"},
+        {"code": "000270", "name": "기아", "market": "kospi"},
+        {"code": "068270", "name": "셀트리온", "market": "kospi"},
+        {"code": "035720", "name": "카카오", "market": "kospi"},
+        {"code": "051910", "name": "LG화학", "market": "kospi"},
+        {"code": "105560", "name": "KB금융", "market": "kospi"},
+        {"code": "055550", "name": "신한지주", "market": "kospi"},
+        {"code": "003670", "name": "포스코퓨처엠", "market": "kospi"},
+        {"code": "096770", "name": "SK이노베이션", "market": "kospi"},
+        {"code": "028260", "name": "삼성물산", "market": "kospi"},
+        {"code": "012330", "name": "현대모비스", "market": "kospi"},
+        {"code": "066570", "name": "LG전자", "market": "kospi"},
+        {"code": "003550", "name": "LG", "market": "kospi"},
+        {"code": "034730", "name": "SK", "market": "kospi"},
+        {"code": "015760", "name": "한국전력", "market": "kospi"},
+        {"code": "032830", "name": "삼성생명", "market": "kospi"},
+        {"code": "011200", "name": "HMM", "market": "kospi"},
+        {"code": "010130", "name": "고려아연", "market": "kospi"},
+        {"code": "033780", "name": "KT&G", "market": "kospi"},
+        {"code": "009150", "name": "삼성전기", "market": "kospi"},
+        {"code": "018260", "name": "삼성에스디에스", "market": "kospi"},
+        {"code": "086790", "name": "하나금융지주", "market": "kospi"},
+        {"code": "316140", "name": "우리금융지주", "market": "kospi"},
+        {"code": "017670", "name": "SK텔레콤", "market": "kospi"},
+        {"code": "030200", "name": "KT", "market": "kospi"},
+        {"code": "010950", "name": "S-Oil", "market": "kospi"},
+        {"code": "247540", "name": "에코프로비엠", "market": "kosdaq"},
+        {"code": "086520", "name": "에코프로", "market": "kosdaq"},
+        {"code": "377300", "name": "카카오페이", "market": "kospi"},
+        {"code": "259960", "name": "크래프톤", "market": "kospi"},
+        {"code": "352820", "name": "하이브", "market": "kospi"},
+        {"code": "263750", "name": "펄어비스", "market": "kospi"},
+        {"code": "112040", "name": "위메이드", "market": "kosdaq"},
+        {"code": "041510", "name": "에스엠", "market": "kosdaq"},
+        {"code": "293490", "name": "카카오게임즈", "market": "kosdaq"},
+        {"code": "036570", "name": "엔씨소프트", "market": "kospi"},
+        {"code": "251270", "name": "넷마블", "market": "kospi"},
+        {"code": "090430", "name": "아모레퍼시픽", "market": "kospi"},
+        {"code": "005490", "name": "POSCO홀딩스", "market": "kospi"},
+        {"code": "042700", "name": "한미반도체", "market": "kosdaq"},
+        {"code": "196170", "name": "알테오젠", "market": "kosdaq"},
+        {"code": "000100", "name": "유한양행", "market": "kospi"},
+        {"code": "004020", "name": "현대제철", "market": "kospi"},
+        {"code": "009540", "name": "HD한국조선해양", "market": "kospi"},
+    ]
