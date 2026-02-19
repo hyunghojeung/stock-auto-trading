@@ -81,7 +81,14 @@ async def trigger_scan(password: str = ""):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-
+@app.get("/api/trading/trigger")
+async def trigger_trading(password: str = ""):
+    if password != config.SITE_PASSWORD:
+        raise HTTPException(403, "비밀번호가 틀렸습니다")
+    from app.engine.trade_executor import execute_trading_cycle
+    await execute_trading_cycle()
+    return {"success": True, "message": "매매사이클 수동 실행 완료"}
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=config.PORT)
