@@ -49,8 +49,10 @@ async def score_and_select(stocks, top_n=10):
                 "theme_score": s.get("theme_score", 0),
                 "technical_score": s.get("technical_score", 0),
                 "supply_score": s.get("supply_score", 0),
-                "status": "감시중",
-                "scan_date": scan_date,
+               "current_price": s.get("price", 0),
+"change_pct": s.get("change_pct", 0),
+"status": "감시중",
+"scan_date": scan_date,
             }, on_conflict="stock_code,scan_date").execute()
         except Exception as e:
             # upsert 실패 시 insert 시도
@@ -64,8 +66,10 @@ async def score_and_select(stocks, top_n=10):
                     "theme_score": s.get("theme_score", 0),
                     "technical_score": s.get("technical_score", 0),
                     "supply_score": s.get("supply_score", 0),
-                    "status": "감시중",
-                    "scan_date": scan_date,
+"current_price": s.get("price", 0),
+"change_pct": s.get("change_pct", 0),
+"status": "감시중",
+"scan_date": scan_date,
                 }).execute()
             except Exception as e2:
                 print(f"[DB 저장 오류] {s['name']}: {e2}")
