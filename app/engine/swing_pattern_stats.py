@@ -318,6 +318,43 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
     final_capital = capital_curve[-1] if capital_curve else 100.0
     total_return_compound = round(final_capital - 100, 2)
 
+    # ── 매매 기간 계산 (실제 날짜 기반) (★ 추가) ──
+    trading_period_days = 0
+    first_date_str = ""
+    last_date_str = ""
+    if sorted_trades:
+        all_dates = []
+        for t in sorted_trades:
+            if t.entry_date:
+                all_dates.append(t.entry_date)
+            if t.exit_date:
+                all_dates.append(t.exit_date)
+        if all_dates:
+            all_dates.sort()
+            first_date_str = all_dates[0]
+            last_date_str = all_dates[-1]
+            try:
+                from datetime import datetime as _dt
+                d1 = _dt.strptime(first_date_str[:8].replace("-", ""), "%Y%m%d")
+                d2 = _dt.strptime(last_date_str[:8].replace("-", ""), "%Y%m%d")
+                trading_period_days = (d2 - d1).days
+            except:
+                trading_period_days = 0
+
+    # ── 연환산 수익률 (★ 추가) ──
+    annualized_return = 0.0
+    if trading_period_days > 30 and final_capital > 0:
+        years = trading_period_days / 365
+        if years > 0:
+            annualized_return = round(
+                ((final_capital / 100) ** (1 / years) - 1) * 100, 2
+            )
+
+    # ── 일평균 수익률 (★ 추가) ──
+    daily_return = 0.0
+    if trading_period_days > 0:
+        daily_return = round(total_return_compound / trading_period_days, 4)
+
     # ── 전체 요약 ──
     summary = {
         "total_trades": total,
@@ -330,8 +367,13 @@ def analyze_timing_patterns(all_trades: List[TradeSimulation]) -> Dict:
         "max_profit": round(max(t.profit_pct for t in all_trades), 2),
         "max_loss": round(min(t.profit_pct for t in all_trades), 2),
         "avg_holding_days": round(sum(t.holding_days for t in all_trades) / total, 1),
-        "total_return": total_return_compound,  # ★ 수정: 복리 기반
-        "mdd": round(max_drawdown, 2),          # ★ 수정: 자본금 기반 (-100% 초과 불가)
+        "total_return": total_return_compound,       # ★ 복리 기반
+        "mdd": round(max_drawdown, 2),               # ★ 자본금 기반
+        "trading_period_days": trading_period_days,   # ★ 추가: 실제 매매 기간 (일)
+        "first_trade_date": first_date_str,           # ★ 추가: 첫 매매일
+        "last_trade_date": last_date_str,             # ★ 추가: 마지막 매매일
+        "annualized_return": annualized_return,       # ★ 추가: 연환산 수익률
+        "daily_return": daily_return,                 # ★ 추가: 일평균 수익률
     }
 
     # ── 눌림 % 구간별 승률 ──
