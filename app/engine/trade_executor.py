@@ -16,6 +16,8 @@ trailing_stops = {}
 async def execute_trading_cycle():
     """1분 간격 매매 사이클"""
     try:
+        print(f"[매매사이클] 실행 시작")
+        
         # 활성 전략 가져오기
         strategies = db.table("strategies").select("*").eq("is_active", True).execute()
         if not strategies.data:
