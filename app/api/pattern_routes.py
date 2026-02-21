@@ -113,16 +113,25 @@ async def fetch_candles_for_code(code: str, period_days: int) -> Tuple[List[Cand
 @router.post("/search")
 async def search_stock(req: SearchRequest):
     """
-    종목 검색 — 키워드로 종목코드+종목명 반환
-    1) 6자리 숫자 입력 시 → 직접 코드로 종목명 조회
-    2) 텍스트 입력 시 → DB candidates + 대표종목에서 검색
+    종목 검색 — stock_list DB 조회 (전종목 ~2500개)
+    1) 6자리 숫자 → 코드 직접 매칭
+    2) 텍스트 → DB에서 종목명/코드 LIKE 검색
+    3) DB 실패 시 → fallback 리스트 검색
     """
     keyword = req.keyword.strip()
     if not keyword:
         return {"results": []}
 
-    # ── 1) 6자리 코드 직접 입력 → 네이버에서 종목명 조회 ──
+    # ── 1) 6자리 코드 직접 입력 ──
     if re.match(r'^\d{6}$', keyword):
+        try:
+            from app.core.database import db
+            data = db.table("stock_list").select("code, name").eq("code", keyword).eq("is_active", True).execute().data
+            if data:
+                return {"results": [{"code": data[0]["code"], "name": data[0]["name"]}]}
+        except Exception:
+            pass
+        # DB에 없으면 네이버에서 조회
         try:
             loop = asyncio.get_event_loop()
             _, stock_name = await loop.run_in_executor(
@@ -135,35 +144,21 @@ async def search_stock(req: SearchRequest):
         except Exception:
             return {"results": [{"code": keyword, "name": keyword}]}
 
-    # ── 2) 텍스트 검색 → DB candidates + 대표종목 ──
-    query_upper = keyword.upper()
-    results = []
-    seen = set()
-
-    # 2-a) Supabase DB candidates 검색
+    # ── 2) 텍스트 검색 → stock_list DB ──
     try:
         from app.core.database import db
-        data = db.table("candidates").select("code, name, market").execute().data
+        data = db.table("stock_list").select("code, name, market").eq("is_active", True).ilike("name", f"%{keyword}%").limit(20).execute().data
         if data:
-            for s in data:
-                name = (s.get("name") or "").upper()
-                code = (s.get("code") or "")
-                if code not in seen and (query_upper in name or query_upper in code.upper()):
-                    seen.add(code)
-                    results.append({"code": code, "name": s.get("name", code)})
+            return {"results": [{"code": s["code"], "name": s["name"]} for s in data]}
     except Exception as e:
-        logger.debug(f"DB 검색 실패 (무시): {e}")
+        logger.debug(f"stock_list DB 검색 실패: {e}")
 
-    # 2-b) 대표종목 fallback 검색
+    # ── 3) DB 실패 시 fallback ──
+    query_upper = keyword.upper()
+    results = []
     for s in _FALLBACK_STOCKS:
-        code = s["code"]
-        if code in seen:
-            continue
-        name_upper = s["name"].upper()
-        if query_upper in name_upper or query_upper in code:
-            seen.add(code)
-            results.append({"code": code, "name": s["name"]})
-
+        if query_upper in s["name"].upper() or query_upper in s["code"]:
+            results.append({"code": s["code"], "name": s["name"]})
     return {"results": results[:20]}
 
 
