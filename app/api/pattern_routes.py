@@ -122,7 +122,7 @@ async def search_stock(req: SearchRequest):
         return {"results": []}
 
     try:
-        encoded = urllib.parse.quote(keyword)
+       encoded = urllib.parse.quote(keyword.encode('euc-kr'))
         url = f"https://ac.finance.naver.com/ac?q={encoded}&q_enc=euc-kr&t_koreng=1&st=111&r_lt=111"
 
         loop = asyncio.get_event_loop()
