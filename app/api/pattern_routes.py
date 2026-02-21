@@ -114,58 +114,118 @@ async def fetch_candles_for_code(code: str, period_days: int) -> Tuple[List[Cand
 async def search_stock(req: SearchRequest):
     """
     종목 검색 — 키워드로 종목코드+종목명 반환
-    네이버 금융 자동완성 API 활용
+    1) 6자리 숫자 입력 시 → 직접 코드로 종목명 조회
+    2) 텍스트 입력 시 → DB candidates + 대표종목에서 검색
     """
     keyword = req.keyword.strip()
     if not keyword:
         return {"results": []}
 
+    # ── 1) 6자리 코드 직접 입력 → 네이버에서 종목명 조회 ──
+    if re.match(r'^\d{6}$', keyword):
+        try:
+            loop = asyncio.get_event_loop()
+            _, stock_name = await loop.run_in_executor(
+                None, lambda: get_daily_candles_with_name(keyword, count=1)
+            )
+            if stock_name and stock_name != keyword:
+                return {"results": [{"code": keyword, "name": stock_name}]}
+            else:
+                return {"results": [{"code": keyword, "name": keyword}]}
+        except Exception:
+            return {"results": [{"code": keyword, "name": keyword}]}
+
+    # ── 2) 텍스트 검색 → DB candidates + 대표종목 ──
+    query_upper = keyword.upper()
+    results = []
+    seen = set()
+
+    # 2-a) Supabase DB candidates 검색
     try:
-        import urllib.request
-        import json as _json
-
-        encoded = urllib.parse.quote(keyword, encoding="euc-kr")
-        url = (
-            f"https://ac.finance.naver.com/ac?q={encoded}"
-            f"&q_enc=euc-kr&st=111&frm=stock&r_format=json"
-            f"&r_enc=utf-8&r_unicode=0&t_koreng=1&r_lt=111"
-        )
-
-        loop = asyncio.get_event_loop()
-
-        def _search():
-            req_obj = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req_obj, timeout=5) as resp:
-                return _json.loads(resp.read().decode("utf-8"))
-
-        data = await loop.run_in_executor(None, _search)
-
-        results = []
-        items = data.get("items", [[]])[0] if data.get("items") else []
-
-        for item in items[:20]:
-            if len(item) >= 2:
-                name = item[0][0] if isinstance(item[0], list) else str(item[0])
-                code = item[1][0] if isinstance(item[1], list) else str(item[1])
-                if len(code) == 6 and code.isdigit():
-                    results.append({
-                        "code": code,
-                        "name": name,
-                    })
-
-        # 중복 제거
-        seen = set()
-        unique = []
-        for r in results:
-            if r["code"] not in seen:
-                seen.add(r["code"])
-                unique.append(r)
-
-        return {"results": unique[:20]}
-
+        from app.core.database import db
+        data = db.table("candidates").select("code, name, market").execute().data
+        if data:
+            for s in data:
+                name = (s.get("name") or "").upper()
+                code = (s.get("code") or "")
+                if code not in seen and (query_upper in name or query_upper in code.upper()):
+                    seen.add(code)
+                    results.append({"code": code, "name": s.get("name", code)})
     except Exception as e:
-        logger.error(f"종목 검색 실패: {e}")
-        return {"results": []}
+        logger.debug(f"DB 검색 실패 (무시): {e}")
+
+    # 2-b) 대표종목 fallback 검색
+    for s in _FALLBACK_STOCKS:
+        code = s["code"]
+        if code in seen:
+            continue
+        name_upper = s["name"].upper()
+        if query_upper in name_upper or query_upper in code:
+            seen.add(code)
+            results.append({"code": code, "name": s["name"]})
+
+    return {"results": results[:20]}
+
+
+# 대표종목 리스트 (네이버 자동완성 API가 Railway에서 차단되어 fallback용)
+_FALLBACK_STOCKS = [
+    {"code": "005930", "name": "삼성전자"},
+    {"code": "000660", "name": "SK하이닉스"},
+    {"code": "373220", "name": "LG에너지솔루션"},
+    {"code": "207940", "name": "삼성바이오로직스"},
+    {"code": "005380", "name": "현대차"},
+    {"code": "006400", "name": "삼성SDI"},
+    {"code": "035420", "name": "NAVER"},
+    {"code": "000270", "name": "기아"},
+    {"code": "068270", "name": "셀트리온"},
+    {"code": "035720", "name": "카카오"},
+    {"code": "051910", "name": "LG화학"},
+    {"code": "105560", "name": "KB금융"},
+    {"code": "055550", "name": "신한지주"},
+    {"code": "003670", "name": "포스코퓨처엠"},
+    {"code": "096770", "name": "SK이노베이션"},
+    {"code": "028260", "name": "삼성물산"},
+    {"code": "012330", "name": "현대모비스"},
+    {"code": "066570", "name": "LG전자"},
+    {"code": "003550", "name": "LG"},
+    {"code": "034730", "name": "SK"},
+    {"code": "015760", "name": "한국전력"},
+    {"code": "032830", "name": "삼성생명"},
+    {"code": "011200", "name": "HMM"},
+    {"code": "010130", "name": "고려아연"},
+    {"code": "033780", "name": "KT&G"},
+    {"code": "009150", "name": "삼성전기"},
+    {"code": "018260", "name": "삼성에스디에스"},
+    {"code": "086790", "name": "하나금융지주"},
+    {"code": "316140", "name": "우리금융지주"},
+    {"code": "017670", "name": "SK텔레콤"},
+    {"code": "030200", "name": "KT"},
+    {"code": "010950", "name": "S-Oil"},
+    {"code": "247540", "name": "에코프로비엠"},
+    {"code": "086520", "name": "에코프로"},
+    {"code": "377300", "name": "카카오페이"},
+    {"code": "259960", "name": "크래프톤"},
+    {"code": "352820", "name": "하이브"},
+    {"code": "263750", "name": "펄어비스"},
+    {"code": "112040", "name": "위메이드"},
+    {"code": "041510", "name": "에스엠"},
+    {"code": "293490", "name": "카카오게임즈"},
+    {"code": "036570", "name": "엔씨소프트"},
+    {"code": "251270", "name": "넷마블"},
+    {"code": "090430", "name": "아모레퍼시픽"},
+    {"code": "005490", "name": "POSCO홀딩스"},
+    {"code": "042700", "name": "한미반도체"},
+    {"code": "196170", "name": "알테오젠"},
+    {"code": "000100", "name": "유한양행"},
+    {"code": "004020", "name": "현대제철"},
+    {"code": "009540", "name": "HD한국조선해양"},
+    {"code": "267260", "name": "HD현대일렉트릭"},
+    {"code": "003490", "name": "대한항공"},
+    {"code": "180640", "name": "한진칼"},
+    {"code": "000810", "name": "삼성화재"},
+    {"code": "036460", "name": "한국가스공사"},
+    {"code": "161390", "name": "한국타이어앤테크놀로지"},
+]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
