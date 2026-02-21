@@ -17,7 +17,6 @@ import asyncio
 import logging
 import traceback
 import re
-import requests
 import urllib.parse
 
 from app.engine.pattern_analyzer import (
@@ -122,32 +121,37 @@ async def search_stock(req: SearchRequest):
         return {"results": []}
 
     try:
-       encoded = urllib.parse.quote(keyword.encode('euc-kr'))
-        url = f"https://ac.finance.naver.com/ac?q={encoded}&q_enc=euc-kr&t_koreng=1&st=111&r_lt=111"
+        import urllib.request
+        import json as _json
+
+        encoded = urllib.parse.quote(keyword, encoding="euc-kr")
+        url = (
+            f"https://ac.finance.naver.com/ac?q={encoded}"
+            f"&q_enc=euc-kr&st=111&frm=stock&r_format=json"
+            f"&r_enc=utf-8&r_unicode=0&t_koreng=1&r_lt=111"
+        )
 
         loop = asyncio.get_event_loop()
 
         def _search():
-            resp = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
-            return resp.json()
+            req_obj = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req_obj, timeout=5) as resp:
+                return _json.loads(resp.read().decode("utf-8"))
 
         data = await loop.run_in_executor(None, _search)
 
         results = []
-        items = data.get("items", [])
+        items = data.get("items", [[]])[0] if data.get("items") else []
 
-        # items는 [키워드매칭, 코드매칭, ...] 구조
-        for group in items:
-            for item in group:
-                if len(item) >= 2:
-                    name = item[0]
-                    code = item[1]
-                    # 6자리 숫자인 코드만 (ETF, 주식)
-                    if re.match(r'^\d{6}$', code):
-                        results.append({
-                            "code": code,
-                            "name": name,
-                        })
+        for item in items[:20]:
+            if len(item) >= 2:
+                name = item[0][0] if isinstance(item[0], list) else str(item[0])
+                code = item[1][0] if isinstance(item[1], list) else str(item[1])
+                if len(code) == 6 and code.isdigit():
+                    results.append({
+                        "code": code,
+                        "name": name,
+                    })
 
         # 중복 제거
         seen = set()
