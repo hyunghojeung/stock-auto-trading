@@ -39,7 +39,7 @@ app.include_router(strategy_routes.router)
 app.include_router(kakao_routes.router)
 app.include_router(backtest_router)
 app.include_router(swing_router)
-
+app.include_router(pattern_router)
 
 @app.get("/")
 async def root():
