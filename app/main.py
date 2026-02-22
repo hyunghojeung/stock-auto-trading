@@ -12,7 +12,7 @@ from app.api.backtest_routes import router as backtest_router
 from app.api.swing_routes import router as swing_router
 from app.api.pattern_routes import router as pattern_router
 from app.api.surge_scanner_routes import router as scanner_router
-app.include_router(scanner_router)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -39,6 +39,7 @@ app.include_router(strategy_routes.router)
 app.include_router(kakao_routes.router)
 app.include_router(backtest_router)
 app.include_router(swing_router)
+app.include_router(scanner_router)
 app.include_router(pattern_router)
 
 @app.get("/")
