@@ -11,7 +11,6 @@ from datetime import datetime
 from app.api.backtest_routes import router as backtest_router
 from app.api.swing_routes import router as swing_router
 from app.api.pattern_routes import router as pattern_router
-from app.api import stock_routes
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -20,9 +19,7 @@ async def lifespan(app: FastAPI):
     yield
     print("[서버] 서버 종료")
 
-
 app = FastAPI(title="10억 만들기 - 주식 자동매매", version="1.0.0", lifespan=lifespan)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,18 +38,15 @@ app.include_router(kakao_routes.router)
 app.include_router(backtest_router)
 app.include_router(swing_router)
 app.include_router(pattern_router)
-app.include_router(pattern_routes.router)
-app.include_router(stock_routes.router)
+
 @app.get("/")
 async def root():
     now = datetime.now(KST)
     return {"name": "10억 만들기", "status": "running", "market": get_market_status(now)}
 
-
 @app.get("/api/auth")
 async def authenticate(password: str = ""):
     return {"authenticated": True}
-
 
 @app.get("/api/system/status")
 async def system_status():
@@ -67,7 +61,6 @@ async def system_status():
         "holiday": holiday,
         "next_market_day": str(get_next_market_day(now.date())) if not is_market_open_now(now) else None,
     }
-
 
 @app.get("/api/scan/trigger")
 async def trigger_scan(password: str = ""):
@@ -90,7 +83,7 @@ async def trigger_trading(password: str = ""):
     from app.engine.trade_executor import execute_trading_cycle
     await execute_trading_cycle()
     return {"success": True, "message": "매매사이클 수동 실행 완료"}
-    
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=config.PORT)
