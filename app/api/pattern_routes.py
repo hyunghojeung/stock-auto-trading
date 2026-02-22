@@ -8,6 +8,8 @@ POST /api/pattern/analyze  — 분석 시작 (비동기)
 GET  /api/pattern/progress  — 진행률 확인
 GET  /api/pattern/result    — 결과 조회
 POST /api/pattern/search    — 종목 검색 (네이버)
+
+[v2] 프리셋(우량주/작전주) 지원 — DTW 가중치 파라미터 추가
 """
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -52,6 +54,10 @@ class AnalyzeRequest(BaseModel):
     pre_rise_days: int = 10     # 급상승 전 분석 구간
     rise_pct: float = 30.0      # 급상승 기준 (%)
     rise_window: int = 5        # 급상승 판단 기간 (거래일)
+    # ── [v2] DTW 가중치 (프리셋에서 전달) ──
+    weight_returns: float = 0.5   # 등락률 가중치
+    weight_candle: float = 0.2    # 봉 모양 가중치
+    weight_volume: float = 0.3    # 거래량 가중치
 
 
 class SearchRequest(BaseModel):
@@ -231,6 +237,7 @@ _FALLBACK_STOCKS = [
 async def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks):
     """
     분석 시작 — 백그라운드에서 실행
+    [v2] DTW 가중치 파라미터 전달
     """
     global _analysis_state
 
@@ -260,6 +267,10 @@ async def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks)
         req.pre_rise_days,
         req.rise_pct,
         req.rise_window,
+        # [v2] 가중치 전달
+        req.weight_returns,
+        req.weight_candle,
+        req.weight_volume,
     )
 
     return {"status": "started", "message": f"{len(req.codes)}개 종목 분석 시작"}
@@ -272,6 +283,10 @@ async def _run_analysis_task(
     pre_rise_days: int,
     rise_pct: float,
     rise_window: int,
+    # [v2] DTW 가중치
+    weight_returns: float = 0.5,
+    weight_candle: float = 0.2,
+    weight_volume: float = 0.3,
 ):
     """백그라운드 분석 태스크"""
     global _analysis_state
@@ -313,6 +328,13 @@ async def _run_analysis_task(
             _analysis_state["progress"] = min(mapped_pct, 100)
             _analysis_state["message"] = msg
 
+        # [v2] 가중치 dict 구성 → pattern_analyzer로 전달
+        weights = {
+            "returns": weight_returns,
+            "candle": weight_candle,
+            "volume": weight_volume,
+        }
+
         result = run_pattern_analysis(
             candles_by_code=candles_by_code,
             names=names,
@@ -320,6 +342,7 @@ async def _run_analysis_task(
             rise_pct=rise_pct,
             rise_window=rise_window,
             progress_callback=progress_cb,
+            weights=weights,          # [v2] 가중치 전달
         )
 
         # 결과 저장
