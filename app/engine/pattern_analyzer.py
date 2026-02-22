@@ -7,6 +7,8 @@ Pattern Surge Detector — DTW-based Analysis Engine
 여러 종목의 일봉 데이터에서 급상승(5일 내 +30%) 구간을 자동 탐지하고,
 상승 직전 N일의 일봉 패턴을 DTW(Dynamic Time Warping)로 비교하여
 공통 패턴을 도출합니다.
+
+[v2] 프리셋(우량주/작전주) 지원 — DTW 가중치를 외부에서 전달받음
 """
 
 import numpy as np
@@ -17,6 +19,13 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 기본 가중치 / Default Weights
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DEFAULT_WEIGHTS = {'returns': 0.5, 'candle': 0.2, 'volume': 0.3}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -150,10 +159,11 @@ def multi_dim_dtw_similarity(
 ) -> float:
     """
     다차원 DTW 유사도 — 등락률 + 봉모양 + 거래량 종합
+    [v2] weights를 외부에서 전달받아 사용
     weights: {'returns': 0.5, 'candle': 0.2, 'volume': 0.3}
     """
     if weights is None:
-        weights = {'returns': 0.5, 'candle': 0.2, 'volume': 0.3}
+        weights = DEFAULT_WEIGHTS
 
     # 1) 등락률 DTW
     sim_returns = dtw_similarity(p1.returns, p2.returns)
@@ -168,9 +178,9 @@ def multi_dim_dtw_similarity(
 
     # 가중 합산
     total = (
-        weights['returns'] * sim_returns +
-        weights['candle'] * sim_candle +
-        weights['volume'] * sim_volume
+        weights.get('returns', 0.5) * sim_returns +
+        weights.get('candle', 0.2) * sim_candle +
+        weights.get('volume', 0.3) * sim_volume
     )
     return round(total, 2)
 
@@ -336,22 +346,27 @@ def extract_pre_rise_pattern(
 
 def cluster_patterns(
     patterns: List[PreRisePattern],
-    similarity_threshold: float = 40.0
+    similarity_threshold: float = 40.0,
+    weights: Dict[str, float] = None
 ) -> List[PatternCluster]:
     """
     DTW 유사도 기반 단순 클러스터링 (Agglomerative 방식)
     similarity_threshold: 같은 클러스터로 묶을 최소 유사도 (%)
+    [v2] weights: DTW 가중치 (프리셋에서 전달)
     """
     if not patterns:
         return []
 
+    if weights is None:
+        weights = DEFAULT_WEIGHTS
+
     n = len(patterns)
 
-    # 유사도 행렬 계산
+    # 유사도 행렬 계산 — [v2] weights 전달
     sim_matrix = np.zeros((n, n))
     for i in range(n):
         for j in range(i + 1, n):
-            sim = multi_dim_dtw_similarity(patterns[i], patterns[j])
+            sim = multi_dim_dtw_similarity(patterns[i], patterns[j], weights)
             sim_matrix[i, j] = sim
             sim_matrix[j, i] = sim
         sim_matrix[i, i] = 100.0  # 자기 자신
@@ -492,19 +507,33 @@ def find_current_matches(
     candles_by_code: Dict[str, List[CandleDay]],
     names: Dict[str, str],
     clusters: List[PatternCluster],
-    pre_days: int = 10
+    pre_days: int = 10,
+    weights: Dict[str, float] = None
 ) -> List[Dict]:
     """
     현재 일봉 흐름이 도출된 공통 패턴과 얼마나 유사한지 계산
     → 매수 추천 목록 생성
+    [v2] weights를 사용하여 등락률/거래량 비중 조절
     """
     recommendations = []
 
     if not clusters:
         return recommendations
 
-    # 대표 패턴 (가장 큰 클러스터)의 평균 등락률/거래량
-    top_cluster = clusters[0]
+    if weights is None:
+        weights = DEFAULT_WEIGHTS
+
+    # [v2] 가중치 기반 추천 유사도 비율 계산
+    # returns + volume 기준으로 비례 배분 (candle은 추천에서 제외)
+    w_r = weights.get('returns', 0.5)
+    w_v = weights.get('volume', 0.3)
+    total_rv = w_r + w_v
+    if total_rv > 0:
+        rec_weight_returns = w_r / total_rv
+        rec_weight_volume = w_v / total_rv
+    else:
+        rec_weight_returns = 0.6
+        rec_weight_volume = 0.4
 
     for code, candles in candles_by_code.items():
         if len(candles) < pre_days + 20:
@@ -547,8 +576,8 @@ def find_current_matches(
             sim_r = dtw_similarity(current_returns, cluster.avg_return_flow)
             # 거래량 DTW
             sim_v = dtw_similarity(current_volumes, cluster.avg_volume_flow)
-            # 종합
-            sim = sim_r * 0.6 + sim_v * 0.4
+            # [v2] 가중치 기반 종합 (기존 하드코딩 0.6/0.4 → 동적)
+            sim = sim_r * rec_weight_returns + sim_v * rec_weight_volume
 
             if sim > best_sim:
                 best_sim = sim
@@ -596,7 +625,8 @@ def run_pattern_analysis(
     pre_days: int = 10,
     rise_pct: float = 30.0,
     rise_window: int = 5,
-    progress_callback=None
+    progress_callback=None,
+    weights: Dict[str, float] = None
 ) -> AnalysisResult:
     """
     전체 분석 실행
@@ -606,7 +636,11 @@ def run_pattern_analysis(
     - rise_pct: 급상승 기준 (%)
     - rise_window: 급상승 기간 (거래일)
     - progress_callback: 진행률 콜백 (pct, message)
+    - [v2] weights: DTW 가중치 {'returns': 0.5, 'candle': 0.2, 'volume': 0.3}
     """
+    if weights is None:
+        weights = DEFAULT_WEIGHTS
+
     all_surges = []
     all_patterns = []
     total_stocks = len(candles_by_code)
@@ -633,22 +667,22 @@ def run_pattern_analysis(
     if progress_callback:
         progress_callback(45, f"패턴 추출 완료: {len(all_patterns)}개")
 
-    # ── Step 2: DTW 클러스터링 ──
+    # ── Step 2: DTW 클러스터링 — [v2] weights 전달 ──
     if progress_callback:
         progress_callback(50, "DTW 패턴 유사도 분석 중...")
 
-    clusters_raw = cluster_patterns(all_patterns)
+    clusters_raw = cluster_patterns(all_patterns, weights=weights)
     clusters = [asdict(c) for c in clusters_raw]
 
     if progress_callback:
         progress_callback(75, f"클러스터링 완료: {len(clusters)}개 패턴 그룹")
 
-    # ── Step 3: 현재 매수 추천 ──
+    # ── Step 3: 현재 매수 추천 — [v2] weights 전달 ──
     if progress_callback:
         progress_callback(80, "현재 매수 추천 분석 중...")
 
     recommendations = find_current_matches(
-        candles_by_code, names, clusters_raw, pre_days
+        candles_by_code, names, clusters_raw, pre_days, weights=weights
     )
 
     # ── Step 4: 요약 생성 ──
