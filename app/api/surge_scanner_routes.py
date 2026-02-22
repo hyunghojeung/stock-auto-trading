@@ -1,16 +1,17 @@
 """
-전종목 급상승 스캐너 — API 라우트
-All-Stock Surge Scanner — API Routes
+전종목 급상승 스캐너 — API 라우트 (v2 DB 저장)
+All-Stock Surge Scanner — API Routes (v2 with DB persistence)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 파일경로: app/api/surge_scanner_routes.py
 
-전체 ~2,500개 종목을 자동 스캔하여 급상승 이력이 있는 종목을 발굴합니다.
-특히 작전 세력의 급상승 패턴(단기 급등 + 거래량 폭증)을 탐지합니다.
+스캔 결과를 Supabase에 저장하여 재접속 시 자동 로드합니다.
+네이버 차단 방지: batch_size=3, delay=1.5초, 재시도 3회, 차단감지 60초대기
 
-POST /api/scanner/start     — 스캔 시작 (비동기)
-GET  /api/scanner/progress   — 진행률 확인
-GET  /api/scanner/result     — 결과 조회
-POST /api/scanner/stop       — 스캔 중지
+POST /api/scanner/start      — 스캔 시작 (비동기)
+GET  /api/scanner/progress    — 진행률 확인
+GET  /api/scanner/result      — 현재 스캔 결과
+GET  /api/scanner/latest      — DB에서 최근 스캔 결과 로드
+POST /api/scanner/stop        — 스캔 중지
 """
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -19,6 +20,7 @@ from typing import List, Optional, Dict
 import asyncio
 import logging
 import traceback
+import json
 from datetime import datetime, timedelta
 
 from app.engine.pattern_analyzer import CandleDay, detect_surges
@@ -36,9 +38,9 @@ _scanner_state = {
     "stop_requested": False,
     "progress": 0,
     "message": "",
-    "scanned": 0,           # 스캔 완료 종목 수
-    "total": 0,             # 전체 종목 수
-    "found": 0,             # 급상승 발견 종목 수
+    "scanned": 0,
+    "total": 0,
+    "found": 0,
     "result": None,
     "error": None,
 }
@@ -49,50 +51,62 @@ _scanner_state = {
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class ScanRequest(BaseModel):
-    market: str = "ALL"         # ALL / KOSPI / KOSDAQ
-    period_days: int = 365      # 조회 기간 (일)
-    rise_pct: float = 30.0      # 급상승 기준 (%)
-    rise_window: int = 5        # 급상승 판단 기간 (거래일)
-    min_volume_ratio: float = 2.0   # 최소 거래량 배율 (평소 대비)
-    batch_size: int = 10        # 동시 처리 수 (API 부하 방지)
+    market: str = "ALL"
+    period_days: int = 365
+    rise_pct: float = 30.0
+    rise_window: int = 5
+    min_volume_ratio: float = 2.0
+    batch_size: int = 3          # ← 최안전 설정 (동시 3개씩)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 네이버 일봉 조회 (단일 종목)
+# 네이버 일봉 조회 (단일 종목, 재시도 포함)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async def _fetch_candles(code: str, period_days: int) -> List[CandleDay]:
-    """네이버에서 일봉 데이터 조회 → CandleDay 리스트"""
-    try:
-        from app.services.naver_stock import get_daily_candles_with_name
-        capped = min(period_days, 600)
-        loop = asyncio.get_event_loop()
-        raw, _ = await loop.run_in_executor(
-            None, lambda: get_daily_candles_with_name(code, count=capped)
-        )
-        if not raw:
-            return []
+async def _fetch_candles_safe(code: str, period_days: int, max_retries: int = 3) -> List[CandleDay]:
+    """
+    네이버에서 일봉 데이터 조회 — 실패 시 재시도
+    Fetch daily candles from Naver Finance with retry on failure
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            from app.services.naver_stock import get_daily_candles_with_name
+            capped = min(period_days, 600)
+            loop = asyncio.get_event_loop()
+            raw, _ = await loop.run_in_executor(
+                None, lambda: get_daily_candles_with_name(code, count=capped)
+            )
+            if not raw:
+                if attempt < max_retries:
+                    await asyncio.sleep(3)  # 재시도 전 대기
+                    continue
+                return []
 
-        candles = []
-        for item in raw:
-            try:
-                c = CandleDay(
-                    date=str(item.get("date", "")),
-                    open=float(item.get("open", 0)),
-                    high=float(item.get("high", 0)),
-                    low=float(item.get("low", 0)),
-                    close=float(item.get("close", 0)),
-                    volume=int(item.get("volume", 0)),
-                )
-                if c.close > 0:
-                    candles.append(c)
-            except (ValueError, TypeError):
-                continue
-        candles.sort(key=lambda c: c.date)
-        return candles
-    except Exception as e:
-        logger.debug(f"[{code}] 일봉 조회 실패: {e}")
-        return []
+            candles = []
+            for item in raw:
+                try:
+                    c = CandleDay(
+                        date=str(item.get("date", "")),
+                        open=float(item.get("open", 0)),
+                        high=float(item.get("high", 0)),
+                        low=float(item.get("low", 0)),
+                        close=float(item.get("close", 0)),
+                        volume=int(item.get("volume", 0)),
+                    )
+                    if c.close > 0:
+                        candles.append(c)
+                except (ValueError, TypeError):
+                    continue
+            candles.sort(key=lambda c: c.date)
+            return candles
+        except Exception as e:
+            if attempt < max_retries:
+                logger.debug(f"[{code}] 재시도 {attempt+1}/{max_retries}: {e}")
+                await asyncio.sleep(3 + attempt * 2)  # 점진적 대기 (3초, 5초)
+            else:
+                logger.debug(f"[{code}] 일봉 조회 최종 실패: {e}")
+                return []
+    return []
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -100,10 +114,7 @@ async def _fetch_candles(code: str, period_days: int) -> List[CandleDay]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _get_stock_list(market: str = "ALL") -> List[Dict]:
-    """
-    stock_list DB에서 전종목 리스트 조회
-    market: ALL / KOSPI / KOSDAQ
-    """
+    """stock_list DB에서 전종목 리스트 조회"""
     try:
         from app.core.database import db
         query = db.table("stock_list").select("code, name, market").eq("is_active", True)
@@ -119,27 +130,159 @@ def _get_stock_list(market: str = "ALL") -> List[Dict]:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DB 저장/로드 함수
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _save_scan_to_db(scan_params: Dict, stocks: List[Dict], stats: Dict) -> Optional[int]:
+    """스캔 결과를 Supabase에 저장 → session_id 반환"""
+    try:
+        from app.core.database import db
+
+        # 1) 세션 생성
+        session_data = {
+            "market": scan_params.get("market", "ALL"),
+            "period_days": scan_params.get("period_days", 365),
+            "rise_pct": scan_params.get("rise_pct", 30.0),
+            "rise_window": scan_params.get("rise_window", 5),
+            "min_volume_ratio": scan_params.get("min_volume_ratio", 2.0),
+            "total_scanned": stats.get("total_scanned", 0),
+            "total_found": stats.get("total_found", 0),
+            "total_surges": stats.get("total_surges", 0),
+            "high_manip_count": stats.get("high_manip_count", 0),
+            "medium_manip_count": stats.get("medium_manip_count", 0),
+            "status": "done",
+        }
+        resp = db.table("surge_scan_sessions").insert(session_data).execute()
+        if not resp.data:
+            logger.error("세션 저장 실패: 응답 데이터 없음")
+            return None
+        session_id = resp.data[0]["id"]
+
+        # 2) 종목별 결과 저장 (50개씩 배치)
+        batch = []
+        for stock in stocks:
+            row = {
+                "session_id": session_id,
+                "code": stock.get("code", ""),
+                "name": stock.get("name", ""),
+                "market": stock.get("market", ""),
+                "current_price": stock.get("current_price", 0),
+                "last_date": stock.get("last_date", ""),
+                "surge_count": stock.get("surge_count", 0),
+                "top_manip_score": stock.get("top_manip_score", 0),
+                "top_manip_level": stock.get("top_manip_level", "low"),
+                "top_manip_label": stock.get("top_manip_label", ""),
+                "latest_rise_pct": stock.get("latest_rise_pct", 0),
+                "latest_surge_date": stock.get("latest_surge_date", ""),
+                "latest_from_peak": stock.get("latest_from_peak", 0),
+                "surges_json": json.dumps(stock.get("surges", []), ensure_ascii=False),
+            }
+            batch.append(row)
+
+            if len(batch) >= 50:
+                db.table("surge_scan_stocks").insert(batch).execute()
+                batch = []
+
+        if batch:
+            db.table("surge_scan_stocks").insert(batch).execute()
+
+        logger.info(f"스캔 결과 DB 저장 완료: session_id={session_id}, {len(stocks)}개 종목")
+        return session_id
+
+    except Exception as e:
+        logger.error(f"스캔 결과 DB 저장 실패: {e}\n{traceback.format_exc()}")
+        return None
+
+
+def _load_latest_scan_from_db() -> Optional[Dict]:
+    """DB에서 가장 최근 스캔 결과 로드"""
+    try:
+        from app.core.database import db
+
+        # 최근 세션 조회
+        resp = db.table("surge_scan_sessions") \
+            .select("*") \
+            .eq("status", "done") \
+            .order("scan_date", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if not resp.data:
+            return None
+
+        session = resp.data[0]
+        session_id = session["id"]
+
+        # 해당 세션의 종목 결과 로드
+        stocks_resp = db.table("surge_scan_stocks") \
+            .select("*") \
+            .eq("session_id", session_id) \
+            .order("top_manip_score", desc=True) \
+            .execute()
+
+        stocks = []
+        for row in (stocks_resp.data or []):
+            surges = []
+            try:
+                surges = json.loads(row.get("surges_json", "[]"))
+            except:
+                pass
+
+            stocks.append({
+                "code": row["code"],
+                "name": row["name"],
+                "market": row.get("market", ""),
+                "current_price": row.get("current_price", 0),
+                "last_date": row.get("last_date", ""),
+                "surge_count": row.get("surge_count", 0),
+                "top_manip_score": row.get("top_manip_score", 0),
+                "top_manip_level": row.get("top_manip_level", "low"),
+                "top_manip_label": row.get("top_manip_label", ""),
+                "latest_rise_pct": row.get("latest_rise_pct", 0),
+                "latest_surge_date": row.get("latest_surge_date", ""),
+                "latest_from_peak": row.get("latest_from_peak", 0),
+                "surges": surges,
+            })
+
+        return {
+            "stocks": stocks,
+            "stats": {
+                "total_scanned": session.get("total_scanned", 0),
+                "total_found": session.get("total_found", 0),
+                "total_surges": session.get("total_surges", 0),
+                "high_manip_count": session.get("high_manip_count", 0),
+                "medium_manip_count": session.get("medium_manip_count", 0),
+                "scan_params": {
+                    "period_days": session.get("period_days", 365),
+                    "rise_pct": session.get("rise_pct", 30.0),
+                    "rise_window": session.get("rise_window", 5),
+                    "min_volume_ratio": session.get("min_volume_ratio", 2.0),
+                },
+            },
+            "scan_date": session.get("scan_date", ""),
+            "market": session.get("market", "ALL"),
+        }
+
+    except Exception as e:
+        logger.error(f"DB 로드 실패: {e}")
+        return None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 급상승 + 작전주 특성 분석
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _analyze_surge_detail(candles: List[CandleDay], surge, min_volume_ratio: float) -> Dict:
-    """
-    급상승 구간의 상세 분석 — 작전주 특성 판별
-    - 거래량 폭증 정도
-    - 급상승 후 급락 여부 (세력 이탈 징후)
-    - 상승 전 매집 흔적 (저거래량 횡보)
-    """
+    """급상승 구간의 상세 분석 — 작전주 특성 판별"""
     si = surge.start_idx
     ei = surge.end_idx
     n = len(candles)
 
-    # ── 1) 급상승 구간 거래량 분석 ──
-    # 상승 직전 20일 평균 거래량
+    # 1) 급상승 구간 거래량 분석
     pre_start = max(0, si - 20)
     pre_vols = [c.volume for c in candles[pre_start:si]]
     avg_pre_vol = sum(pre_vols) / len(pre_vols) if pre_vols else 1
 
-    # 급상승 구간 평균 거래량
     surge_vols = [c.volume for c in candles[si:ei + 1]]
     avg_surge_vol = sum(surge_vols) / len(surge_vols) if surge_vols else 1
     max_surge_vol = max(surge_vols) if surge_vols else 0
@@ -147,29 +290,24 @@ def _analyze_surge_detail(candles: List[CandleDay], surge, min_volume_ratio: flo
     volume_ratio = round(avg_surge_vol / avg_pre_vol, 2) if avg_pre_vol > 0 else 0
     max_volume_ratio = round(max_surge_vol / avg_pre_vol, 2) if avg_pre_vol > 0 else 0
 
-    # 거래량 기준 미달 시 제외
     if volume_ratio < min_volume_ratio:
         return None
 
-    # ── 2) 급상승 후 급락 분석 (세력 이탈 징후) ──
+    # 2) 급상승 후 급락 분석
     after_drop_pct = 0
-    after_days_checked = 0
     current_price = candles[-1].close
     peak_price = surge.peak_price
 
     if ei + 1 < n:
-        # 급상승 후 최대 20일간 하락 체크
         check_end = min(ei + 21, n)
         post_prices = [c.close for c in candles[ei + 1:check_end]]
         if post_prices:
             min_after = min(post_prices)
             after_drop_pct = round(((min_after - peak_price) / peak_price) * 100, 2)
-            after_days_checked = len(post_prices)
 
-    # 현재가 대비 고점 이격률
     from_peak_pct = round(((current_price - peak_price) / peak_price) * 100, 2) if peak_price > 0 else 0
 
-    # ── 3) 매집 흔적 (급상승 전 저거래량 횡보) ──
+    # 3) 매집 흔적
     accumulation_score = 0
     if si >= 20:
         pre_20 = candles[si - 20:si]
@@ -178,48 +316,38 @@ def _analyze_surge_detail(candles: List[CandleDay], surge, min_volume_ratio: flo
             if pre_20[k - 1].close > 0:
                 ret = abs((pre_20[k].close - pre_20[k - 1].close) / pre_20[k - 1].close * 100)
                 pre_20_returns.append(ret)
-        # 변동성 낮고 거래량 작으면 → 매집 흔적
         avg_volatility = sum(pre_20_returns) / len(pre_20_returns) if pre_20_returns else 0
         if avg_volatility < 2.0 and volume_ratio >= 3.0:
-            accumulation_score = 3  # 강한 매집 의심
+            accumulation_score = 3
         elif avg_volatility < 3.0 and volume_ratio >= 2.0:
-            accumulation_score = 2  # 매집 가능성
+            accumulation_score = 2
         elif volume_ratio >= 2.0:
-            accumulation_score = 1  # 약한 징후
+            accumulation_score = 1
 
-    # ── 4) 작전주 의심 점수 (0~100) ──
+    # 4) 작전주 의심 점수
     manip_score = 0
-    # 거래량 폭증 → 최대 30점
     manip_score += min(30, int(volume_ratio * 5))
-    # 급상승 후 급락 → 최대 30점
     if after_drop_pct < -20:
         manip_score += 30
     elif after_drop_pct < -10:
         manip_score += 20
     elif after_drop_pct < -5:
         manip_score += 10
-    # 매집 흔적 → 최대 20점
     manip_score += accumulation_score * 7
-    # 단기 급등폭 → 최대 20점
     if surge.rise_pct >= 100:
         manip_score += 20
     elif surge.rise_pct >= 50:
         manip_score += 15
     elif surge.rise_pct >= 30:
         manip_score += 10
-
     manip_score = min(100, manip_score)
 
-    # 작전주 판정
     if manip_score >= 70:
-        manip_label = "🔴 세력 의심"
-        manip_level = "high"
+        manip_label, manip_level = "🔴 세력 의심", "high"
     elif manip_score >= 45:
-        manip_label = "🟡 주의 필요"
-        manip_level = "medium"
+        manip_label, manip_level = "🟡 주의 필요", "medium"
     else:
-        manip_label = "🟢 일반 급등"
-        manip_level = "low"
+        manip_label, manip_level = "🟢 일반 급등", "low"
 
     return {
         "volume_ratio": volume_ratio,
@@ -246,7 +374,6 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
     if _scanner_state["running"]:
         raise HTTPException(status_code=409, detail="이미 스캔이 진행 중입니다.")
 
-    # stock_list에서 종목 조회
     stock_list = _get_stock_list(req.market)
     if not stock_list:
         raise HTTPException(
@@ -254,7 +381,6 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
             detail="stock_list DB에 종목이 없습니다. 먼저 POST /api/stocks/update를 실행하세요."
         )
 
-    # 상태 초기화
     _scanner_state = {
         "running": True,
         "stop_requested": False,
@@ -270,6 +396,7 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(
         _run_scan_task,
         stock_list,
+        req.market,
         req.period_days,
         req.rise_pct,
         req.rise_window,
@@ -286,6 +413,7 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
 
 async def _run_scan_task(
     stock_list: List[Dict],
+    market: str,
     period_days: int,
     rise_pct: float,
     rise_window: int,
@@ -300,17 +428,15 @@ async def _run_scan_task(
         all_results = []
         scanned = 0
         found = 0
+        consecutive_failures = 0  # 연속 실패 카운터
 
-        # 배치 처리 (batch_size개씩)
         for batch_start in range(0, total, batch_size):
-            # 중지 요청 체크
             if _scanner_state["stop_requested"]:
                 _scanner_state["message"] = f"사용자 중지 — {scanned}개 스캔, {found}개 발견"
                 break
 
             batch = stock_list[batch_start:batch_start + batch_size]
 
-            # 배치 내 종목 동시 처리
             tasks = []
             for stock in batch:
                 tasks.append(_scan_single_stock(
@@ -320,11 +446,27 @@ async def _run_scan_task(
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
+            batch_failures = 0
             for r in results:
                 scanned += 1
                 if isinstance(r, dict) and r.get("surges"):
                     all_results.append(r)
                     found += 1
+                elif isinstance(r, Exception):
+                    batch_failures += 1
+
+            # ── 네이버 차단 감지 ──
+            if batch_failures == len(batch) and len(batch) > 1:
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    # 3배치 연속 전부 실패 → 차단 의심 → 장시간 대기
+                    _scanner_state["message"] = f"⚠️ 네이버 차단 감지 — 60초 대기 중... ({scanned}/{total})"
+                    await asyncio.sleep(60)
+                    consecutive_failures = 0
+                else:
+                    await asyncio.sleep(10)  # 짧은 대기
+            else:
+                consecutive_failures = 0
 
             # 진행률 업데이트
             pct = int((scanned / total) * 100)
@@ -338,33 +480,49 @@ async def _run_scan_task(
                 f"급상승 {found}개 발견"
             )
 
-            # API 부하 방지 — 배치 간 딜레이
-            await asyncio.sleep(0.5)
+            # ── 안전 딜레이: 1.5초 (네이버 차단 방지) ──
+            await asyncio.sleep(1.5)
 
         # ── 결과 정리 ──
-        # 작전주 의심 점수 높은 순 정렬
         all_results.sort(key=lambda r: r.get("top_manip_score", 0), reverse=True)
 
-        # 통계
         total_surges = sum(len(r["surges"]) for r in all_results)
         high_manip = sum(1 for r in all_results if r.get("top_manip_level") == "high")
         med_manip = sum(1 for r in all_results if r.get("top_manip_level") == "medium")
 
+        stats = {
+            "total_scanned": scanned,
+            "total_found": found,
+            "total_surges": total_surges,
+            "high_manip_count": high_manip,
+            "medium_manip_count": med_manip,
+            "scan_params": {
+                "period_days": period_days,
+                "rise_pct": rise_pct,
+                "rise_window": rise_window,
+                "min_volume_ratio": min_volume_ratio,
+            },
+        }
+
+        # ── DB에 결과 저장 ──
+        scan_params = {
+            "market": market,
+            "period_days": period_days,
+            "rise_pct": rise_pct,
+            "rise_window": rise_window,
+            "min_volume_ratio": min_volume_ratio,
+        }
+        session_id = _save_scan_to_db(scan_params, all_results, stats)
+        if session_id:
+            logger.info(f"스캔 결과 DB 저장 완료 (session_id={session_id})")
+        else:
+            logger.warning("스캔 결과 DB 저장 실패 — 메모리에만 보관")
+
         _scanner_state["result"] = {
             "stocks": all_results,
-            "stats": {
-                "total_scanned": scanned,
-                "total_found": found,
-                "total_surges": total_surges,
-                "high_manip_count": high_manip,
-                "medium_manip_count": med_manip,
-                "scan_params": {
-                    "period_days": period_days,
-                    "rise_pct": rise_pct,
-                    "rise_window": rise_window,
-                    "min_volume_ratio": min_volume_ratio,
-                },
-            },
+            "stats": stats,
+            "scan_date": datetime.now().isoformat(),
+            "market": market,
         }
         _scanner_state["progress"] = 100
         _scanner_state["message"] = f"스캔 완료! {scanned}개 스캔, {found}개 급상승 종목 발견"
@@ -390,16 +548,14 @@ async def _scan_single_stock(
 ) -> Dict:
     """단일 종목 급상승 스캔"""
     try:
-        candles = await _fetch_candles(code, period_days)
+        candles = await _fetch_candles_safe(code, period_days)
         if len(candles) < rise_window + 20:
             return {"code": code, "name": name, "surges": []}
 
-        # 급상승 구간 탐지
         surges = detect_surges(candles, code, name, rise_pct, rise_window)
         if not surges:
             return {"code": code, "name": name, "surges": []}
 
-        # 각 급상승의 상세 분석
         surge_details = []
         top_manip_score = 0
         top_manip_level = "low"
@@ -407,7 +563,7 @@ async def _scan_single_stock(
         for surge in surges:
             detail = _analyze_surge_detail(candles, surge, min_volume_ratio)
             if detail is None:
-                continue  # 거래량 기준 미달
+                continue
 
             surge_info = {
                 "start_date": surge.start_date,
@@ -427,10 +583,7 @@ async def _scan_single_stock(
         if not surge_details:
             return {"code": code, "name": name, "surges": []}
 
-        # 최근 급상승 우선 정렬
         surge_details.sort(key=lambda s: s["start_date"], reverse=True)
-
-        # 현재 정보
         current_price = candles[-1].close
         last_date = candles[-1].date
 
@@ -461,7 +614,6 @@ async def _scan_single_stock(
 
 @router.get("/progress")
 async def get_scan_progress():
-    """스캔 진행률 반환"""
     return {
         "running": _scanner_state["running"],
         "progress": _scanner_state["progress"],
@@ -475,34 +627,57 @@ async def get_scan_progress():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 결과 조회 / Result
+# 현재 스캔 결과 / Current Result (메모리)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.get("/result")
 async def get_scan_result():
-    """스캔 결과 반환"""
+    """현재 세션의 스캔 결과 반환 (메모리)"""
     if _scanner_state["running"]:
-        return {
-            "status": "running",
-            "progress": _scanner_state["progress"],
-            "message": _scanner_state["message"],
-        }
+        return {"status": "running", "progress": _scanner_state["progress"]}
 
     if _scanner_state["error"]:
-        return {
-            "status": "error",
-            "error": _scanner_state["error"],
-        }
+        return {"status": "error", "error": _scanner_state["error"]}
 
     if _scanner_state["result"] is None:
+        return {"status": "idle", "message": "스캔을 시작해주세요."}
+
+    return {"status": "done", **_scanner_state["result"]}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DB에서 최근 스캔 결과 로드 / Load Latest from DB
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/latest")
+async def get_latest_scan():
+    """
+    DB에 저장된 가장 최근 스캔 결과를 로드합니다.
+    재접속 시 자동으로 호출하여 이전 스캔 결과를 복원합니다.
+    """
+    # 1) 먼저 메모리에 있으면 메모리 결과 반환
+    if _scanner_state["result"] is not None:
         return {
-            "status": "idle",
-            "message": "스캔을 시작해주세요.",
+            "status": "done",
+            "source": "memory",
+            **_scanner_state["result"],
         }
+
+    # 2) 메모리에 없으면 DB에서 로드
+    data = _load_latest_scan_from_db()
+    if data is None:
+        return {
+            "status": "empty",
+            "message": "저장된 스캔 결과가 없습니다. 스캔을 시작해주세요.",
+        }
+
+    # 메모리에도 복원
+    _scanner_state["result"] = data
 
     return {
         "status": "done",
-        **_scanner_state["result"],
+        "source": "db",
+        **data,
     }
 
 
@@ -512,7 +687,6 @@ async def get_scan_result():
 
 @router.post("/stop")
 async def stop_scan():
-    """스캔 중지 요청"""
     if not _scanner_state["running"]:
         return {"status": "not_running", "message": "진행 중인 스캔이 없습니다."}
 
