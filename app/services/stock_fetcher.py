@@ -1,6 +1,6 @@
 """
 전종목 수집 서비스 / Stock List Fetcher Service
-requests.Session으로 KRX 세션/쿠키 자동 처리 (추가 라이브러리 불필요)
+네이버 금융에서 전종목 데이터 수집 (KRX는 Railway IP 차단)
 
 파일 위치: app/services/stock_fetcher.py
 """
@@ -8,40 +8,36 @@ requests.Session으로 KRX 세션/쿠키 자동 처리 (추가 라이브러리 �
 import requests
 import time
 import traceback
+import re
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Optional
+from bs4 import BeautifulSoup
 
 from app.core.database import db
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 1. KRX 전종목 수집 / Fetch All Stocks from KRX
+# 1. 네이버 금융 전종목 수집 / Fetch All Stocks from Naver Finance
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def fetch_krx_all_stocks() -> List[Dict]:
     """
-    KRX(한국거래소)에서 코스피 + 코스닥 전종목 데이터 수집
-    requests.Session 사용으로 세션/쿠키 자동 처리
+    네이버 금융에서 코스피 + 코스닥 전종목 데이터 수집
+    (함수명은 기존 호환성을 위해 유지)
     """
-    trade_date = _get_last_trading_date()
-    print(f"[전종목 수집] 기준일: {trade_date}")
-
     all_stocks = []
 
-    # 세션 생성 (쿠키 자동 처리)
-    session = _create_krx_session()
-
-    # 코스피 수집
+    # 코스피 수집 (sosok=0)
     print("[전종목 수집] 코스피(KOSPI) 종목 수집 시작...")
-    kospi = _fetch_krx_market(session, "STK", trade_date)
+    kospi = _fetch_naver_market(0)
     print(f"[전종목 수집] 코스피 {len(kospi)}개 종목 수집 완료")
     all_stocks.extend(kospi)
 
-    time.sleep(2)
+    time.sleep(1)
 
-    # 코스닥 수집
+    # 코스닥 수집 (sosok=1)
     print("[전종목 수집] 코스닥(KOSDAQ) 종목 수집 시작...")
-    kosdaq = _fetch_krx_market(session, "KSQ", trade_date)
+    kosdaq = _fetch_naver_market(1)
     print(f"[전종목 수집] 코스닥 {len(kosdaq)}개 종목 수집 완료")
     all_stocks.extend(kosdaq)
 
@@ -49,136 +45,182 @@ def fetch_krx_all_stocks() -> List[Dict]:
     return all_stocks
 
 
-def _create_krx_session() -> requests.Session:
-    """KRX 세션 생성 — 먼저 메인 페이지 방문하여 쿠키 획득"""
-    session = requests.Session()
-    session.headers.update({
+def _fetch_naver_market(sosok: int) -> List[Dict]:
+    """
+    네이버 금융 시가총액 페이지에서 전종목 수집
+    sosok: 0=코스피, 1=코스닥
+    """
+    market_name = "kospi" if sosok == 0 else "kosdaq"
+    base_url = "https://finance.naver.com/sise/sise_market_sum.naver"
+
+    headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate",
-        "X-Requested-With": "XMLHttpRequest",
-    })
-
-    try:
-        # KRX 메인 페이지 방문하여 세션 쿠키 획득
-        session.get(
-            "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101",
-            timeout=15
-        )
-        print("[전종목 수집] KRX 세션 쿠키 획득 완료")
-    except Exception as e:
-        print(f"[전종목 수집] KRX 세션 생성 경고: {e} (계속 진행)")
-
-    return session
-
-
-def _fetch_krx_market(session: requests.Session, market_code: str, trade_date: str) -> List[Dict]:
-    """
-    KRX DATA에서 특정 시장의 전종목 데이터 가져오기
-    market_code: "STK" (코스피) 또는 "KSQ" (코스닥)
-    """
-    url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
-
-    data = {
-        "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
-        "locale": "ko_KR",
-        "mktId": market_code,
-        "trdDd": trade_date,
-        "share": "1",
-        "money": "1",
-        "csvxls_isNo": "false",
     }
 
-    # 최대 3회 재시도 (날짜를 하루씩 뒤로)
-    retry_date = trade_date
-    for attempt in range(3):
+    all_stocks = []
+    seen_codes = set()
+
+    # 총 페이지 수 확인
+    total_pages = _get_total_pages(base_url, sosok, headers)
+    print(f"[전종목 수집] {market_name} 총 {total_pages}페이지")
+
+    for page in range(1, total_pages + 1):
         try:
-            data["trdDd"] = retry_date
-            print(f"[전종목 수집] KRX 요청: market={market_code}, date={retry_date}, 시도={attempt + 1}")
+            params = {"sosok": sosok, "page": page}
+            resp = requests.get(base_url, params=params, headers=headers, timeout=15)
+            resp.encoding = "euc-kr"
 
-            resp = session.post(
-                url,
-                data=data,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101",
-                },
-                timeout=30
-            )
+            if resp.status_code != 200:
+                print(f"[전종목 수집] {market_name} page {page} HTTP {resp.status_code}")
+                continue
 
-            print(f"[전종목 수집] KRX 응답: status={resp.status_code}, length={len(resp.text)}")
+            soup = BeautifulSoup(resp.text, "lxml")
 
-            if resp.status_code == 200:
-                result = resp.json()
-                items = result.get("OutBlock_1", [])
+            # 종목 테이블 파싱
+            table = soup.select_one("table.type_2")
+            if not table:
+                continue
 
-                if items:
-                    stocks = _parse_krx_items(items, market_code)
-                    return stocks
-                else:
-                    print(f"[전종목 수집] {market_code} date={retry_date} → 데이터 0건, 이전 날짜로 재시도")
-            else:
-                print(f"[전종목 수집] {market_code} HTTP {resp.status_code}, 이전 날짜로 재시도")
+            rows = table.select("tr")
+
+            for row in rows:
+                try:
+                    cols = row.select("td")
+                    if len(cols) < 10:
+                        continue
+
+                    # 종목명 + 코드
+                    name_tag = cols[1].select_one("a")
+                    if not name_tag:
+                        continue
+
+                    name = name_tag.text.strip()
+                    href = name_tag.get("href", "")
+
+                    # 코드 추출: /item/main.naver?code=005930
+                    code_match = re.search(r"code=(\d{6})", href)
+                    if not code_match:
+                        continue
+                    code = code_match.group(1)
+
+                    # 중복 체크
+                    if code in seen_codes:
+                        continue
+                    seen_codes.add(code)
+
+                    # 현재가
+                    price = _parse_td_int(cols[2])
+                    # 등락률
+                    change_pct = _parse_change_pct(cols[3], cols[4])
+                    # 시가총액 (억원 → 원)
+                    market_cap = _parse_td_int(cols[6]) * 100000000
+                    # 거래량
+                    volume = _parse_td_int(cols[9])
+
+                    # ETF / 우선주 판별
+                    is_etf = _is_etf(code, name)
+                    is_preferred = code[-1] != "0" and not is_etf
+
+                    all_stocks.append({
+                        "code": code,
+                        "name": name,
+                        "market": market_name,
+                        "sector": "",
+                        "market_cap": market_cap,
+                        "price": price,
+                        "volume": volume,
+                        "change_pct": round(change_pct, 2),
+                        "is_active": True,
+                        "is_etf": is_etf,
+                        "is_preferred": is_preferred,
+                        "listed_shares": 0,
+                    })
+
+                except Exception:
+                    continue
+
+            if page % 10 == 0 or page == total_pages:
+                print(f"[전종목 수집] {market_name} {page}/{total_pages}페이지 (누적 {len(all_stocks)}개)")
+
+            # 네이버 부하 방지
+            time.sleep(0.3)
 
         except Exception as e:
-            print(f"[전종목 수집] KRX {market_code} 요청 오류: {e}")
-
-        # 하루 전으로 이동
-        dt = datetime.strptime(retry_date, "%Y%m%d").date() - timedelta(days=1)
-        # 주말 건너뛰기
-        while dt.weekday() >= 5:
-            dt -= timedelta(days=1)
-        retry_date = dt.strftime("%Y%m%d")
-        time.sleep(1)
-
-    print(f"[전종목 수집] {market_code} 3회 시도 모두 실패")
-    return []
-
-
-def _parse_krx_items(items: list, market_code: str) -> List[Dict]:
-    """KRX 응답 데이터를 파싱하여 종목 리스트로 변환"""
-    stocks = []
-    market_name = "kospi" if market_code == "STK" else "kosdaq"
-
-    for item in items:
-        try:
-            code = item.get("ISU_SRT_CD", "").strip()
-            name = item.get("ISU_ABBRV", "").strip()
-
-            if not code or not name:
-                continue
-            if len(code) != 6 or not code.isdigit():
-                continue
-
-            price = _parse_int(item.get("TDD_CLSPRC", "0"))
-            volume = _parse_int(item.get("ACC_TRDVOL", "0"))
-            change_pct = _parse_float(item.get("FLUC_RT", "0"))
-            market_cap = _parse_int(item.get("MKTCAP", "0"))
-            listed_shares = _parse_int(item.get("LIST_SHRS", "0"))
-
-            is_etf = _is_etf(code, name)
-            is_preferred = code[-1] != "0" and not is_etf
-            sector = item.get("IDX_IND_NM", "").strip()
-
-            stocks.append({
-                "code": code,
-                "name": name,
-                "market": market_name,
-                "sector": sector,
-                "market_cap": market_cap,
-                "price": price,
-                "volume": volume,
-                "change_pct": round(change_pct, 2),
-                "is_active": True,
-                "is_etf": is_etf,
-                "is_preferred": is_preferred,
-                "listed_shares": listed_shares,
-            })
-        except Exception:
+            print(f"[전종목 수집] {market_name} page {page} 오류: {e}")
+            time.sleep(1)
             continue
 
-    return stocks
+    return all_stocks
+
+
+def _get_total_pages(base_url: str, sosok: int, headers: dict) -> int:
+    """네이버 금융 시가총액 페이지의 총 페이지 수 확인"""
+    try:
+        resp = requests.get(
+            base_url,
+            params={"sosok": sosok, "page": 1},
+            headers=headers,
+            timeout=15
+        )
+        resp.encoding = "euc-kr"
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # 맨끝 페이지 링크 찾기
+        page_nav = soup.select("td.pgRR a")
+        if page_nav:
+            href = page_nav[0].get("href", "")
+            match = re.search(r"page=(\d+)", href)
+            if match:
+                return int(match.group(1))
+
+        # fallback
+        page_links = soup.select("table.Nnavi td a")
+        max_page = 1
+        for link in page_links:
+            href = link.get("href", "")
+            match = re.search(r"page=(\d+)", href)
+            if match:
+                max_page = max(max_page, int(match.group(1)))
+
+        return max(max_page, 40)
+
+    except Exception as e:
+        print(f"[전종목 수집] 페이지 수 확인 실패: {e}")
+        return 45
+
+
+def _parse_td_int(td) -> int:
+    """td 셀에서 정수 파싱"""
+    try:
+        text = td.text.strip().replace(",", "").replace("\n", "").replace("\t", "")
+        num = re.sub(r"[^\d]", "", text)
+        return int(num) if num else 0
+    except Exception:
+        return 0
+
+
+def _parse_change_pct(change_td, pct_td) -> float:
+    """등락률 파싱 (상승/하락 판별)"""
+    try:
+        pct_text = pct_td.text.strip().replace("%", "").replace(",", "")
+        pct = float(re.sub(r"[^\d.\-]", "", pct_text)) if pct_text else 0.0
+
+        # 하락 판별
+        img = change_td.select_one("img")
+        if img:
+            alt = img.get("alt", "")
+            if "하락" in alt or "down" in alt.lower():
+                pct = -abs(pct)
+            elif "상승" in alt or "up" in alt.lower():
+                pct = abs(pct)
+        else:
+            change_text = change_td.text.strip()
+            if "-" in change_text:
+                pct = -abs(pct)
+
+        return pct
+    except Exception:
+        return 0.0
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -230,7 +272,7 @@ async def save_stocks_to_db(stocks: List[Dict]) -> Dict:
 
 
 async def _deactivate_delisted(current_stocks: List[Dict]) -> int:
-    """현재 KRX 목록에 없는 기존 DB 종목을 비활성화"""
+    """현재 목록에 없는 기존 DB 종목을 비활성화"""
     try:
         current_codes = {s["code"] for s in current_stocks}
 
@@ -268,7 +310,7 @@ async def _deactivate_delisted(current_stocks: List[Dict]) -> int:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def update_stock_list() -> Dict:
-    """전체 프로세스: KRX 수집 → DB 저장 → 상장폐지 처리"""
+    """전체 프로세스: 네이버 수집 → DB 저장 → 상장폐지 처리"""
     print(f"\n{'=' * 50}")
     print(f"[전종목 업데이트] 시작: {datetime.now()}")
     print(f"{'=' * 50}")
@@ -279,7 +321,7 @@ async def update_stock_list() -> Dict:
     if not stocks:
         return {
             "success": False,
-            "error": "KRX에서 종목 수집 실패",
+            "error": "네이버 금융에서 종목 수집 실패",
             "elapsed": 0,
         }
 
@@ -311,7 +353,7 @@ def search_stocks_from_db(
     exclude_etf: bool = False,
     exclude_preferred: bool = False,
 ) -> List[Dict]:
-    """stock_list 테이블에서 종목 검색 (종목명 또는 코드)"""
+    """stock_list 테이블에서 종목 검색"""
     try:
         q = query.strip()
         if not q:
@@ -425,24 +467,6 @@ def get_stock_stats() -> Dict:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 5. 유틸리티 / Utility Functions
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _get_last_trading_date() -> str:
-    """최근 거래일 반환 (장중이면 직전 거래일, 장 마감 후면 오늘)"""
-    now = datetime.now()
-    today = now.date()
-
-    # 16시 이전이면 오늘 데이터 미확정 → 직전 거래일
-    if now.hour < 16:
-        today = today - timedelta(days=1)
-
-    # 주말이면 이전 평일로
-    for _ in range(10):
-        if today.weekday() < 5:
-            break
-        today = today - timedelta(days=1)
-
-    return today.strftime("%Y%m%d")
-
 
 def _parse_int(val) -> int:
     try:
