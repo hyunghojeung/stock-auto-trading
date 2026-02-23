@@ -434,15 +434,24 @@ def get_stock_stats() -> Dict:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _get_last_trading_date() -> str:
-    """최근 거래일 반환 (주말이면 금요일로 조정)"""
-    today = date.today()
-    weekday = today.weekday()  # 월=0, 일=6
-    if weekday == 5:  # 토요일
-        today = today.replace(day=today.day - 1)
-    elif weekday == 6:  # 일요일
-        today = today.replace(day=today.day - 2)
+    """최근 거래일 반환 (장중이면 직전 거래일, 장 마감 후면 오늘)
+    KRX 전종목 데이터는 장 마감(15:30) 후 ~16:00에 확정됨
+    """
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    today = now.date()
+    
+    # 16시 이전이면 오늘 데이터 미확정 → 직전 거래일 사용
+    if now.hour < 16:
+        today = today - timedelta(days=1)
+    
+    # 주말/공휴일이면 이전 평일로 이동
+    for _ in range(10):
+        if today.weekday() < 5:  # 월~금
+            break
+        today = today - timedelta(days=1)
+    
     return today.strftime("%Y%m%d")
-
 
 def _parse_int(val) -> int:
     """쉼표 포함 숫자 문자열 → int 변환"""
