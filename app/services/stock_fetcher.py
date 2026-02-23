@@ -1,10 +1,11 @@
 """
 전종목 수집 서비스 / Stock List Fetcher Service
-pykrx 라이브러리를 사용하여 KRX 전종목 데이터 수집 (세션/쿠키 자동 처리)
+requests.Session으로 KRX 세션/쿠키 자동 처리 (추가 라이브러리 불필요)
 
 파일 위치: app/services/stock_fetcher.py
 """
 
+import requests
 import time
 import traceback
 from datetime import datetime, date, timedelta
@@ -20,28 +21,27 @@ from app.core.database import db
 def fetch_krx_all_stocks() -> List[Dict]:
     """
     KRX(한국거래소)에서 코스피 + 코스닥 전종목 데이터 수집
-    pykrx 라이브러리 사용 (세션/쿠키 자동 처리로 400 오류 방지)
-
-    Returns: [{"code": "005930", "name": "삼성전자", "market": "kospi", ...}, ...]
+    requests.Session 사용으로 세션/쿠키 자동 처리
     """
-    from pykrx import stock as pykrx_stock
-
     trade_date = _get_last_trading_date()
     print(f"[전종목 수집] 기준일: {trade_date}")
 
     all_stocks = []
 
+    # 세션 생성 (쿠키 자동 처리)
+    session = _create_krx_session()
+
     # 코스피 수집
     print("[전종목 수집] 코스피(KOSPI) 종목 수집 시작...")
-    kospi = _fetch_market_pykrx(pykrx_stock, trade_date, "KOSPI")
+    kospi = _fetch_krx_market(session, "STK", trade_date)
     print(f"[전종목 수집] 코스피 {len(kospi)}개 종목 수집 완료")
     all_stocks.extend(kospi)
 
-    time.sleep(1)
+    time.sleep(2)
 
     # 코스닥 수집
     print("[전종목 수집] 코스닥(KOSDAQ) 종목 수집 시작...")
-    kosdaq = _fetch_market_pykrx(pykrx_stock, trade_date, "KOSDAQ")
+    kosdaq = _fetch_krx_market(session, "KSQ", trade_date)
     print(f"[전종목 수집] 코스닥 {len(kosdaq)}개 종목 수집 완료")
     all_stocks.extend(kosdaq)
 
@@ -49,96 +49,136 @@ def fetch_krx_all_stocks() -> List[Dict]:
     return all_stocks
 
 
-def _fetch_market_pykrx(pykrx_stock, trade_date: str, market: str) -> List[Dict]:
-    """
-    pykrx를 사용하여 특정 시장 종목 수집
-    market: "KOSPI" 또는 "KOSDAQ"
-    """
-    market_name = "kospi" if market == "KOSPI" else "kosdaq"
+def _create_krx_session() -> requests.Session:
+    """KRX 세션 생성 — 먼저 메인 페이지 방문하여 쿠키 획득"""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate",
+        "X-Requested-With": "XMLHttpRequest",
+    })
 
     try:
-        # 1) 종목 코드 + 이름 리스트
-        tickers = pykrx_stock.get_market_ticker_list(trade_date, market=market)
-        if not tickers:
-            print(f"[전종목 수집] {market} 종목 코드 0개 — 날짜({trade_date}) 확인 필요")
-            return []
+        # KRX 메인 페이지 방문하여 세션 쿠키 획득
+        session.get(
+            "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101",
+            timeout=15
+        )
+        print("[전종목 수집] KRX 세션 쿠키 획득 완료")
+    except Exception as e:
+        print(f"[전종목 수집] KRX 세션 생성 경고: {e} (계속 진행)")
 
-        print(f"[전종목 수집] {market} 종목 코드 {len(tickers)}개 확인")
+    return session
 
-        # 2) 전종목 시세 (한 번의 호출로 전체 가져옴)
+
+def _fetch_krx_market(session: requests.Session, market_code: str, trade_date: str) -> List[Dict]:
+    """
+    KRX DATA에서 특정 시장의 전종목 데이터 가져오기
+    market_code: "STK" (코스피) 또는 "KSQ" (코스닥)
+    """
+    url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+
+    data = {
+        "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
+        "locale": "ko_KR",
+        "mktId": market_code,
+        "trdDd": trade_date,
+        "share": "1",
+        "money": "1",
+        "csvxls_isNo": "false",
+    }
+
+    # 최대 3회 재시도 (날짜를 하루씩 뒤로)
+    retry_date = trade_date
+    for attempt in range(3):
         try:
-            df = pykrx_stock.get_market_ohlcv_by_ticker(trade_date, market=market)
-        except Exception as e:
-            print(f"[전종목 수집] {market} OHLCV 조회 실패: {e}")
-            df = None
+            data["trdDd"] = retry_date
+            print(f"[전종목 수집] KRX 요청: market={market_code}, date={retry_date}, 시도={attempt + 1}")
 
-        # 3) 시가총액 데이터
+            resp = session.post(
+                url,
+                data=data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101",
+                },
+                timeout=30
+            )
+
+            print(f"[전종목 수집] KRX 응답: status={resp.status_code}, length={len(resp.text)}")
+
+            if resp.status_code == 200:
+                result = resp.json()
+                items = result.get("OutBlock_1", [])
+
+                if items:
+                    stocks = _parse_krx_items(items, market_code)
+                    return stocks
+                else:
+                    print(f"[전종목 수집] {market_code} date={retry_date} → 데이터 0건, 이전 날짜로 재시도")
+            else:
+                print(f"[전종목 수집] {market_code} HTTP {resp.status_code}, 이전 날짜로 재시도")
+
+        except Exception as e:
+            print(f"[전종목 수집] KRX {market_code} 요청 오류: {e}")
+
+        # 하루 전으로 이동
+        dt = datetime.strptime(retry_date, "%Y%m%d").date() - timedelta(days=1)
+        # 주말 건너뛰기
+        while dt.weekday() >= 5:
+            dt -= timedelta(days=1)
+        retry_date = dt.strftime("%Y%m%d")
+        time.sleep(1)
+
+    print(f"[전종목 수집] {market_code} 3회 시도 모두 실패")
+    return []
+
+
+def _parse_krx_items(items: list, market_code: str) -> List[Dict]:
+    """KRX 응답 데이터를 파싱하여 종목 리스트로 변환"""
+    stocks = []
+    market_name = "kospi" if market_code == "STK" else "kosdaq"
+
+    for item in items:
         try:
-            cap_df = pykrx_stock.get_market_cap_by_ticker(trade_date, market=market)
-        except Exception as e:
-            print(f"[전종목 수집] {market} 시가총액 조회 실패: {e}")
-            cap_df = None
+            code = item.get("ISU_SRT_CD", "").strip()
+            name = item.get("ISU_ABBRV", "").strip()
 
-        stocks = []
-        for code in tickers:
-            try:
-                name = pykrx_stock.get_market_ticker_name(code)
-                if not name:
-                    continue
-
-                # 6자리 숫자 코드만
-                if len(code) != 6 or not code.isdigit():
-                    continue
-
-                # OHLCV 데이터
-                price = 0
-                volume = 0
-                change_pct = 0.0
-                if df is not None and code in df.index:
-                    row = df.loc[code]
-                    price = int(row.get("종가", 0))
-                    volume = int(row.get("거래량", 0))
-                    # 등락률 계산
-                    prev_close = int(row.get("시가", 0))  # 전일종가 대신 시가 사용
-                    if prev_close > 0 and price > 0:
-                        change_val = row.get("등락률", 0)
-                        change_pct = float(change_val) if change_val else 0.0
-
-                # 시가총액
-                market_cap = 0
-                listed_shares = 0
-                if cap_df is not None and code in cap_df.index:
-                    cap_row = cap_df.loc[code]
-                    market_cap = int(cap_row.get("시가총액", 0))
-                    listed_shares = int(cap_row.get("상장주식수", 0))
-
-                # ETF / 우선주 판별
-                is_etf = _is_etf(code, name)
-                is_preferred = code[-1] != "0" and not is_etf
-
-                stocks.append({
-                    "code": code,
-                    "name": name,
-                    "market": market_name,
-                    "sector": "",
-                    "market_cap": market_cap,
-                    "price": price,
-                    "volume": volume,
-                    "change_pct": round(change_pct, 2),
-                    "is_active": True,
-                    "is_etf": is_etf,
-                    "is_preferred": is_preferred,
-                    "listed_shares": listed_shares,
-                })
-            except Exception as e:
+            if not code or not name:
+                continue
+            if len(code) != 6 or not code.isdigit():
                 continue
 
-        return stocks
+            price = _parse_int(item.get("TDD_CLSPRC", "0"))
+            volume = _parse_int(item.get("ACC_TRDVOL", "0"))
+            change_pct = _parse_float(item.get("FLUC_RT", "0"))
+            market_cap = _parse_int(item.get("MKTCAP", "0"))
+            listed_shares = _parse_int(item.get("LIST_SHRS", "0"))
 
-    except Exception as e:
-        print(f"[전종목 수집] {market} pykrx 수집 실패: {e}")
-        traceback.print_exc()
-        return []
+            is_etf = _is_etf(code, name)
+            is_preferred = code[-1] != "0" and not is_etf
+            sector = item.get("IDX_IND_NM", "").strip()
+
+            stocks.append({
+                "code": code,
+                "name": name,
+                "market": market_name,
+                "sector": sector,
+                "market_cap": market_cap,
+                "price": price,
+                "volume": volume,
+                "change_pct": round(change_pct, 2),
+                "is_active": True,
+                "is_etf": is_etf,
+                "is_preferred": is_preferred,
+                "listed_shares": listed_shares,
+            })
+        except Exception:
+            continue
+
+    return stocks
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -146,10 +186,7 @@ def _fetch_market_pykrx(pykrx_stock, trade_date: str, market: str) -> List[Dict]
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def save_stocks_to_db(stocks: List[Dict]) -> Dict:
-    """
-    수집된 종목 데이터를 Supabase stock_list 테이블에 저장
-    UPSERT: 이미 있는 종목은 업데이트, 없는 종목은 신규 삽입
-    """
+    """수집된 종목 데이터를 Supabase stock_list 테이블에 저장 (UPSERT)"""
     if not stocks:
         return {"inserted": 0, "updated": 0, "total": 0, "errors": 0}
 
@@ -178,7 +215,6 @@ async def save_stocks_to_db(stocks: List[Dict]) -> Dict:
             errors += len(batch)
             print(f"[DB 저장] 배치 {i // batch_size + 1} 오류: {e}")
 
-    # 상장폐지 종목 비활성화
     deactivated = await _deactivate_delisted(stocks)
 
     total = inserted + updated
@@ -232,19 +268,13 @@ async def _deactivate_delisted(current_stocks: List[Dict]) -> int:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def update_stock_list() -> Dict:
-    """
-    전체 프로세스 실행:
-    1) KRX에서 전종목 수집 (pykrx)
-    2) Supabase DB에 저장 (upsert)
-    3) 상장폐지 종목 비활성화
-    """
+    """전체 프로세스: KRX 수집 → DB 저장 → 상장폐지 처리"""
     print(f"\n{'=' * 50}")
     print(f"[전종목 업데이트] 시작: {datetime.now()}")
     print(f"{'=' * 50}")
 
     start = time.time()
 
-    # Step 1: KRX 수집
     stocks = fetch_krx_all_stocks()
     if not stocks:
         return {
@@ -253,7 +283,6 @@ async def update_stock_list() -> Dict:
             "elapsed": 0,
         }
 
-    # Step 2: DB 저장
     result = await save_stocks_to_db(stocks)
 
     elapsed = round(time.time() - start, 1)
@@ -282,9 +311,7 @@ def search_stocks_from_db(
     exclude_etf: bool = False,
     exclude_preferred: bool = False,
 ) -> List[Dict]:
-    """
-    stock_list 테이블에서 종목 검색 (종목명 또는 코드)
-    """
+    """stock_list 테이블에서 종목 검색 (종목명 또는 코드)"""
     try:
         q = query.strip()
         if not q:
@@ -362,12 +389,9 @@ def get_all_active_stocks(
 
             if not result.data:
                 break
-
             all_data.extend(result.data)
-
             if len(result.data) < page_size:
                 break
-
             offset += page_size
 
         return all_data
@@ -403,20 +427,17 @@ def get_stock_stats() -> Dict:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _get_last_trading_date() -> str:
-    """최근 거래일 반환 (장중이면 직전 거래일, 장 마감 후면 오늘)
-    KRX 전종목 데이터는 장 마감(15:30) 후 ~16:00에 확정됨
-    """
-    from datetime import datetime, timedelta
+    """최근 거래일 반환 (장중이면 직전 거래일, 장 마감 후면 오늘)"""
     now = datetime.now()
     today = now.date()
 
-    # 16시 이전이면 오늘 데이터 미확정 → 직전 거래일 사용
+    # 16시 이전이면 오늘 데이터 미확정 → 직전 거래일
     if now.hour < 16:
         today = today - timedelta(days=1)
 
-    # 주말이면 이전 평일로 이동
+    # 주말이면 이전 평일로
     for _ in range(10):
-        if today.weekday() < 5:  # 월~금
+        if today.weekday() < 5:
             break
         today = today - timedelta(days=1)
 
