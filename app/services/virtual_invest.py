@@ -131,64 +131,22 @@ class StrategyResult:
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 일봉 데이터 수집 / Daily Candle Data
+# 기존 naver_stock.py 재사용 (requests 기반, Railway에서 안정 동작)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-async def fetch_daily_candles(stock_code: str, days: int = 60) -> List[Dict]:
-    """
-    네이버 금융에서 일봉 데이터 수집
-    Fetch daily candles from Naver Finance
-    """
-    import aiohttp
+from app.services.naver_stock import get_daily_candles_naver
 
-    url = f"https://fchart.stock.naver.com/siseJson.nhn?symbol={stock_code}&requestType=1&startTime=20240101&endTime=20261231&timeframe=day"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://finance.naver.com"
-    }
-
-    candles = []
+def fetch_daily_candles(stock_code: str, days: int = 60) -> List[Dict]:
+    """
+    네이버 금융에서 일봉 데이터 수집 (naver_stock.py 재사용)
+    Fetch daily candles from Naver Finance (reusing naver_stock.py)
+    """
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    logger.error(f"[가상투자] {stock_code} 일봉 조회 실패: {resp.status}")
-                    return []
-
-                text = await resp.text()
-                # 네이버 일봉 JSON 파싱
-                lines = text.strip().split("\n")
-                for line in lines[1:]:  # 헤더 스킵
-                    line = line.strip().strip(",")
-                    if not line or line.startswith("["):
-                        continue
-                    try:
-                        # ['날짜', 시가, 고가, 저가, 종가, 거래량]
-                        parts = line.strip("[]").split(",")
-                        if len(parts) < 6:
-                            continue
-                        date_str = parts[0].strip().strip("'\"").strip()
-                        if len(date_str) < 8:
-                            continue
-                        candles.append({
-                            "date": date_str,
-                            "open": int(float(parts[1].strip())),
-                            "high": int(float(parts[2].strip())),
-                            "low": int(float(parts[3].strip())),
-                            "close": int(float(parts[4].strip())),
-                            "volume": int(float(parts[5].strip())),
-                        })
-                    except (ValueError, IndexError):
-                        continue
-
-        # 최근 N일만
-        if len(candles) > days:
-            candles = candles[-days:]
-
+        candles = get_daily_candles_naver(stock_code, count=days)
         logger.info(f"[가상투자] {stock_code}: {len(candles)}개 일봉 수집")
-
+        return candles
     except Exception as e:
         logger.error(f"[가상투자] {stock_code} 일봉 수집 오류: {e}")
-
-    return candles
+        return []
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -412,7 +370,7 @@ async def run_comparison(
     stocks_data = {}
     for stock in stocks[:MAX_POSITIONS]:
         code = stock["code"]
-        candles = await fetch_daily_candles(code, days=60)
+        candles = fetch_daily_candles(code, days=60)
 
         if not candles:
             logger.warning(f"[가상투자] {code} 일봉 데이터 없음, 스킵")
@@ -641,7 +599,7 @@ async def update_realtime(session_id: str, supabase=None) -> Dict:
 
         for pos in positions:
             code = pos["stock_code"]
-            candles = await fetch_daily_candles(code, days=5)
+            candles = fetch_daily_candles(code, days=5)
 
             if not candles:
                 continue
