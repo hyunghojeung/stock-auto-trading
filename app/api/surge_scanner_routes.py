@@ -119,9 +119,9 @@ def _get_stock_list(market: str = "ALL") -> List[Dict]:
         from app.core.database import db
         query = db.table("stock_list").select("code, name, market").eq("is_active", True)
         if market == "KOSPI":
-            query = query.eq("market", "KOSPI")
+            query = query.eq("market", "kospi")
         elif market == "KOSDAQ":
-            query = query.eq("market", "KOSDAQ")
+            query = query.eq("market", "kosdaq")
         data = query.order("code").execute().data
         return data or []
     except Exception as e:
