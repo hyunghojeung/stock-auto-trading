@@ -114,16 +114,30 @@ async def _fetch_candles_safe(code: str, period_days: int, max_retries: int = 3)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _get_stock_list(market: str = "ALL") -> List[Dict]:
-    """stock_list DB에서 전종목 리스트 조회"""
+    """stock_list DB에서 전종목 리스트 조회 (페이지네이션 적용)"""
     try:
         from app.core.database import db
-        query = db.table("stock_list").select("code, name, market").eq("is_active", True)
-        if market == "KOSPI":
-            query = query.eq("market", "kospi")
-        elif market == "KOSDAQ":
-            query = query.eq("market", "kosdaq")
-        data = query.order("code").execute().data
-        return data or []
+        all_data = []
+        page_size = 1000
+        offset = 0
+
+        while True:
+            query = db.table("stock_list").select("code, name, market").eq("is_active", True)
+            if market == "KOSPI":
+                query = query.eq("market", "kospi")
+            elif market == "KOSDAQ":
+                query = query.eq("market", "kosdaq")
+            result = query.order("code").range(offset, offset + page_size - 1).execute()
+
+            if not result.data:
+                break
+            all_data.extend(result.data)
+            if len(result.data) < page_size:
+                break
+            offset += page_size
+
+        logger.info(f"stock_list 조회: {len(all_data)}개 ({market})")
+        return all_data
     except Exception as e:
         logger.error(f"stock_list DB 조회 실패: {e}")
         return []
@@ -133,8 +147,98 @@ def _get_stock_list(market: str = "ALL") -> List[Dict]:
 # DB 저장/로드 함수
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+INTERMEDIATE_SAVE_INTERVAL = 500  # 500개마다 중간 저장
+
+
+def _create_scan_session(scan_params: Dict) -> Optional[int]:
+    """스캔 세션 생성 (status=running) → session_id 반환"""
+    try:
+        from app.core.database import db
+        session_data = {
+            "market": scan_params.get("market", "ALL"),
+            "period_days": scan_params.get("period_days", 365),
+            "rise_pct": scan_params.get("rise_pct", 30.0),
+            "rise_window": scan_params.get("rise_window", 5),
+            "min_volume_ratio": scan_params.get("min_volume_ratio", 2.0),
+            "total_scanned": 0,
+            "total_found": 0,
+            "total_surges": 0,
+            "high_manip_count": 0,
+            "medium_manip_count": 0,
+            "status": "running",
+        }
+        resp = db.table("surge_scan_sessions").insert(session_data).execute()
+        if not resp.data:
+            return None
+        session_id = resp.data[0]["id"]
+        logger.info(f"스캔 세션 생성: session_id={session_id}")
+        return session_id
+    except Exception as e:
+        logger.error(f"세션 생성 실패: {e}")
+        return None
+
+
+def _save_intermediate_stocks(session_id: int, stocks: List[Dict]) -> int:
+    """중간 결과 DB 저장 (종목 배치 추가) → 저장된 개수 반환"""
+    if not stocks or not session_id:
+        return 0
+    try:
+        from app.core.database import db
+        batch = []
+        saved = 0
+        for stock in stocks:
+            row = {
+                "session_id": session_id,
+                "code": stock.get("code", ""),
+                "name": stock.get("name", ""),
+                "market": stock.get("market", ""),
+                "current_price": stock.get("current_price", 0),
+                "last_date": stock.get("last_date", ""),
+                "surge_count": stock.get("surge_count", 0),
+                "top_manip_score": stock.get("top_manip_score", 0),
+                "top_manip_level": stock.get("top_manip_level", "low"),
+                "top_manip_label": stock.get("top_manip_label", ""),
+                "latest_rise_pct": stock.get("latest_rise_pct", 0),
+                "latest_surge_date": stock.get("latest_surge_date", ""),
+                "latest_from_peak": stock.get("latest_from_peak", 0),
+                "surges_json": json.dumps(stock.get("surges", []), ensure_ascii=False),
+            }
+            batch.append(row)
+            if len(batch) >= 50:
+                db.table("surge_scan_stocks").insert(batch).execute()
+                saved += len(batch)
+                batch = []
+        if batch:
+            db.table("surge_scan_stocks").insert(batch).execute()
+            saved += len(batch)
+        logger.info(f"중간 저장: session_id={session_id}, {saved}개 종목 추가")
+        return saved
+    except Exception as e:
+        logger.error(f"중간 저장 실패: {e}")
+        return 0
+
+
+def _finalize_scan_session(session_id: int, stats: Dict):
+    """스캔 완료 시 세션 통계 업데이트 + status=done"""
+    if not session_id:
+        return
+    try:
+        from app.core.database import db
+        db.table("surge_scan_sessions").update({
+            "total_scanned": stats.get("total_scanned", 0),
+            "total_found": stats.get("total_found", 0),
+            "total_surges": stats.get("total_surges", 0),
+            "high_manip_count": stats.get("high_manip_count", 0),
+            "medium_manip_count": stats.get("medium_manip_count", 0),
+            "status": "done",
+        }).eq("id", session_id).execute()
+        logger.info(f"세션 완료 처리: session_id={session_id}")
+    except Exception as e:
+        logger.error(f"세션 완료 처리 실패: {e}")
+
+
 def _save_scan_to_db(scan_params: Dict, stocks: List[Dict], stats: Dict) -> Optional[int]:
-    """스캔 결과를 Supabase에 저장 → session_id 반환"""
+    """스캔 결과를 Supabase에 저장 → session_id 반환 (호환용 유지)"""
     try:
         from app.core.database import db
 
@@ -213,15 +317,26 @@ def _load_latest_scan_from_db() -> Optional[Dict]:
         session = resp.data[0]
         session_id = session["id"]
 
-        # 해당 세션의 종목 결과 로드
-        stocks_resp = db.table("surge_scan_stocks") \
-            .select("*") \
-            .eq("session_id", session_id) \
-            .order("top_manip_score", desc=True) \
-            .execute()
+        # 해당 세션의 종목 결과 로드 (페이지네이션)
+        all_stock_rows = []
+        page_size = 1000
+        offset = 0
+        while True:
+            stocks_resp = db.table("surge_scan_stocks") \
+                .select("*") \
+                .eq("session_id", session_id) \
+                .order("top_manip_score", desc=True) \
+                .range(offset, offset + page_size - 1) \
+                .execute()
+            if not stocks_resp.data:
+                break
+            all_stock_rows.extend(stocks_resp.data)
+            if len(stocks_resp.data) < page_size:
+                break
+            offset += page_size
 
         stocks = []
-        for row in (stocks_resp.data or []):
+        for row in all_stock_rows:
             surges = []
             try:
                 surges = json.loads(row.get("surges_json", "[]"))
@@ -420,7 +535,7 @@ async def _run_scan_task(
     min_volume_ratio: float,
     batch_size: int,
 ):
-    """백그라운드 스캔 태스크"""
+    """백그라운드 스캔 태스크 (500개마다 중간 저장)"""
     global _scanner_state
 
     try:
@@ -428,7 +543,19 @@ async def _run_scan_task(
         all_results = []
         scanned = 0
         found = 0
-        consecutive_failures = 0  # 연속 실패 카운터
+        consecutive_failures = 0
+
+        # ── 세션 생성 (status=running) ──
+        scan_params = {
+            "market": market,
+            "period_days": period_days,
+            "rise_pct": rise_pct,
+            "rise_window": rise_window,
+            "min_volume_ratio": min_volume_ratio,
+        }
+        session_id = _create_scan_session(scan_params)
+        unsaved_results = []       # 아직 DB에 저장 안 된 종목
+        last_save_scanned = 0      # 마지막 중간 저장 시점
 
         for batch_start in range(0, total, batch_size):
             if _scanner_state["stop_requested"]:
@@ -451,6 +578,7 @@ async def _run_scan_task(
                 scanned += 1
                 if isinstance(r, dict) and r.get("surges"):
                     all_results.append(r)
+                    unsaved_results.append(r)
                     found += 1
                 elif isinstance(r, Exception):
                     batch_failures += 1
@@ -459,14 +587,37 @@ async def _run_scan_task(
             if batch_failures == len(batch) and len(batch) > 1:
                 consecutive_failures += 1
                 if consecutive_failures >= 3:
-                    # 3배치 연속 전부 실패 → 차단 의심 → 장시간 대기
                     _scanner_state["message"] = f"⚠️ 네이버 차단 감지 — 60초 대기 중... ({scanned}/{total})"
                     await asyncio.sleep(60)
                     consecutive_failures = 0
                 else:
-                    await asyncio.sleep(10)  # 짧은 대기
+                    await asyncio.sleep(10)
             else:
                 consecutive_failures = 0
+
+            # ── 500개마다 중간 저장 ──
+            if scanned - last_save_scanned >= INTERMEDIATE_SAVE_INTERVAL:
+                if session_id and unsaved_results:
+                    saved = _save_intermediate_stocks(session_id, unsaved_results)
+                    logger.info(f"중간 저장 완료: {scanned}/{total} 스캔, {saved}개 종목 저장")
+                    unsaved_results = []
+                last_save_scanned = scanned
+
+                # 메모리에도 중간 결과 반영 (프론트에서 조회 가능)
+                _scanner_state["result"] = {
+                    "stocks": sorted(all_results, key=lambda r: r.get("top_manip_score", 0), reverse=True),
+                    "stats": {
+                        "total_scanned": scanned,
+                        "total_found": found,
+                        "total_surges": sum(len(r["surges"]) for r in all_results),
+                        "high_manip_count": sum(1 for r in all_results if r.get("top_manip_level") == "high"),
+                        "medium_manip_count": sum(1 for r in all_results if r.get("top_manip_level") == "medium"),
+                        "scan_params": scan_params,
+                    },
+                    "scan_date": datetime.now().isoformat(),
+                    "market": market,
+                    "partial": True,  # 아직 진행 중 표시
+                }
 
             # 진행률 업데이트
             pct = int((scanned / total) * 100)
@@ -496,27 +647,22 @@ async def _run_scan_task(
             "total_surges": total_surges,
             "high_manip_count": high_manip,
             "medium_manip_count": med_manip,
-            "scan_params": {
-                "period_days": period_days,
-                "rise_pct": rise_pct,
-                "rise_window": rise_window,
-                "min_volume_ratio": min_volume_ratio,
-            },
+            "scan_params": scan_params,
         }
 
-        # ── DB에 결과 저장 ──
-        scan_params = {
-            "market": market,
-            "period_days": period_days,
-            "rise_pct": rise_pct,
-            "rise_window": rise_window,
-            "min_volume_ratio": min_volume_ratio,
-        }
-        session_id = _save_scan_to_db(scan_params, all_results, stats)
+        # ── 남은 미저장 종목 DB 저장 ──
         if session_id:
-            logger.info(f"스캔 결과 DB 저장 완료 (session_id={session_id})")
+            if unsaved_results:
+                _save_intermediate_stocks(session_id, unsaved_results)
+            _finalize_scan_session(session_id, stats)
+            logger.info(f"스캔 결과 DB 최종 저장 완료 (session_id={session_id})")
         else:
-            logger.warning("스캔 결과 DB 저장 실패 — 메모리에만 보관")
+            # session 생성 실패 시 → 기존 방식으로 한번에 저장
+            fallback_id = _save_scan_to_db(scan_params, all_results, stats)
+            if fallback_id:
+                logger.info(f"폴백 저장 완료 (session_id={fallback_id})")
+            else:
+                logger.warning("스캔 결과 DB 저장 실패 — 메모리에만 보관")
 
         _scanner_state["result"] = {
             "stocks": all_results,
