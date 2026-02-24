@@ -248,3 +248,22 @@ async def realtime_update(session_id: str):
     Update positions after market close
     """
     return await update_realtime(session_id, supabase=supabase)
+
+
+@router.get("/candles/{code}")
+async def get_candles(code: str, count: int = 120):
+    """
+    종목 일봉 데이터 조회 (봉차트용)
+    Fetch daily candles for chart display
+    """
+    import asyncio
+    try:
+        from app.services.naver_stock import get_daily_candles_naver
+        loop = asyncio.get_event_loop()
+        candles = await loop.run_in_executor(
+            None, lambda: get_daily_candles_naver(code, count=count)
+        )
+        return {"code": code, "candles": candles, "count": len(candles)}
+    except Exception as e:
+        logger.error(f"[가상투자] 일봉 조회 오류: {e}")
+        return {"code": code, "candles": [], "error": str(e)}
