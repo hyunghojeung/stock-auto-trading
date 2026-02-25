@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 COMMISSION_RATE = 0.00015    # 매수/매도 수수료 0.015%
 SELL_TAX_RATE = 0.0023       # 매도세 0.23%
-MAX_POSITIONS = 5            # 최대 동시 보유 종목수
+MAX_POSITIONS = 10           # 최대 동시 보유 종목수
 DEFAULT_CAPITAL = 1_000_000  # 기본 자본금
 
 # 프리셋 전략 정의 / Preset Strategies
@@ -69,6 +69,17 @@ STRATEGY_PRESETS = {
         "stop_loss_pct": 3.0,
         "max_hold_days": 10,
         "color": "#ce93d8",
+    },
+    "smart": {
+        "name": "🧠 스마트형",
+        "name_en": "Smart",
+        "take_profit_pct": 0.0,   # 트레일링 스탑 사용 (고정 익절 없음)
+        "stop_loss_pct": 5.0,     # 종가 기준 손절
+        "max_hold_days": 20,
+        "trailing_stop_pct": 3.0, # 최고가 대비 -3% 하락 시 매도
+        "grace_days": 2,          # 매수 후 2일간 손절 유예
+        "use_close_stop": True,   # 종가 기준 손절 (장중 저점 무시)
+        "color": "#ff9800",
     },
 }
 
@@ -194,7 +205,7 @@ def simulate_strategy(
             "code": code,
             "name": info.get("name", code),
             "buy_price": buy_price,
-            "signal_date": info.get("signal_date", ""),
+            "signal_date": info.get("signal_date", "") or (info.get("candles", [{}])[0].get("date", "") if info.get("candles") else ""),
             "candles": info.get("candles", []),
             "quantity": quantity,
             "invest_amount": per_stock_amount,
@@ -226,7 +237,8 @@ def simulate_strategy(
             if candle_idx >= len(candles):
                 # 데이터 부족 → 마지막 가격으로 강제 청산
                 last_price = candles[-1]["close"] if candles else pos["buy_price"]
-                trade = _close_position(pos, last_price, day, "timeout", per_stock_amount)
+                last_date = candles[-1].get("date", "") if candles else ""
+                trade = _close_position(pos, last_price, day, "timeout", per_stock_amount, sell_date=last_date)
                 trades.append(trade)
                 cash += per_stock_amount + trade.profit_won
                 pos["status"] = "closed"
@@ -245,7 +257,7 @@ def simulate_strategy(
             # 익절 체크 (장중 고가 기준)
             if high_pct >= take_profit_pct:
                 sell_price = pos["buy_price"] * (1 + take_profit_pct / 100)
-                trade = _close_position(pos, sell_price, day + 1, "profit", per_stock_amount)
+                trade = _close_position(pos, sell_price, day + 1, "profit", per_stock_amount, sell_date=candle.get("date", ""))
                 trades.append(trade)
                 cash += per_stock_amount + trade.profit_won
                 pos["status"] = "closed"
@@ -254,7 +266,7 @@ def simulate_strategy(
             # 손절 체크 (장중 저가 기준)
             if low_pct <= -stop_loss_pct:
                 sell_price = pos["buy_price"] * (1 - stop_loss_pct / 100)
-                trade = _close_position(pos, sell_price, day + 1, "loss", per_stock_amount)
+                trade = _close_position(pos, sell_price, day + 1, "loss", per_stock_amount, sell_date=candle.get("date", ""))
                 trades.append(trade)
                 cash += per_stock_amount + trade.profit_won
                 pos["status"] = "closed"
@@ -262,7 +274,7 @@ def simulate_strategy(
 
             # 최대 보유일 초과
             if day + 1 >= max_hold_days:
-                trade = _close_position(pos, current_price, day + 1, "timeout", per_stock_amount)
+                trade = _close_position(pos, current_price, day + 1, "timeout", per_stock_amount, sell_date=candle.get("date", ""))
                 trades.append(trade)
                 cash += per_stock_amount + trade.profit_won
                 pos["status"] = "closed"
@@ -287,7 +299,7 @@ def simulate_strategy(
     return trades, daily_snapshots
 
 
-def _close_position(pos: Dict, sell_price: float, hold_days: int, result_type: str, invest_amount: float) -> TradeResult:
+def _close_position(pos: Dict, sell_price: float, hold_days: int, result_type: str, invest_amount: float, sell_date: str = "") -> TradeResult:
     """포지션 청산 처리 / Close a position"""
     buy_price = pos["buy_price"]
 
@@ -310,6 +322,8 @@ def _close_position(pos: Dict, sell_price: float, hold_days: int, result_type: s
     # result_type 매핑
     if result_type == "profit":
         result_label = "익절✅"
+    elif result_type == "trailing":
+        result_label = "추적✅"
     elif result_type == "loss":
         result_label = "손절❌"
     else:
@@ -321,13 +335,148 @@ def _close_position(pos: Dict, sell_price: float, hold_days: int, result_type: s
         buy_price=buy_price,
         buy_date=pos.get("signal_date", ""),
         sell_price=round(sell_price),
-        sell_date="",
+        sell_date=sell_date or "",
         profit_pct=net_pct,
         profit_won=profit_won,
         hold_days=hold_days,
         result=result_label,
         invest_amount=invest_amount,
     )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 스마트형 시뮬레이션 / Smart Strategy Simulation
+# 1) 매수 후 2일간 손절 유예 (grace period)
+# 2) 종가 기준 손절 (장중 저점 무시)
+# 3) 트레일링 스탑 (보유 중 최고가 대비 -3% 하락 시 매도)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def simulate_smart_strategy(
+    stocks_data: Dict[str, Dict],
+    capital: float,
+    stop_loss_pct: float = 5.0,
+    trailing_stop_pct: float = 3.0,
+    grace_days: int = 2,
+    max_hold_days: int = 20,
+) -> Tuple[List[TradeResult], List[DailySnapshot]]:
+    """
+    스마트형 전략 시뮬레이션
+    Smart strategy: grace period + close-based stop + trailing stop
+    """
+    trades = []
+    daily_snapshots = []
+
+    if not stocks_data:
+        return trades, daily_snapshots
+
+    num_stocks = min(len(stocks_data), MAX_POSITIONS)
+    per_stock_amount = capital / num_stocks
+    cash = capital - (per_stock_amount * num_stocks)
+
+    positions = []
+    for code, info in list(stocks_data.items())[:MAX_POSITIONS]:
+        buy_price = info["buy_price"]
+        if buy_price <= 0:
+            cash += per_stock_amount
+            continue
+
+        buy_commission = per_stock_amount * COMMISSION_RATE
+        actual_invest = per_stock_amount - buy_commission
+        quantity = actual_invest / buy_price
+
+        positions.append({
+            "code": code,
+            "name": info.get("name", code),
+            "buy_price": buy_price,
+            "signal_date": info.get("signal_date", "") or (info.get("candles", [{}])[0].get("date", "") if info.get("candles") else ""),
+            "candles": info.get("candles", []),
+            "quantity": quantity,
+            "invest_amount": per_stock_amount,
+            "status": "holding",
+            "buy_day_idx": 0,
+            "peak_price": buy_price,  # 보유 중 최고가 추적
+        })
+
+    if not positions:
+        return trades, daily_snapshots
+
+    max_sim_days = max_hold_days + 5
+
+    for day in range(max_sim_days):
+        day_holding_value = 0
+        all_closed = True
+
+        for pos in positions:
+            if pos["status"] != "holding":
+                continue
+
+            all_closed = False
+            candles = pos["candles"]
+            candle_idx = pos["buy_day_idx"] + day
+
+            if candle_idx >= len(candles):
+                last_price = candles[-1]["close"] if candles else pos["buy_price"]
+                last_date = candles[-1].get("date", "") if candles else ""
+                trade = _close_position(pos, last_price, day, "timeout", per_stock_amount, sell_date=last_date)
+                trades.append(trade)
+                cash += per_stock_amount + trade.profit_won
+                pos["status"] = "closed"
+                continue
+
+            candle = candles[candle_idx]
+            current_price = candle["close"]
+            high_price = candle["high"]
+            low_price = candle["low"]
+            hold_day = day + 1
+
+            # ── 최고가 업데이트 (장중 고가 기준) ──
+            if high_price > pos["peak_price"]:
+                pos["peak_price"] = high_price
+
+            # ── 1) 트레일링 스탑 체크 (최고가 대비 하락) ──
+            # grace period 이후에만 적용
+            if hold_day > grace_days and pos["peak_price"] > pos["buy_price"]:
+                drop_from_peak = ((current_price - pos["peak_price"]) / pos["peak_price"]) * 100
+                if drop_from_peak <= -trailing_stop_pct:
+                    # 최고가 대비 trailing_stop_pct% 하락 → 종가로 매도
+                    trade = _close_position(pos, current_price, hold_day, "trailing", per_stock_amount, sell_date=candle.get("date", ""))
+                    trades.append(trade)
+                    cash += per_stock_amount + trade.profit_won
+                    pos["status"] = "closed"
+                    continue
+
+            # ── 2) 종가 기준 손절 (grace period 이후) ──
+            if hold_day > grace_days:
+                close_pct = ((current_price - pos["buy_price"]) / pos["buy_price"]) * 100
+                if close_pct <= -stop_loss_pct:
+                    trade = _close_position(pos, current_price, hold_day, "loss", per_stock_amount, sell_date=candle.get("date", ""))
+                    trades.append(trade)
+                    cash += per_stock_amount + trade.profit_won
+                    pos["status"] = "closed"
+                    continue
+
+            # ── 3) 최대 보유일 초과 ──
+            if hold_day >= max_hold_days:
+                trade = _close_position(pos, current_price, hold_day, "timeout", per_stock_amount, sell_date=candle.get("date", ""))
+                trades.append(trade)
+                cash += per_stock_amount + trade.profit_won
+                pos["status"] = "closed"
+                continue
+
+            # 보유 중 자산 가치
+            day_holding_value += pos["quantity"] * current_price
+
+        daily_snapshots.append(DailySnapshot(
+            date="",
+            day_num=day + 1,
+            total_asset=round(cash + day_holding_value),
+            cash=round(cash),
+            holding_value=round(day_holding_value),
+        ))
+
+        if all_closed:
+            break
+
+    return trades, daily_snapshots
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -352,7 +501,7 @@ def calc_mdd(daily_assets: List[DailySnapshot]) -> float:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 5가지 전략 동시 비교 실행 / Run All 5 Strategies
+# 6가지 전략 동시 비교 실행 / Run All 6 Strategies
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async def run_comparison(
     stocks: List[Dict],         # [{code, name, buy_price, signal_date}]
@@ -360,8 +509,8 @@ async def run_comparison(
     custom_params: Dict = None,
 ) -> Dict:
     """
-    5가지 전략을 동시에 실행하고 비교 결과 반환
-    Run all 5 strategies and return comparison results
+    6가지 전략을 동시에 실행하고 비교 결과 반환
+    Run all 6 strategies and return comparison results
     """
     session_id = str(uuid.uuid4())[:8]
     logger.info(f"[가상투자] 비교 실행 시작 session={session_id}, 종목수={len(stocks)}")
@@ -370,7 +519,7 @@ async def run_comparison(
     stocks_data = {}
     for stock in stocks[:MAX_POSITIONS]:
         code = stock["code"]
-        candles = fetch_daily_candles(code, days=60)
+        candles = fetch_daily_candles(code, days=120)
 
         if not candles:
             logger.warning(f"[가상투자] {code} 일봉 데이터 없음, 스킵")
@@ -407,20 +556,32 @@ async def run_comparison(
         STRATEGY_PRESETS["custom"]["stop_loss_pct"] = custom_params.get("stop_loss_pct", 3.0)
         STRATEGY_PRESETS["custom"]["max_hold_days"] = custom_params.get("max_hold_days", 10)
 
-    # 3. 5가지 전략 동시 실행
+    # 3. 6가지 전략 동시 실행 (스마트형은 별도 엔진)
     results = []
     for key, preset in STRATEGY_PRESETS.items():
         tp = preset["take_profit_pct"]
         sl = preset["stop_loss_pct"]
         mhd = preset["max_hold_days"]
 
-        trades, daily_assets = simulate_strategy(
-            stocks_data=stocks_data,
-            capital=capital,
-            take_profit_pct=tp,
-            stop_loss_pct=sl,
-            max_hold_days=mhd,
-        )
+        if key == "smart":
+            # 스마트형: 트레일링 스탑 + 종가 손절 + 유예기간
+            trades, daily_assets = simulate_smart_strategy(
+                stocks_data=stocks_data,
+                capital=capital,
+                stop_loss_pct=sl,
+                trailing_stop_pct=preset.get("trailing_stop_pct", 3.0),
+                grace_days=preset.get("grace_days", 2),
+                max_hold_days=mhd,
+            )
+        else:
+            # 기존 전략: 고정 익절/손절
+            trades, daily_assets = simulate_strategy(
+                stocks_data=stocks_data,
+                capital=capital,
+                take_profit_pct=tp,
+                stop_loss_pct=sl,
+                max_hold_days=mhd,
+            )
 
         # 결과 집계
         win_count = sum(1 for t in trades if t.profit_won > 0)
@@ -433,7 +594,7 @@ async def run_comparison(
         final_asset = capital + total_return_won
 
         mdd = calc_mdd(daily_assets)
-        risk_reward = round(tp / sl, 2) if sl > 0 else 0
+        risk_reward = round(tp / sl, 2) if (sl > 0 and tp > 0) else round(preset.get("trailing_stop_pct", 3.0) / sl, 2) if sl > 0 else 0
 
         # 종합점수: 수익률 × (승률/100) × (1 + 1/|MDD|) → 높을수록 좋음
         score = round(total_return_pct * (win_rate / 100) * (1 / max(abs(mdd), 0.1)), 2)
@@ -475,7 +636,7 @@ async def run_comparison(
     rankings = []
     for r in results:
         strategies[r.strategy] = asdict(r)
-        rankings.append({
+        rank_item = {
             "strategy": r.strategy,
             "strategy_name": r.strategy_name,
             "color": r.color,
@@ -492,7 +653,15 @@ async def run_comparison(
             "take_profit_pct": r.take_profit_pct,
             "stop_loss_pct": r.stop_loss_pct,
             "max_hold_days": r.max_hold_days,
-        })
+        }
+        # 스마트형 추가 필드
+        if r.strategy == "smart":
+            smart_preset = STRATEGY_PRESETS.get("smart", {})
+            rank_item["trailing_stop_pct"] = smart_preset.get("trailing_stop_pct", 3.0)
+            rank_item["grace_days"] = smart_preset.get("grace_days", 2)
+            strategies[r.strategy]["trailing_stop_pct"] = rank_item["trailing_stop_pct"]
+            strategies[r.strategy]["grace_days"] = rank_item["grace_days"]
+        rankings.append(rank_item)
 
     response = {
         "session_id": session_id,
