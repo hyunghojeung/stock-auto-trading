@@ -519,7 +519,21 @@ async def run_comparison(
     stocks_data = {}
     for stock in stocks[:MAX_POSITIONS]:
         code = stock["code"]
-        candles = fetch_daily_candles(code, days=120)
+
+        # ★ signal_date 기반으로 충분한 기간 계산
+        signal_date = stock.get("signal_date", "")
+        fetch_days = 120  # 기본값
+        if signal_date:
+            try:
+                sd_clean = signal_date.replace("-", "").replace(".", "").strip()
+                sd_dt = datetime.strptime(sd_clean[:8], "%Y%m%d")
+                days_diff = (datetime.now() - sd_dt).days
+                fetch_days = max(120, days_diff + 60)  # signal_date 이전 여유 + 이후 전체
+                fetch_days = min(fetch_days, 600)  # 네이버 최대 600일
+            except Exception:
+                fetch_days = 600  # 파싱 실패시 최대치
+
+        candles = fetch_daily_candles(code, days=fetch_days)
 
         if not candles:
             logger.warning(f"[가상투자] {code} 일봉 데이터 없음, 스킵")
