@@ -217,9 +217,45 @@ async def _scan_recommendations(
         logger.warning("stock_list 테이블이 비어있습니다")
         return []
 
-    # ── 2단계: 분석 대상 제외 + 샘플링 ──
-    candidates = [s for s in all_stocks if s["code"] not in analyzed_codes]
-    logger.info(f"전체 {len(all_stocks)}개 중 후보 {len(candidates)}개 (분석대상 {len(analyzed_codes)}개 제외)")
+    # ── 2단계: 비주식 종목 제외 + 분석 대상 제외 + 샘플링 ──
+
+    # ★ ETF/ETN/스팩/우선주/리츠 필터링
+    ETF_KEYWORDS = [
+        "KODEX", "TIGER", "RISE", "SOL", "ACE", "HANARO", "KBSTAR",
+        "ARIRANG", "KOSEF", "PLUS", "BNK", "TREX", "WOORI", "파워",
+        "마이티", "마이다스", "히어로", "에셋플러스",
+    ]
+    EXCLUDE_KEYWORDS = [
+        "ETN", "스팩", "리츠", "인프라", "선물", "인버스", "레버리지",
+        "채권", "국고", "통안", "CD금리", "머니마켓", "단기자금",
+    ]
+
+    def is_regular_stock(stock):
+        name = stock.get("name", "")
+        code = stock.get("code", "")
+
+        # ETF 키워드 필터
+        for kw in ETF_KEYWORDS:
+            if kw in name:
+                return False
+
+        # ETN/스팩/리츠 등 키워드 필터
+        for kw in EXCLUDE_KEYWORDS:
+            if kw in name:
+                return False
+
+        # 우선주 필터 (종목코드 끝자리가 5, 7, 8, 9이면 우선주 가능성 높음)
+        if code and len(code) == 6 and code[-1] in ("5", "7", "8", "9"):
+            return False
+
+        return True
+
+    filtered_stocks = [s for s in all_stocks if is_regular_stock(s)]
+    excluded_count = len(all_stocks) - len(filtered_stocks)
+    logger.info(f"비주식 종목 {excluded_count}개 제외: {len(all_stocks)}개 → {len(filtered_stocks)}개")
+
+    candidates = [s for s in filtered_stocks if s["code"] not in analyzed_codes]
+    logger.info(f"분석대상 {len(analyzed_codes)}개 추가 제외 → 최종 후보 {len(candidates)}개")
 
     if len(candidates) > max_candidates:
         # 시장별 균등 샘플링 / Stratified sampling by market
