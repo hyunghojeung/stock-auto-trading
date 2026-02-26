@@ -77,7 +77,7 @@ STRATEGY_PRESETS = {
         "stop_loss_pct": 5.0,     # 종가 기준 손절
         "max_hold_days": 20,
         "trailing_stop_pct": 3.0, # 최고가 대비 -3% 하락 시 매도
-        "grace_days": 2,          # 매수 후 2일간 손절 유예
+        "grace_days": 5,          # 매수 후 5일간 손절 유예 (급등 초기 보호)
         "use_close_stop": True,   # 종가 기준 손절 (장중 저점 무시)
         "color": "#ff9800",
     },
@@ -393,16 +393,16 @@ def _close_position(pos: Dict, sell_price: float, hold_days: int, result_type: s
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 스마트형 시뮬레이션 / Smart Strategy Simulation
-# 1) 매수 후 2일간 손절 유예 (grace period)
+# 1) 매수 후 5일간 손절 유예 (grace period — 급등 초기 변동성 보호)
 # 2) 종가 기준 손절 (장중 저점 무시)
-# 3) 트레일링 스탑 (보유 중 최고가 대비 -3% 하락 시 매도)
+# 3) 트레일링 스탑 (보유 중 최고 종가 대비 -3% 하락 시 매도)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def simulate_smart_strategy(
     stocks_data: Dict[str, Dict],
     capital: float,
     stop_loss_pct: float = 5.0,
     trailing_stop_pct: float = 3.0,
-    grace_days: int = 2,
+    grace_days: int = 5,
     max_hold_days: int = 20,
 ) -> Tuple[List[TradeResult], List[DailySnapshot]]:
     """
@@ -512,9 +512,9 @@ def simulate_smart_strategy(
                 all_done = False
                 hold_day = day - pos["hold_start_day"] + 1
 
-                # ── 최고가 업데이트 (장중 고가 기준) ──
-                if high_price > pos["peak_price"]:
-                    pos["peak_price"] = high_price
+                # ── 최고가 업데이트 (★ 종가 기준 — 장중 고가 사용 시 조기 발동 방지) ──
+                if current_price > pos["peak_price"]:
+                    pos["peak_price"] = current_price
 
                 # ── 1) 트레일링 스탑 체크 (최고가 대비 하락) ──
                 if hold_day > grace_days and pos["peak_price"] > pos["buy_price"]:
@@ -673,7 +673,7 @@ async def run_comparison(
                 capital=capital,
                 stop_loss_pct=sl,
                 trailing_stop_pct=preset.get("trailing_stop_pct", 3.0),
-                grace_days=preset.get("grace_days", 2),
+                grace_days=preset.get("grace_days", 5),
                 max_hold_days=mhd,
             )
         else:
@@ -761,7 +761,7 @@ async def run_comparison(
         if r.strategy == "smart":
             smart_preset = STRATEGY_PRESETS.get("smart", {})
             rank_item["trailing_stop_pct"] = smart_preset.get("trailing_stop_pct", 3.0)
-            rank_item["grace_days"] = smart_preset.get("grace_days", 2)
+            rank_item["grace_days"] = smart_preset.get("grace_days", 5)
             strategies[r.strategy]["trailing_stop_pct"] = rank_item["trailing_stop_pct"]
             strategies[r.strategy]["grace_days"] = rank_item["grace_days"]
         rankings.append(rank_item)
