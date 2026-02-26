@@ -7,9 +7,10 @@ Pattern Surge Detector — API Routes
 POST /api/pattern/analyze  — 분석 시작 (비동기)
 GET  /api/pattern/progress  — 진행률 확인
 GET  /api/pattern/result    — 결과 조회
-POST /api/pattern/search    — 종목 검색 (네이버)
+POST /api/pattern/search    — 종목 검색
 
-[v2] 프리셋(우량주/작전주) 지원 — DTW 가중치 파라미터 추가
+★ v2 수정사항: 매수 추천을 전종목 DB에서 스캔하여
+  분석 대상이 아닌 "다른 종목" 중 유사 패턴 보유 종목을 추천
 """
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -18,17 +19,54 @@ from typing import List, Optional, Tuple
 import asyncio
 import logging
 import traceback
+import random
 import re
 import urllib.parse
+import urllib.request
+import json
 
 from app.engine.pattern_analyzer import (
     CandleDay,
     run_pattern_analysis,
 )
+
+# dtw_similarity가 pattern_analyzer에서 import 가능하면 사용, 아니면 내장 버전 사용
+try:
+    from app.engine.pattern_analyzer import dtw_similarity
+except ImportError:
+    import math
+
+    def _dtw_distance(s1, s2, window=None):
+        n, m = len(s1), len(s2)
+        if n == 0 or m == 0:
+            return float('inf')
+        if window is None:
+            window = max(n, m)
+        cost = [[float('inf')] * (m + 1) for _ in range(n + 1)]
+        cost[0][0] = 0
+        for i in range(1, n + 1):
+            for j in range(max(1, i - window), min(m, i + window) + 1):
+                d = (s1[i - 1] - s2[j - 1]) ** 2
+                cost[i][j] = d + min(cost[i - 1][j], cost[i][j - 1], cost[i - 1][j - 1])
+        return math.sqrt(cost[n][m]) if cost[n][m] < float('inf') else float('inf')
+
+    def dtw_similarity(s1, s2) -> float:
+        if not s1 or not s2:
+            return 0.0
+        s1_std = max(max(s1) - min(s1), 0.001)
+        s2_std = max(max(s2) - min(s2), 0.001)
+        s1_norm = [(v - sum(s1) / len(s1)) / s1_std for v in s1]
+        s2_norm = [(v - sum(s2) / len(s2)) / s2_std for v in s2]
+        dist = _dtw_distance(s1_norm, s2_norm, window=max(len(s1), len(s2)))
+        max_len = max(len(s1), len(s2))
+        similarity = max(0, 100 - (dist / max_len) * 30)
+        return round(min(similarity, 100), 1)
 from app.services.naver_stock import get_daily_candles_with_name
+from app.core.database import db
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/pattern", tags=["pattern"])
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 전역 상태 (분석 진행률 + 결과 캐시)
@@ -40,6 +78,7 @@ _analysis_state = {
     "message": "",
     "result": None,
     "error": None,
+    "has_result": False,
 }
 
 
@@ -48,42 +87,37 @@ _analysis_state = {
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class AnalyzeRequest(BaseModel):
-    codes: List[str]            # 종목코드 리스트 ["005930", "000660"]
-    names: dict = {}            # 종목명 {"005930": "삼성전자"}
-    period_days: int = 365      # 조회 기간 (일)
-    pre_rise_days: int = 10     # 급상승 전 분석 구간
-    rise_pct: float = 30.0      # 급상승 기준 (%)
-    rise_window: int = 5        # 급상승 판단 기간 (거래일)
-    # ── [v2] DTW 가중치 (프리셋에서 전달) ──
-    weight_returns: float = 0.5   # 등락률 가중치
-    weight_candle: float = 0.2    # 봉 모양 가중치
-    weight_volume: float = 0.3    # 거래량 가중치
+    codes: List[str]
+    names: dict = {}
+    period_days: int = 365
+    pre_rise_days: int = 10
+    rise_pct: float = 30.0
+    rise_window: int = 5
+    # 가중치 (프론트엔드 상세설정)
+    weight_returns: float = 0.4
+    weight_candle: float = 0.3
+    weight_volume: float = 0.3
 
 
 class SearchRequest(BaseModel):
-    keyword: str                # 검색어
+    keyword: str
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 네이버 일봉 데이터 조회
+# 네이버 캔들 → CandleDay 변환
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def fetch_candles_for_code(code: str, period_days: int) -> Tuple[List[CandleDay], str]:
     """
     네이버 금융에서 일봉 데이터 조회 → CandleDay 리스트 + 종목명 변환
-    기존 app/services/naver_stock.py의 get_daily_candles_with_name 활용 (sync → async 래핑)
     """
     try:
-        # sync 함수를 스레드풀에서 실행 (이벤트루프 블로킹 방지)
-        # 네이버 API 최대 600거래일 제한
-        capped_count = min(period_days, 600)
         loop = asyncio.get_event_loop()
         raw_candles, stock_name = await loop.run_in_executor(
-            None, lambda: get_daily_candles_with_name(code, count=capped_count)
+            None, lambda: get_daily_candles_with_name(code, count=period_days)
         )
 
         if not raw_candles:
-            logger.warning(f"[{code}] 네이버 일봉 데이터 없음")
             return [], code
 
         candles = []
@@ -102,146 +136,235 @@ async def fetch_candles_for_code(code: str, period_days: int) -> Tuple[List[Cand
             except (ValueError, TypeError):
                 continue
 
-        # 이미 naver_stock.py에서 날짜순 정렬되어 있지만 안전하게
         candles.sort(key=lambda c: c.date)
-        logger.info(f"[{code}({stock_name})] 일봉 {len(candles)}개 변환 완료")
         return candles, stock_name
 
     except Exception as e:
-        logger.error(f"[{code}] 일봉 조회 실패: {e}")
+        logger.error(f"[{code}] 캔들 조회 실패: {e}")
         return [], code
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 종목 검색 (네이버)
+# ★ 전종목 매수 추천 스캔 (v2 핵심 추가)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@router.post("/search")
-async def search_stock(req: SearchRequest):
+def _compute_pattern_vectors(candles: List[CandleDay], pre_days: int):
     """
-    종목 검색 — stock_list DB 조회 (전종목 ~2500개)
-    1) 6자리 숫자 → 코드 직접 매칭
-    2) 텍스트 → DB에서 종목명/코드 LIKE 검색
-    3) DB 실패 시 → fallback 리스트 검색
+    최근 pre_days일의 등락률 + 거래량비율 벡터 계산
+    Compute return flow + volume ratio vectors for recent N days
     """
-    keyword = req.keyword.strip()
-    if not keyword:
-        return {"results": []}
+    if len(candles) < pre_days + 20:
+        return None, None
 
-    # ── 1) 6자리 코드 직접 입력 ──
-    if re.match(r'^\d{6}$', keyword):
-        try:
-            from app.core.database import db
-            data = db.table("stock_list").select("code, name").eq("code", keyword).eq("is_active", True).execute().data
-            if data:
-                return {"results": [{"code": data[0]["code"], "name": data[0]["name"]}]}
-        except Exception:
-            pass
-        # DB에 없으면 네이버에서 조회
-        try:
-            loop = asyncio.get_event_loop()
-            _, stock_name = await loop.run_in_executor(
-                None, lambda: get_daily_candles_with_name(keyword, count=1)
-            )
-            if stock_name and stock_name != keyword:
-                return {"results": [{"code": keyword, "name": stock_name}]}
-            else:
-                return {"results": [{"code": keyword, "name": keyword}]}
-        except Exception:
-            return {"results": [{"code": keyword, "name": keyword}]}
+    recent = candles[-pre_days:]
 
-    # ── 2) 텍스트 검색 → stock_list DB ──
+    # 등락률 벡터 / Return flow vector
+    returns = []
+    for k in range(len(recent)):
+        if k == 0:
+            idx_in_full = len(candles) - pre_days
+            prev_close = candles[idx_in_full - 1].close if idx_in_full > 0 else recent[0].open
+        else:
+            prev_close = recent[k - 1].close
+        ret = ((recent[k].close - prev_close) / prev_close) * 100 if prev_close > 0 else 0
+        returns.append(round(ret, 4))
+
+    # 거래량 비율 벡터 / Volume ratio vector
+    volumes = []
+    for k in range(len(recent)):
+        abs_idx = len(candles) - pre_days + k
+        vol_start = max(0, abs_idx - 20)
+        vol_slice = candles[vol_start:abs_idx]
+        avg_vol = sum(c.volume for c in vol_slice) / len(vol_slice) if vol_slice else 1
+        ratio = round(recent[k].volume / avg_vol, 4) if avg_vol > 0 else 1.0
+        volumes.append(ratio)
+
+    return returns, volumes
+
+
+async def _scan_recommendations(
+    clusters_dicts: list,
+    analyzed_codes: set,
+    pre_days: int,
+    progress_callback=None,
+    max_candidates: int = 300,
+) -> list:
+    """
+    ★ 전종목 DB에서 후보 종목을 로드하고 클러스터와 DTW 비교하여 매수 추천 생성
+    Scan stock_list DB for candidates matching detected patterns
+
+    Args:
+        clusters_dicts: 분석 결과의 클러스터 (dict 형태)
+        analyzed_codes: 분석 대상 종목 코드 (제외 대상)
+        pre_days: 패턴 분석 일수
+        progress_callback: 진행률 콜백
+        max_candidates: 최대 후보 종목 수
+    Returns:
+        매수 추천 리스트 (유사도순 정렬)
+    """
+    # ── 1단계: DB에서 전종목 로드 ──
+    if progress_callback:
+        progress_callback(78, "전종목 DB에서 후보 종목 로드 중...")
+
     try:
-        from app.core.database import db
-        data = db.table("stock_list").select("code, name, market").eq("is_active", True).ilike("name", f"%{keyword}%").limit(20).execute().data
-        if data:
-            return {"results": [{"code": s["code"], "name": s["name"]} for s in data]}
+        resp = db.table("stock_list").select("code, name, market").execute()
+        all_stocks = resp.data or []
     except Exception as e:
-        logger.debug(f"stock_list DB 검색 실패: {e}")
+        logger.error(f"stock_list 조회 실패: {e}")
+        return []
 
-    # ── 3) DB 실패 시 fallback ──
-    query_upper = keyword.upper()
-    results = []
-    for s in _FALLBACK_STOCKS:
-        if query_upper in s["name"].upper() or query_upper in s["code"]:
-            results.append({"code": s["code"], "name": s["name"]})
-    return {"results": results[:20]}
+    if not all_stocks:
+        logger.warning("stock_list 테이블이 비어있습니다")
+        return []
 
+    # ── 2단계: 분석 대상 제외 + 샘플링 ──
+    candidates = [s for s in all_stocks if s["code"] not in analyzed_codes]
+    logger.info(f"전체 {len(all_stocks)}개 중 후보 {len(candidates)}개 (분석대상 {len(analyzed_codes)}개 제외)")
 
-# 대표종목 리스트 (네이버 자동완성 API가 Railway에서 차단되어 fallback용)
-_FALLBACK_STOCKS = [
-    {"code": "005930", "name": "삼성전자"},
-    {"code": "000660", "name": "SK하이닉스"},
-    {"code": "373220", "name": "LG에너지솔루션"},
-    {"code": "207940", "name": "삼성바이오로직스"},
-    {"code": "005380", "name": "현대차"},
-    {"code": "006400", "name": "삼성SDI"},
-    {"code": "035420", "name": "NAVER"},
-    {"code": "000270", "name": "기아"},
-    {"code": "068270", "name": "셀트리온"},
-    {"code": "035720", "name": "카카오"},
-    {"code": "051910", "name": "LG화학"},
-    {"code": "105560", "name": "KB금융"},
-    {"code": "055550", "name": "신한지주"},
-    {"code": "003670", "name": "포스코퓨처엠"},
-    {"code": "096770", "name": "SK이노베이션"},
-    {"code": "028260", "name": "삼성물산"},
-    {"code": "012330", "name": "현대모비스"},
-    {"code": "066570", "name": "LG전자"},
-    {"code": "003550", "name": "LG"},
-    {"code": "034730", "name": "SK"},
-    {"code": "015760", "name": "한국전력"},
-    {"code": "032830", "name": "삼성생명"},
-    {"code": "011200", "name": "HMM"},
-    {"code": "010130", "name": "고려아연"},
-    {"code": "033780", "name": "KT&G"},
-    {"code": "009150", "name": "삼성전기"},
-    {"code": "018260", "name": "삼성에스디에스"},
-    {"code": "086790", "name": "하나금융지주"},
-    {"code": "316140", "name": "우리금융지주"},
-    {"code": "017670", "name": "SK텔레콤"},
-    {"code": "030200", "name": "KT"},
-    {"code": "010950", "name": "S-Oil"},
-    {"code": "247540", "name": "에코프로비엠"},
-    {"code": "086520", "name": "에코프로"},
-    {"code": "377300", "name": "카카오페이"},
-    {"code": "259960", "name": "크래프톤"},
-    {"code": "352820", "name": "하이브"},
-    {"code": "263750", "name": "펄어비스"},
-    {"code": "112040", "name": "위메이드"},
-    {"code": "041510", "name": "에스엠"},
-    {"code": "293490", "name": "카카오게임즈"},
-    {"code": "036570", "name": "엔씨소프트"},
-    {"code": "251270", "name": "넷마블"},
-    {"code": "090430", "name": "아모레퍼시픽"},
-    {"code": "005490", "name": "POSCO홀딩스"},
-    {"code": "042700", "name": "한미반도체"},
-    {"code": "196170", "name": "알테오젠"},
-    {"code": "000100", "name": "유한양행"},
-    {"code": "004020", "name": "현대제철"},
-    {"code": "009540", "name": "HD한국조선해양"},
-    {"code": "267260", "name": "HD현대일렉트릭"},
-    {"code": "003490", "name": "대한항공"},
-    {"code": "180640", "name": "한진칼"},
-    {"code": "000810", "name": "삼성화재"},
-    {"code": "036460", "name": "한국가스공사"},
-    {"code": "161390", "name": "한국타이어앤테크놀로지"},
-]
+    if len(candidates) > max_candidates:
+        # 시장별 균등 샘플링 / Stratified sampling by market
+        kospi = [s for s in candidates if s.get("market", "").lower() == "kospi"]
+        kosdaq = [s for s in candidates if s.get("market", "").lower() == "kosdaq"]
+        others = [s for s in candidates if s.get("market", "").lower() not in ("kospi", "kosdaq")]
+
+        kospi_n = int(max_candidates * 0.45)
+        kosdaq_n = int(max_candidates * 0.45)
+        other_n = max_candidates - kospi_n - kosdaq_n
+
+        sampled = []
+        if kospi:
+            sampled.extend(random.sample(kospi, min(kospi_n, len(kospi))))
+        if kosdaq:
+            sampled.extend(random.sample(kosdaq, min(kosdaq_n, len(kosdaq))))
+        if others:
+            sampled.extend(random.sample(others, min(other_n, len(others))))
+
+        candidates = sampled
+        logger.info(f"샘플링 완료: {len(candidates)}개")
+
+    # ── 3단계: 후보 종목 캔들 수집 ──
+    if progress_callback:
+        progress_callback(80, f"후보 {len(candidates)}개 종목 캔들 데이터 수집 중...")
+
+    candidate_candles = {}  # {code: [CandleDay, ...]}
+    candidate_names = {}    # {code: name}
+    total_cands = len(candidates)
+
+    for idx, stock in enumerate(candidates):
+        code = stock["code"]
+        name = stock.get("name", code)
+
+        if progress_callback and idx % 20 == 0:
+            pct = 80 + int((idx / total_cands) * 12)  # 80~92%
+            progress_callback(pct, f"후보 캔들 수집: {name} ({idx+1}/{total_cands})")
+
+        try:
+            candles, fetched_name = await fetch_candles_for_code(code, pre_days + 30)
+            if candles and len(candles) >= pre_days + 20:
+                candidate_candles[code] = candles
+                candidate_names[code] = fetched_name or name
+        except Exception as e:
+            logger.debug(f"[{code}] 캔들 수집 실패: {e}")
+
+        # API 부하 방지 (네이버 차단 방지)
+        await asyncio.sleep(0.15)
+
+    logger.info(f"캔들 수집 완료: {len(candidate_candles)}개 / {total_cands}개")
+
+    if not candidate_candles:
+        return []
+
+    # ── 4단계: DTW 유사도 비교 ──
+    if progress_callback:
+        progress_callback(93, f"{len(candidate_candles)}개 종목 패턴 매칭 중...")
+
+    # 유효한 클러스터만 필터
+    valid_clusters = [
+        c for c in clusters_dicts
+        if c.get("avg_return_flow") and c.get("avg_volume_flow")
+    ]
+
+    if not valid_clusters:
+        logger.warning("유효한 클러스터가 없습니다")
+        return []
+
+    recommendations = []
+
+    for code, candles in candidate_candles.items():
+        name = candidate_names.get(code, code)
+
+        # 패턴 벡터 계산
+        current_returns, current_volumes = _compute_pattern_vectors(candles, pre_days)
+        if current_returns is None:
+            continue
+
+        # 각 클러스터와 DTW 유사도 비교
+        best_sim = 0
+        best_cluster_id = 0
+
+        for cluster in valid_clusters:
+            try:
+                # 등락률 DTW
+                sim_r = dtw_similarity(current_returns, cluster["avg_return_flow"])
+                # 거래량 DTW
+                sim_v = dtw_similarity(current_volumes, cluster["avg_volume_flow"])
+                # 종합 유사도
+                sim = sim_r * 0.6 + sim_v * 0.4
+
+                if sim > best_sim:
+                    best_sim = sim
+                    best_cluster_id = cluster.get("cluster_id", 0)
+            except Exception:
+                continue
+
+        # 시그널 판단
+        if best_sim >= 65:
+            signal = "🟢 강력 매수"
+            signal_code = "strong_buy"
+        elif best_sim >= 50:
+            signal = "🟡 관심"
+            signal_code = "watch"
+        elif best_sim >= 40:
+            signal = "⚠️ 대기"
+            signal_code = "wait"
+        else:
+            signal = "⬜ 미해당"
+            signal_code = "none"
+
+        # 유사도 35% 이상만 추천 목록에 포함
+        if best_sim >= 35:
+            recommendations.append({
+                "code": code,
+                "name": name,
+                "current_price": candles[-1].close if candles else 0,
+                "similarity": round(best_sim, 1),
+                "best_cluster_id": best_cluster_id,
+                "signal": signal,
+                "signal_code": signal_code,
+                "current_returns": current_returns[-5:],  # 최근 5일만 (UI용)
+                "current_volumes": current_volumes[-5:],
+                "last_date": candles[-1].date if candles else "",
+                "signal_date": candles[-1].date if candles else "",
+            })
+
+    # 유사도 높은 순 정렬, 상위 30개
+    recommendations.sort(key=lambda r: r["similarity"], reverse=True)
+    recommendations = recommendations[:30]
+
+    logger.info(f"매수 추천 결과: {len(recommendations)}개 (35%+ 유사도)")
+    return recommendations
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 분석 시작 (비동기 백그라운드)
+# API 엔드포인트
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.post("/analyze")
 async def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks):
-    """
-    분석 시작 — 백그라운드에서 실행
-    [v2] DTW 가중치 파라미터 전달
-    """
+    """분석 시작 (백그라운드 실행)"""
     global _analysis_state
 
-    if _analysis_state["running"]:
+    if _analysis_state.get("running"):
         raise HTTPException(status_code=409, detail="이미 분석이 진행 중입니다.")
 
     if not req.codes:
@@ -250,13 +373,13 @@ async def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks)
     if len(req.codes) > 20:
         raise HTTPException(status_code=400, detail="최대 20개 종목까지 분석 가능합니다.")
 
-    # 상태 초기화
     _analysis_state = {
         "running": True,
         "progress": 0,
         "message": "분석 준비 중...",
         "result": None,
         "error": None,
+        "has_result": False,
     }
 
     background_tasks.add_task(
@@ -267,10 +390,6 @@ async def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks)
         req.pre_rise_days,
         req.rise_pct,
         req.rise_window,
-        # [v2] 가중치 전달
-        req.weight_returns,
-        req.weight_candle,
-        req.weight_volume,
     )
 
     return {"status": "started", "message": f"{len(req.codes)}개 종목 분석 시작"}
@@ -283,33 +402,34 @@ async def _run_analysis_task(
     pre_rise_days: int,
     rise_pct: float,
     rise_window: int,
-    # [v2] DTW 가중치
-    weight_returns: float = 0.5,
-    weight_candle: float = 0.2,
-    weight_volume: float = 0.3,
 ):
-    """백그라운드 분석 태스크"""
+    """
+    백그라운드 분석 태스크
+    ★ Phase 1: 패턴 분석 (기존)
+    ★ Phase 2: 전종목 매수 추천 스캔 (신규)
+    """
     global _analysis_state
 
     try:
-        # ── 데이터 수집 ──
+        # ══════════════════════════════════════════
+        # Phase 1: 데이터 수집 + 패턴 분석
+        # ══════════════════════════════════════════
         candles_by_code = {}
         total = len(codes)
 
         for idx, code in enumerate(codes):
-            _analysis_state["progress"] = int((idx / total) * 30)
+            _analysis_state["progress"] = int((idx / total) * 25)
             _analysis_state["message"] = f"데이터 수집 중: {names.get(code, code)} ({idx+1}/{total})"
 
-            candles, stock_name = await fetch_candles_for_code(code, period_days)
+            candles, fetched_name = await fetch_candles_for_code(code, period_days)
             if candles:
                 candles_by_code[code] = candles
-                # 네이버에서 가져온 종목명으로 보완 (프론트에서 미전달 시)
-                if code not in names or not names[code]:
-                    names[code] = stock_name
+                # 네이버에서 가져온 종목명으로 업데이트
+                if fetched_name and fetched_name != code:
+                    names[code] = fetched_name
             else:
                 logger.warning(f"[{code}] 데이터 없음 — 스킵")
 
-            # API 부하 방지 딜레이
             await asyncio.sleep(0.3)
 
         if not candles_by_code:
@@ -318,22 +438,15 @@ async def _run_analysis_task(
             _analysis_state["progress"] = 100
             return
 
-        _analysis_state["progress"] = 35
-        _analysis_state["message"] = f"{len(candles_by_code)}개 종목 데이터 수집 완료, 분석 시작..."
+        _analysis_state["progress"] = 28
+        _analysis_state["message"] = f"{len(candles_by_code)}개 종목 데이터 수집 완료, 패턴 분석 시작..."
 
-        # ── 분석 실행 ──
-        def progress_cb(pct, msg):
-            # 35~100% 범위로 매핑
-            mapped_pct = 35 + int(pct * 0.65)
-            _analysis_state["progress"] = min(mapped_pct, 100)
+        # 패턴 분석 실행
+        def progress_cb_phase1(pct, msg):
+            # Phase1: 28~75% 범위
+            mapped_pct = 28 + int(pct * 0.47)
+            _analysis_state["progress"] = min(mapped_pct, 75)
             _analysis_state["message"] = msg
-
-        # [v2] 가중치 dict 구성 → pattern_analyzer로 전달
-        weights = {
-            "returns": weight_returns,
-            "candle": weight_candle,
-            "volume": weight_volume,
-        }
 
         result = run_pattern_analysis(
             candles_by_code=candles_by_code,
@@ -341,81 +454,146 @@ async def _run_analysis_task(
             pre_days=pre_rise_days,
             rise_pct=rise_pct,
             rise_window=rise_window,
-            progress_callback=progress_cb,
-            weights=weights,          # [v2] 가중치 전달
+            progress_callback=progress_cb_phase1,
         )
 
+        # ══════════════════════════════════════════
+        # Phase 2: 전종목 매수 추천 스캔 (★ 핵심 수정)
+        # ══════════════════════════════════════════
+        _analysis_state["progress"] = 76
+        _analysis_state["message"] = "전종목 매수 추천 스캔 시작..."
+
+        analyzed_codes = set(codes)
+        clusters_dicts = result.clusters  # 이미 dict 리스트
+
+        def progress_cb_phase2(pct, msg):
+            _analysis_state["progress"] = pct
+            _analysis_state["message"] = msg
+
+        # 클러스터가 있을 때만 전종목 스캔 실행
+        if clusters_dicts:
+            new_recommendations = await _scan_recommendations(
+                clusters_dicts=clusters_dicts,
+                analyzed_codes=analyzed_codes,
+                pre_days=pre_rise_days,
+                progress_callback=progress_cb_phase2,
+                max_candidates=300,
+            )
+        else:
+            new_recommendations = []
+            logger.info("클러스터가 없어 매수 추천 스캔 생략")
+
+        # ══════════════════════════════════════════
         # 결과 저장
+        # ══════════════════════════════════════════
         _analysis_state["result"] = {
+            "status": "done",
             "total_stocks": result.total_stocks,
             "total_surges": result.total_surges,
             "total_patterns": result.total_patterns,
             "clusters": result.clusters,
             "all_patterns": result.all_patterns,
-            "recommendations": result.recommendations,
+            "recommendations": new_recommendations,  # ★ 전종목 스캔 결과로 교체!
             "summary": result.summary,
             "raw_surges": result.raw_surges,
+            # 추가 메타정보
+            "scanned_candidates": len(new_recommendations),
+            "analyzed_codes": list(analyzed_codes),
         }
         _analysis_state["progress"] = 100
         _analysis_state["message"] = "분석 완료!"
+        _analysis_state["has_result"] = True
         _analysis_state["running"] = False
 
         logger.info(
             f"분석 완료: {result.total_surges}개 급상승, "
-            f"{result.total_patterns}개 패턴, {len(result.clusters)}개 클러스터"
+            f"{result.total_patterns}개 패턴, "
+            f"{len(new_recommendations)}개 매수 추천"
         )
 
     except Exception as e:
-        logger.error(f"분석 실패: {e}\n{traceback.format_exc()}")
+        logger.error(f"분석 실패: {traceback.format_exc()}")
         _analysis_state["running"] = False
         _analysis_state["error"] = str(e)
         _analysis_state["progress"] = 100
-        _analysis_state["message"] = f"분석 실패: {str(e)}"
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 진행률 조회
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.get("/progress")
 async def get_progress():
-    """분석 진행률 반환"""
+    """진행률 조회"""
     return {
-        "running": _analysis_state["running"],
-        "progress": _analysis_state["progress"],
-        "message": _analysis_state["message"],
-        "error": _analysis_state["error"],
-        "has_result": _analysis_state["result"] is not None,
+        "running": _analysis_state.get("running", False),
+        "progress": _analysis_state.get("progress", 0),
+        "message": _analysis_state.get("message", ""),
+        "error": _analysis_state.get("error"),
+        "has_result": _analysis_state.get("has_result", False),
     }
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 결과 조회
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.get("/result")
 async def get_result():
-    """분석 결과 반환"""
-    if _analysis_state["running"]:
-        return {
-            "status": "running",
-            "progress": _analysis_state["progress"],
-            "message": _analysis_state["message"],
-        }
+    """분석 결과 조회"""
+    if _analysis_state.get("error"):
+        return {"status": "error", "error": _analysis_state["error"]}
+    if _analysis_state.get("result"):
+        return _analysis_state["result"]
+    return {"status": "waiting", "message": "분석 결과가 없습니다."}
 
-    if _analysis_state["error"]:
-        return {
-            "status": "error",
-            "error": _analysis_state["error"],
-        }
 
-    if _analysis_state["result"] is None:
-        return {
-            "status": "idle",
-            "message": "분석을 시작해주세요.",
-        }
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 종목 검색 (네이버 자동완성 or DB)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    return {
-        "status": "done",
-        **_analysis_state["result"],
-    }
+@router.post("/search")
+async def search_stock(req: SearchRequest):
+    """종목명/코드 검색 (DB 우선, 네이버 폴백)"""
+    keyword = req.keyword.strip()
+    if not keyword:
+        return {"results": []}
+
+    results = []
+
+    # 1차: DB 검색 (stock_list)
+    try:
+        if keyword.isdigit() and len(keyword) <= 6:
+            resp = db.table("stock_list").select("code, name, market").ilike("code", f"%{keyword}%").limit(20).execute()
+        else:
+            resp = db.table("stock_list").select("code, name, market").ilike("name", f"%{keyword}%").limit(20).execute()
+
+        if resp.data:
+            for row in resp.data:
+                results.append({"code": row["code"], "name": row["name"]})
+    except Exception as e:
+        logger.error(f"DB 검색 실패: {e}")
+
+    # 2차: DB에 없으면 네이버 자동완성 폴백
+    if not results:
+        try:
+            encoded = urllib.parse.quote(keyword, encoding="euc-kr")
+            url = (
+                f"https://ac.finance.naver.com/ac?"
+                f"q={encoded}&q_enc=euc-kr&t_koreng=1&st=111&r_lt=111"
+                f"&frm=stock&r_format=json&r_enc=utf-8&r_unicode=0&r_query=1"
+            )
+            req_obj = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Referer": "https://finance.naver.com/",
+            })
+            with urllib.request.urlopen(req_obj, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8"))
+
+            items = data.get("items", [[]])[0] if data.get("items") else []
+            for item in items[:20]:
+                if len(item) >= 2:
+                    name = item[0][0] if isinstance(item[0], list) else str(item[0])
+                    code = item[1][0] if isinstance(item[1], list) else str(item[1])
+                    if len(code) == 6 and code.isdigit():
+                        results.append({"code": code, "name": name})
+        except Exception as e:
+            logger.error(f"네이버 검색 실패: {e}")
+
+    # 3차: 직접 코드 입력 (6자리)
+    if not results and keyword.isdigit() and len(keyword) == 6:
+        results.append({"code": keyword, "name": f"종목코드 {keyword}"})
+
+    return {"results": results}
