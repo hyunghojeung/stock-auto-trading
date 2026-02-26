@@ -698,3 +698,44 @@ async def delete_portfolio(portfolio_id: int):
         return {"success": True, "message": "삭제되었습니다"}
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 8. 종목 캔들 데이터 조회 (차트용)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/candles/{code}")
+async def get_candles(code: str, days: int = 120):
+    """네이버에서 일봉 캔들 데이터 조회"""
+    import asyncio
+    from app.services.naver_stock import get_daily_candles_naver
+
+    try:
+        loop = asyncio.get_event_loop()
+        candles = await loop.run_in_executor(
+            None, lambda: get_daily_candles_naver(code, count=days)
+        )
+        if not candles:
+            return {"candles": [], "name": code}
+
+        result = []
+        for c in candles:
+            try:
+                result.append({
+                    "date": c.get("date", ""),
+                    "open": c.get("open", 0),
+                    "high": c.get("high", 0),
+                    "low": c.get("low", 0),
+                    "close": c.get("close", 0),
+                    "volume": c.get("volume", 0),
+                })
+            except Exception:
+                continue
+
+        result.sort(key=lambda x: x["date"])
+
+        return {"candles": result, "code": code}
+
+    except Exception as e:
+        logger.error(f"[가상포트] 캔들 조회 실패 {code}: {e}")
+        return {"candles": [], "code": code, "error": str(e)}
