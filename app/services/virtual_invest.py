@@ -99,8 +99,9 @@ class TradeResult:
     profit_pct: float       # 수수료/세금 차감 후
     profit_won: int         # 원화 수익금
     hold_days: int
-    result: str             # 'profit' | 'loss' | 'timeout'
+    result: str             # 'profit' | 'loss' | 'timeout' | 'trailing'
     invest_amount: float    # 투자금액
+    re_entry_num: int = 0   # 재진입 번호 (0=최초, 1=1차재진입, ...)
 
 
 @dataclass
@@ -171,12 +172,17 @@ def simulate_strategy(
     max_hold_days: int,
 ) -> Tuple[List[TradeResult], List[DailySnapshot]]:
     """
-    단일 전략으로 포트폴리오 시뮬레이션 실행
-    Run portfolio simulation with a single strategy
+    단일 전략으로 포트폴리오 시뮬레이션 실행 (재진입 포함)
+    Run portfolio simulation with re-entry support
 
     매수추천 종목들을 signal_date에 동시 매수하고,
     각 종목별로 익절/손절/만기 조건으로 청산.
+    익절 후 조정 시 재진입하여 수익 극대화.
     """
+    MAX_RE_ENTRIES = 3          # 최대 재진입 횟수
+    RE_ENTRY_DIP_PCT = 2.0     # 매도가 대비 N% 하락 시 재진입 대기
+    RE_ENTRY_COOLDOWN = 2      # 매도 후 최소 N일 쿨다운
+
     trades = []
     daily_snapshots = []
 
@@ -196,7 +202,6 @@ def simulate_strategy(
             cash += per_stock_amount
             continue
 
-        # 매수 수수료 차감
         buy_commission = per_stock_amount * COMMISSION_RATE
         actual_invest = per_stock_amount - buy_commission
         quantity = actual_invest / buy_price
@@ -209,39 +214,38 @@ def simulate_strategy(
             "candles": info.get("candles", []),
             "quantity": quantity,
             "invest_amount": per_stock_amount,
-            "status": "holding",
+            "status": "holding",       # holding / waiting / done
             "buy_day_idx": 0,
+            "hold_start_day": 0,       # 현재 포지션 시작일 (재진입 시 리셋)
+            "re_entry_count": 0,       # 재진입 횟수
+            "last_sell_price": 0,      # 마지막 매도가 (재진입 조건용)
+            "last_sell_day": 0,        # 마지막 매도일 (쿨다운용)
         })
 
     if not positions:
         return trades, daily_snapshots
 
-    # 최대 시뮬레이션 일수 결정
-    max_sim_days = max_hold_days + 5  # 여유분
+    # 재진입 포함 확장 시뮬레이션 기간
+    max_sim_days = max_hold_days * (MAX_RE_ENTRIES + 1) + 10
 
     # 일별 시뮬레이션
     for day in range(max_sim_days):
         day_holding_value = 0
-        all_closed = True
+        all_done = True
 
         for pos in positions:
-            if pos["status"] != "holding":
-                # 이미 청산된 포지션은 cash에 반영됨
-                continue
-
-            all_closed = False
             candles = pos["candles"]
-            # signal_date 이후 day번째 캔들
             candle_idx = pos["buy_day_idx"] + day
 
+            # ── 데이터 소진 → 강제 종료 ──
             if candle_idx >= len(candles):
-                # 데이터 부족 → 마지막 가격으로 강제 청산
-                last_price = candles[-1]["close"] if candles else pos["buy_price"]
-                last_date = candles[-1].get("date", "") if candles else ""
-                trade = _close_position(pos, last_price, day, "timeout", per_stock_amount, sell_date=last_date)
-                trades.append(trade)
-                cash += per_stock_amount + trade.profit_won
-                pos["status"] = "closed"
+                if pos["status"] == "holding":
+                    last_price = candles[-1]["close"] if candles else pos["buy_price"]
+                    last_date = candles[-1].get("date", "") if candles else ""
+                    trade = _close_position(pos, last_price, day - pos["hold_start_day"], "timeout", per_stock_amount, sell_date=last_date)
+                    trades.append(trade)
+                    cash += per_stock_amount + trade.profit_won
+                pos["status"] = "done"
                 continue
 
             candle = candles[candle_idx]
@@ -249,39 +253,79 @@ def simulate_strategy(
             high_price = candle["high"]
             low_price = candle["low"]
 
-            # 수익률 계산 (장중 고가/저가 체크)
-            high_pct = ((high_price - pos["buy_price"]) / pos["buy_price"]) * 100
-            low_pct = ((low_price - pos["buy_price"]) / pos["buy_price"]) * 100
-            close_pct = ((current_price - pos["buy_price"]) / pos["buy_price"]) * 100
+            # ━━━ 재진입 대기 상태 ━━━
+            if pos["status"] == "waiting":
+                all_done = False
 
-            # 익절 체크 (장중 고가 기준)
-            if high_pct >= take_profit_pct:
-                sell_price = pos["buy_price"] * (1 + take_profit_pct / 100)
-                trade = _close_position(pos, sell_price, day + 1, "profit", per_stock_amount, sell_date=candle.get("date", ""))
-                trades.append(trade)
-                cash += per_stock_amount + trade.profit_won
-                pos["status"] = "closed"
+                # 재진입 조건 체크
+                days_since_sell = day - pos["last_sell_day"]
+                if days_since_sell < RE_ENTRY_COOLDOWN:
+                    continue
+
+                # 매도가 대비 하락 후 양봉 출현 → 재매수
+                dip_from_sell = ((current_price - pos["last_sell_price"]) / pos["last_sell_price"]) * 100
+                is_bullish = candle["close"] > candle["open"]
+
+                if dip_from_sell <= -RE_ENTRY_DIP_PCT and is_bullish:
+                    # 재진입!
+                    pos["status"] = "holding"
+                    pos["buy_price"] = current_price
+                    pos["hold_start_day"] = day
+                    pos["signal_date"] = candle.get("date", "")  # 재진입 매수일
+                    pos["re_entry_count"] += 1
+
+                    # 새 수량 계산 (수수료 차감)
+                    buy_commission = per_stock_amount * COMMISSION_RATE
+                    actual_invest = per_stock_amount - buy_commission
+                    pos["quantity"] = actual_invest / current_price
+                    cash -= per_stock_amount
+
                 continue
 
-            # 손절 체크 (장중 저가 기준)
-            if low_pct <= -stop_loss_pct:
-                sell_price = pos["buy_price"] * (1 - stop_loss_pct / 100)
-                trade = _close_position(pos, sell_price, day + 1, "loss", per_stock_amount, sell_date=candle.get("date", ""))
-                trades.append(trade)
-                cash += per_stock_amount + trade.profit_won
-                pos["status"] = "closed"
-                continue
+            # ━━━ 보유 중 상태 ━━━
+            if pos["status"] == "holding":
+                all_done = False
+                hold_day = day - pos["hold_start_day"] + 1
 
-            # 최대 보유일 초과
-            if day + 1 >= max_hold_days:
-                trade = _close_position(pos, current_price, day + 1, "timeout", per_stock_amount, sell_date=candle.get("date", ""))
-                trades.append(trade)
-                cash += per_stock_amount + trade.profit_won
-                pos["status"] = "closed"
-                continue
+                # 수익률 계산 (장중 고가/저가 체크)
+                high_pct = ((high_price - pos["buy_price"]) / pos["buy_price"]) * 100
+                low_pct = ((low_price - pos["buy_price"]) / pos["buy_price"]) * 100
 
-            # 보유 중 → 현재 평가금액
-            day_holding_value += pos["quantity"] * current_price
+                # 익절 체크 (장중 고가 기준)
+                if high_pct >= take_profit_pct:
+                    sell_price = pos["buy_price"] * (1 + take_profit_pct / 100)
+                    trade = _close_position(pos, sell_price, hold_day, "profit", per_stock_amount, sell_date=candle.get("date", ""))
+                    trades.append(trade)
+                    cash += per_stock_amount + trade.profit_won
+
+                    # 재진입 가능 여부 판단
+                    if pos["re_entry_count"] < MAX_RE_ENTRIES:
+                        pos["status"] = "waiting"
+                        pos["last_sell_price"] = sell_price
+                        pos["last_sell_day"] = day
+                    else:
+                        pos["status"] = "done"
+                    continue
+
+                # 손절 체크 (장중 저가 기준) — 손절 후 재진입 없음
+                if low_pct <= -stop_loss_pct:
+                    sell_price = pos["buy_price"] * (1 - stop_loss_pct / 100)
+                    trade = _close_position(pos, sell_price, hold_day, "loss", per_stock_amount, sell_date=candle.get("date", ""))
+                    trades.append(trade)
+                    cash += per_stock_amount + trade.profit_won
+                    pos["status"] = "done"  # 손절 → 재진입 없음
+                    continue
+
+                # 최대 보유일 초과 — 만기 후 재진입 없음
+                if hold_day >= max_hold_days:
+                    trade = _close_position(pos, current_price, hold_day, "timeout", per_stock_amount, sell_date=candle.get("date", ""))
+                    trades.append(trade)
+                    cash += per_stock_amount + trade.profit_won
+                    pos["status"] = "done"  # 만기 → 재진입 없음
+                    continue
+
+                # 보유 중 → 현재 평가금액
+                day_holding_value += pos["quantity"] * current_price
 
         # 일별 스냅샷 기록
         total_asset = cash + day_holding_value
@@ -293,7 +337,7 @@ def simulate_strategy(
             holding_value=round(day_holding_value),
         ))
 
-        if all_closed:
+        if all_done:
             break
 
     return trades, daily_snapshots
@@ -302,6 +346,7 @@ def simulate_strategy(
 def _close_position(pos: Dict, sell_price: float, hold_days: int, result_type: str, invest_amount: float, sell_date: str = "") -> TradeResult:
     """포지션 청산 처리 / Close a position"""
     buy_price = pos["buy_price"]
+    re_entry_num = pos.get("re_entry_count", 0)
 
     # 수익률 계산
     gross_pct = ((sell_price - buy_price) / buy_price) * 100
@@ -319,21 +364,22 @@ def _close_position(pos: Dict, sell_price: float, hold_days: int, result_type: s
     profit_won = round(net_sell - net_buy)
     net_pct = round((profit_won / invest_amount) * 100, 2)
 
-    # result_type 매핑
+    # result_type 매핑 (재진입 번호 표시)
+    re_tag = f"({re_entry_num}차)" if re_entry_num > 0 else ""
     if result_type == "profit":
-        result_label = "익절✅"
+        result_label = f"익절✅{re_tag}"
     elif result_type == "trailing":
-        result_label = "추적✅"
+        result_label = f"추적✅{re_tag}"
     elif result_type == "loss":
-        result_label = "손절❌"
+        result_label = f"손절❌{re_tag}"
     else:
-        result_label = "만기⏰"
+        result_label = f"만기⏰{re_tag}"
 
     return TradeResult(
         stock_code=pos["code"],
         stock_name=pos["name"],
         buy_price=buy_price,
-        buy_date=pos.get("signal_date", ""),
+        buy_date=pos.get("signal_date", sell_date),
         sell_price=round(sell_price),
         sell_date=sell_date or "",
         profit_pct=net_pct,
@@ -341,6 +387,7 @@ def _close_position(pos: Dict, sell_price: float, hold_days: int, result_type: s
         hold_days=hold_days,
         result=result_label,
         invest_amount=invest_amount,
+        re_entry_num=re_entry_num,
     )
 
 
@@ -359,9 +406,13 @@ def simulate_smart_strategy(
     max_hold_days: int = 20,
 ) -> Tuple[List[TradeResult], List[DailySnapshot]]:
     """
-    스마트형 전략 시뮬레이션
-    Smart strategy: grace period + close-based stop + trailing stop
+    스마트형 전략 시뮬레이션 (재진입 포함)
+    Smart strategy: grace period + close-based stop + trailing stop + re-entry
     """
+    MAX_RE_ENTRIES = 3          # 최대 재진입 횟수
+    RE_ENTRY_DIP_PCT = 2.0     # 매도가 대비 N% 하락 시 재진입 조건
+    RE_ENTRY_COOLDOWN = 2      # 매도 후 최소 N일 쿨다운
+
     trades = []
     daily_snapshots = []
 
@@ -391,79 +442,117 @@ def simulate_smart_strategy(
             "candles": info.get("candles", []),
             "quantity": quantity,
             "invest_amount": per_stock_amount,
-            "status": "holding",
+            "status": "holding",       # holding / waiting / done
             "buy_day_idx": 0,
-            "peak_price": buy_price,  # 보유 중 최고가 추적
+            "peak_price": buy_price,   # 보유 중 최고가 추적
+            "hold_start_day": 0,       # 현재 포지션 시작일
+            "re_entry_count": 0,       # 재진입 횟수
+            "last_sell_price": 0,      # 마지막 매도가
+            "last_sell_day": 0,        # 마지막 매도일
         })
 
     if not positions:
         return trades, daily_snapshots
 
-    max_sim_days = max_hold_days + 5
+    max_sim_days = max_hold_days * (MAX_RE_ENTRIES + 1) + 10
 
     for day in range(max_sim_days):
         day_holding_value = 0
-        all_closed = True
+        all_done = True
 
         for pos in positions:
-            if pos["status"] != "holding":
-                continue
-
-            all_closed = False
             candles = pos["candles"]
             candle_idx = pos["buy_day_idx"] + day
 
+            # ── 데이터 소진 → 강제 종료 ──
             if candle_idx >= len(candles):
-                last_price = candles[-1]["close"] if candles else pos["buy_price"]
-                last_date = candles[-1].get("date", "") if candles else ""
-                trade = _close_position(pos, last_price, day, "timeout", per_stock_amount, sell_date=last_date)
-                trades.append(trade)
-                cash += per_stock_amount + trade.profit_won
-                pos["status"] = "closed"
+                if pos["status"] == "holding":
+                    last_price = candles[-1]["close"] if candles else pos["buy_price"]
+                    last_date = candles[-1].get("date", "") if candles else ""
+                    trade = _close_position(pos, last_price, day - pos["hold_start_day"], "timeout", per_stock_amount, sell_date=last_date)
+                    trades.append(trade)
+                    cash += per_stock_amount + trade.profit_won
+                pos["status"] = "done"
                 continue
 
             candle = candles[candle_idx]
             current_price = candle["close"]
             high_price = candle["high"]
             low_price = candle["low"]
-            hold_day = day + 1
 
-            # ── 최고가 업데이트 (장중 고가 기준) ──
-            if high_price > pos["peak_price"]:
-                pos["peak_price"] = high_price
+            # ━━━ 재진입 대기 상태 ━━━
+            if pos["status"] == "waiting":
+                all_done = False
 
-            # ── 1) 트레일링 스탑 체크 (최고가 대비 하락) ──
-            # grace period 이후에만 적용
-            if hold_day > grace_days and pos["peak_price"] > pos["buy_price"]:
-                drop_from_peak = ((current_price - pos["peak_price"]) / pos["peak_price"]) * 100
-                if drop_from_peak <= -trailing_stop_pct:
-                    # 최고가 대비 trailing_stop_pct% 하락 → 종가로 매도
-                    trade = _close_position(pos, current_price, hold_day, "trailing", per_stock_amount, sell_date=candle.get("date", ""))
-                    trades.append(trade)
-                    cash += per_stock_amount + trade.profit_won
-                    pos["status"] = "closed"
+                days_since_sell = day - pos["last_sell_day"]
+                if days_since_sell < RE_ENTRY_COOLDOWN:
                     continue
 
-            # ── 2) 종가 기준 손절 (grace period 이후) ──
-            if hold_day > grace_days:
-                close_pct = ((current_price - pos["buy_price"]) / pos["buy_price"]) * 100
-                if close_pct <= -stop_loss_pct:
-                    trade = _close_position(pos, current_price, hold_day, "loss", per_stock_amount, sell_date=candle.get("date", ""))
-                    trades.append(trade)
-                    cash += per_stock_amount + trade.profit_won
-                    pos["status"] = "closed"
-                    continue
+                # 매도가 대비 하락 후 양봉 출현 → 재매수
+                dip_from_sell = ((current_price - pos["last_sell_price"]) / pos["last_sell_price"]) * 100
+                is_bullish = candle["close"] > candle["open"]
 
-            # ── 3) 최대 보유일 초과 ──
-            if hold_day >= max_hold_days:
-                trade = _close_position(pos, current_price, hold_day, "timeout", per_stock_amount, sell_date=candle.get("date", ""))
-                trades.append(trade)
-                cash += per_stock_amount + trade.profit_won
-                pos["status"] = "closed"
+                if dip_from_sell <= -RE_ENTRY_DIP_PCT and is_bullish:
+                    pos["status"] = "holding"
+                    pos["buy_price"] = current_price
+                    pos["hold_start_day"] = day
+                    pos["peak_price"] = current_price  # 리셋
+                    pos["signal_date"] = candle.get("date", "")  # 재진입 매수일
+                    pos["re_entry_count"] += 1
+
+                    buy_commission = per_stock_amount * COMMISSION_RATE
+                    actual_invest = per_stock_amount - buy_commission
+                    pos["quantity"] = actual_invest / current_price
+                    cash -= per_stock_amount
+
                 continue
 
-            # 보유 중 자산 가치
-            day_holding_value += pos["quantity"] * current_price
+            # ━━━ 보유 중 상태 ━━━
+            if pos["status"] == "holding":
+                all_done = False
+                hold_day = day - pos["hold_start_day"] + 1
+
+                # ── 최고가 업데이트 (장중 고가 기준) ──
+                if high_price > pos["peak_price"]:
+                    pos["peak_price"] = high_price
+
+                # ── 1) 트레일링 스탑 체크 (최고가 대비 하락) ──
+                if hold_day > grace_days and pos["peak_price"] > pos["buy_price"]:
+                    drop_from_peak = ((current_price - pos["peak_price"]) / pos["peak_price"]) * 100
+                    if drop_from_peak <= -trailing_stop_pct:
+                        trade = _close_position(pos, current_price, hold_day, "trailing", per_stock_amount, sell_date=candle.get("date", ""))
+                        trades.append(trade)
+                        cash += per_stock_amount + trade.profit_won
+
+                        # 수익이면 재진입 가능, 손실이면 종료
+                        if trade.profit_won > 0 and pos["re_entry_count"] < MAX_RE_ENTRIES:
+                            pos["status"] = "waiting"
+                            pos["last_sell_price"] = current_price
+                            pos["last_sell_day"] = day
+                        else:
+                            pos["status"] = "done"
+                        continue
+
+                # ── 2) 종가 기준 손절 (grace period 이후) — 재진입 없음 ──
+                if hold_day > grace_days:
+                    close_pct = ((current_price - pos["buy_price"]) / pos["buy_price"]) * 100
+                    if close_pct <= -stop_loss_pct:
+                        trade = _close_position(pos, current_price, hold_day, "loss", per_stock_amount, sell_date=candle.get("date", ""))
+                        trades.append(trade)
+                        cash += per_stock_amount + trade.profit_won
+                        pos["status"] = "done"  # 손절 → 재진입 없음
+                        continue
+
+                # ── 3) 최대 보유일 초과 — 재진입 없음 ──
+                if hold_day >= max_hold_days:
+                    trade = _close_position(pos, current_price, hold_day, "timeout", per_stock_amount, sell_date=candle.get("date", ""))
+                    trades.append(trade)
+                    cash += per_stock_amount + trade.profit_won
+                    pos["status"] = "done"  # 만기 → 재진입 없음
+                    continue
+
+                # 보유 중 자산 가치
+                day_holding_value += pos["quantity"] * current_price
 
         daily_snapshots.append(DailySnapshot(
             date="",
@@ -473,7 +562,7 @@ def simulate_smart_strategy(
             holding_value=round(day_holding_value),
         ))
 
-        if all_closed:
+        if all_done:
             break
 
     return trades, daily_snapshots
