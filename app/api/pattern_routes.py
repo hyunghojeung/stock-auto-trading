@@ -190,148 +190,97 @@ async def _scan_recommendations(
     max_candidates: int = 300,
 ) -> list:
     """
-    ★ 전종목 DB에서 후보 종목을 로드하고 클러스터와 DTW 비교하여 매수 추천 생성
-    Scan stock_list DB for candidates matching detected patterns
+    ★ v3: stock_patterns DB에서 사전 수집된 벡터로 전종목 DTW 비교
+    DB 미구축 시 기존 실시간 방식으로 fallback
 
     Args:
         clusters_dicts: 분석 결과의 클러스터 (dict 형태)
         analyzed_codes: 분석 대상 종목 코드 (제외 대상)
         pre_days: 패턴 분석 일수
         progress_callback: 진행률 콜백
-        max_candidates: 최대 후보 종목 수
+        max_candidates: 최대 후보 종목 수 (fallback 전용)
     Returns:
         매수 추천 리스트 (유사도순 정렬)
     """
-    # ── 1단계: DB에서 전종목 로드 ──
-    if progress_callback:
-        progress_callback(78, "전종목 DB에서 후보 종목 로드 중...")
-
-    try:
-        resp = db.table("stock_list").select("code, name, market").execute()
-        all_stocks = resp.data or []
-    except Exception as e:
-        logger.error(f"stock_list 조회 실패: {e}")
-        return []
-
-    if not all_stocks:
-        logger.warning("stock_list 테이블이 비어있습니다")
-        return []
-
-    # ── 2단계: 비주식 종목 제외 + 분석 대상 제외 + 샘플링 ──
-
-    # ★ ETF/ETN/스팩/우선주/리츠 필터링
-    ETF_KEYWORDS = [
-        "KODEX", "TIGER", "RISE", "SOL", "ACE", "HANARO", "KBSTAR",
-        "ARIRANG", "KOSEF", "PLUS", "BNK", "TREX", "WOORI", "파워",
-        "마이티", "마이다스", "히어로", "에셋플러스",
-    ]
-    EXCLUDE_KEYWORDS = [
-        "ETN", "스팩", "리츠", "인프라", "선물", "인버스", "레버리지",
-        "채권", "국고", "통안", "CD금리", "머니마켓", "단기자금",
-    ]
-
-    def is_regular_stock(stock):
-        name = stock.get("name", "")
-        code = stock.get("code", "")
-
-        # ETF 키워드 필터
-        for kw in ETF_KEYWORDS:
-            if kw in name:
-                return False
-
-        # ETN/스팩/리츠 등 키워드 필터
-        for kw in EXCLUDE_KEYWORDS:
-            if kw in name:
-                return False
-
-        # 우선주 필터 (종목코드 끝자리가 5, 7, 8, 9이면 우선주 가능성 높음)
-        if code and len(code) == 6 and code[-1] in ("5", "7", "8", "9"):
-            return False
-
-        return True
-
-    filtered_stocks = [s for s in all_stocks if is_regular_stock(s)]
-    excluded_count = len(all_stocks) - len(filtered_stocks)
-    logger.info(f"비주식 종목 {excluded_count}개 제외: {len(all_stocks)}개 → {len(filtered_stocks)}개")
-
-    candidates = [s for s in filtered_stocks if s["code"] not in analyzed_codes]
-    logger.info(f"분석대상 {len(analyzed_codes)}개 추가 제외 → 최종 후보 {len(candidates)}개")
-
-    if len(candidates) > max_candidates:
-        # 시장별 균등 샘플링 / Stratified sampling by market
-        kospi = [s for s in candidates if s.get("market", "").lower() == "kospi"]
-        kosdaq = [s for s in candidates if s.get("market", "").lower() == "kosdaq"]
-        others = [s for s in candidates if s.get("market", "").lower() not in ("kospi", "kosdaq")]
-
-        kospi_n = int(max_candidates * 0.45)
-        kosdaq_n = int(max_candidates * 0.45)
-        other_n = max_candidates - kospi_n - kosdaq_n
-
-        sampled = []
-        if kospi:
-            sampled.extend(random.sample(kospi, min(kospi_n, len(kospi))))
-        if kosdaq:
-            sampled.extend(random.sample(kosdaq, min(kosdaq_n, len(kosdaq))))
-        if others:
-            sampled.extend(random.sample(others, min(other_n, len(others))))
-
-        candidates = sampled
-        logger.info(f"샘플링 완료: {len(candidates)}개")
-
-    # ── 3단계: 후보 종목 캔들 수집 ──
-    if progress_callback:
-        progress_callback(80, f"후보 {len(candidates)}개 종목 캔들 데이터 수집 중...")
-
-    candidate_candles = {}  # {code: [CandleDay, ...]}
-    candidate_names = {}    # {code: name}
-    total_cands = len(candidates)
-
-    for idx, stock in enumerate(candidates):
-        code = stock["code"]
-        name = stock.get("name", code)
-
-        if progress_callback and idx % 20 == 0:
-            pct = 80 + int((idx / total_cands) * 12)  # 80~92%
-            progress_callback(pct, f"후보 캔들 수집: {name} ({idx+1}/{total_cands})")
-
-        try:
-            candles, fetched_name = await fetch_candles_for_code(code, pre_days + 30)
-            if candles and len(candles) >= pre_days + 20:
-                candidate_candles[code] = candles
-                candidate_names[code] = fetched_name or name
-        except Exception as e:
-            logger.debug(f"[{code}] 캔들 수집 실패: {e}")
-
-        # API 부하 방지 (네이버 차단 방지)
-        await asyncio.sleep(0.15)
-
-    logger.info(f"캔들 수집 완료: {len(candidate_candles)}개 / {total_cands}개")
-
-    if not candidate_candles:
-        return []
-
-    # ── 4단계: DTW 유사도 비교 ──
-    if progress_callback:
-        progress_callback(93, f"{len(candidate_candles)}개 종목 패턴 매칭 중...")
-
-    # 유효한 클러스터만 필터
+    # ── 유효 클러스터 확인 ──
     valid_clusters = [
         c for c in clusters_dicts
         if c.get("avg_return_flow") and c.get("avg_volume_flow")
     ]
-
     if not valid_clusters:
         logger.warning("유효한 클러스터가 없습니다")
         return []
 
+    # ── DB 벡터 방식 시도 ──
+    if progress_callback:
+        progress_callback(78, "stock_patterns DB에서 전종목 벡터 로드 중...")
+
+    try:
+        resp = db.table("stock_patterns").select(
+            "code, name, market, returns_30d, volumes_30d, last_close, last_date"
+        ).execute()
+        pattern_rows = resp.data or []
+    except Exception as e:
+        logger.warning(f"stock_patterns 조회 실패 (fallback 실행): {e}")
+        pattern_rows = []
+
+    if len(pattern_rows) >= 100:
+        # ━━━ DB 벡터 방식 (빠른 경로) ━━━
+        logger.info(f"[Phase2] DB 벡터 방식: {len(pattern_rows)}개 로드됨")
+        return _match_from_db_vectors(
+            pattern_rows, valid_clusters, analyzed_codes, pre_days, progress_callback
+        )
+    else:
+        # ━━━ 실시간 방식 (fallback) ━━━
+        logger.info(f"[Phase2] DB 벡터 부족({len(pattern_rows)}개), 실시간 fallback")
+        return await _match_realtime_fallback(
+            valid_clusters, analyzed_codes, pre_days, progress_callback, max_candidates
+        )
+
+
+def _match_from_db_vectors(
+    pattern_rows: list,
+    valid_clusters: list,
+    analyzed_codes: set,
+    pre_days: int,
+    progress_callback=None,
+) -> list:
+    """
+    ★ DB 벡터 기반 전종목 매칭 — 네이버 API 호출 없음, 수초 완료
+    """
+    if progress_callback:
+        progress_callback(80, f"DB에서 {len(pattern_rows)}개 종목 벡터 비교 중...")
+
     recommendations = []
+    total = len(pattern_rows)
 
-    for code, candles in candidate_candles.items():
-        name = candidate_names.get(code, code)
+    for idx, row in enumerate(pattern_rows):
+        code = row.get("code", "")
+        name = row.get("name", code)
 
-        # 패턴 벡터 계산
-        current_returns, current_volumes = _compute_pattern_vectors(candles, pre_days)
-        if current_returns is None:
+        # 분석 대상 종목 제외
+        if code in analyzed_codes:
+            continue
+
+        # 벡터 파싱
+        try:
+            returns_full = row.get("returns_30d", [])
+            volumes_full = row.get("volumes_30d", [])
+
+            # JSONB가 문자열로 올 수 있음
+            if isinstance(returns_full, str):
+                returns_full = json.loads(returns_full)
+            if isinstance(volumes_full, str):
+                volumes_full = json.loads(volumes_full)
+
+            if not returns_full or not volumes_full:
+                continue
+
+            # pre_days에 맞게 슬라이스 (30일 중 최근 N일)
+            current_returns = returns_full[-pre_days:] if len(returns_full) >= pre_days else returns_full
+            current_volumes = volumes_full[-pre_days:] if len(volumes_full) >= pre_days else volumes_full
+
+        except Exception:
             continue
 
         # 각 클러스터와 DTW 유사도 비교
@@ -340,11 +289,8 @@ async def _scan_recommendations(
 
         for cluster in valid_clusters:
             try:
-                # 등락률 DTW
                 sim_r = dtw_similarity(current_returns, cluster["avg_return_flow"])
-                # 거래량 DTW
                 sim_v = dtw_similarity(current_volumes, cluster["avg_volume_flow"])
-                # 종합 유사도
                 sim = sim_r * 0.6 + sim_v * 0.4
 
                 if sim > best_sim:
@@ -367,7 +313,136 @@ async def _scan_recommendations(
             signal = "⬜ 미해당"
             signal_code = "none"
 
-        # 유사도 35% 이상만 추천 목록에 포함
+        if best_sim >= 35:
+            recommendations.append({
+                "code": code,
+                "name": name,
+                "current_price": row.get("last_close", 0),
+                "similarity": round(best_sim, 1),
+                "best_cluster_id": best_cluster_id,
+                "signal": signal,
+                "signal_code": signal_code,
+                "current_returns": current_returns[-5:],
+                "current_volumes": current_volumes[-5:],
+                "last_date": row.get("last_date", ""),
+                "signal_date": row.get("last_date", ""),
+            })
+
+        # 진행률 업데이트 (500개마다)
+        if progress_callback and idx % 500 == 0:
+            pct = 80 + int((idx / total) * 17)  # 80~97%
+            progress_callback(pct, f"벡터 비교: {idx}/{total}")
+
+    # 유사도 높은 순 정렬, 상위 30개
+    recommendations.sort(key=lambda r: r["similarity"], reverse=True)
+    recommendations = recommendations[:30]
+
+    if progress_callback:
+        progress_callback(98, f"전종목 {total}개 스캔 완료 → {len(recommendations)}개 추천")
+
+    logger.info(f"[Phase2-DB] 전종목 {total}개 스캔, {len(recommendations)}개 추천")
+    return recommendations
+
+
+async def _match_realtime_fallback(
+    valid_clusters: list,
+    analyzed_codes: set,
+    pre_days: int,
+    progress_callback=None,
+    max_candidates: int = 300,
+) -> list:
+    """
+    실시간 네이버 캔들 수집 방식 (fallback — DB 미구축 시)
+    """
+    # ── stock_list에서 후보 로드 ──
+    if progress_callback:
+        progress_callback(79, "stock_list에서 후보 종목 로드 중 (fallback)...")
+
+    try:
+        resp = db.table("stock_list").select("code, name, market").execute()
+        all_stocks = resp.data or []
+    except Exception as e:
+        logger.error(f"stock_list 조회 실패: {e}")
+        return []
+
+    if not all_stocks:
+        return []
+
+    # ── 비주식 종목 필터링 ──
+    from app.services.stock_pattern_collector import is_regular_stock
+    filtered = [s for s in all_stocks if is_regular_stock(s)]
+    candidates = [s for s in filtered if s["code"] not in analyzed_codes]
+
+    # ── 샘플링 ──
+    if len(candidates) > max_candidates:
+        kospi = [s for s in candidates if s.get("market", "").lower() == "kospi"]
+        kosdaq = [s for s in candidates if s.get("market", "").lower() == "kosdaq"]
+
+        kospi_n = int(max_candidates * 0.5)
+        kosdaq_n = max_candidates - kospi_n
+
+        sampled = []
+        if kospi:
+            sampled.extend(random.sample(kospi, min(kospi_n, len(kospi))))
+        if kosdaq:
+            sampled.extend(random.sample(kosdaq, min(kosdaq_n, len(kosdaq))))
+
+        candidates = sampled
+
+    # ── 캔들 수집 + 벡터 계산 + DTW 비교 ──
+    if progress_callback:
+        progress_callback(80, f"후보 {len(candidates)}개 캔들 수집 중 (fallback)...")
+
+    recommendations = []
+    total_cands = len(candidates)
+
+    for idx, stock in enumerate(candidates):
+        code = stock["code"]
+        name = stock.get("name", code)
+
+        if progress_callback and idx % 20 == 0:
+            pct = 80 + int((idx / total_cands) * 12)
+            progress_callback(pct, f"후보 캔들 수집: {name} ({idx+1}/{total_cands})")
+
+        try:
+            candles, fetched_name = await fetch_candles_for_code(code, pre_days + 30)
+            if not candles or len(candles) < pre_days + 20:
+                continue
+
+            current_returns, current_volumes = _compute_pattern_vectors(candles, pre_days)
+            if current_returns is None:
+                continue
+
+            name = fetched_name or name
+        except Exception:
+            continue
+
+        await asyncio.sleep(0.15)
+
+        # DTW 비교
+        best_sim = 0
+        best_cluster_id = 0
+
+        for cluster in valid_clusters:
+            try:
+                sim_r = dtw_similarity(current_returns, cluster["avg_return_flow"])
+                sim_v = dtw_similarity(current_volumes, cluster["avg_volume_flow"])
+                sim = sim_r * 0.6 + sim_v * 0.4
+                if sim > best_sim:
+                    best_sim = sim
+                    best_cluster_id = cluster.get("cluster_id", 0)
+            except Exception:
+                continue
+
+        if best_sim >= 65:
+            signal, signal_code = "🟢 강력 매수", "strong_buy"
+        elif best_sim >= 50:
+            signal, signal_code = "🟡 관심", "watch"
+        elif best_sim >= 40:
+            signal, signal_code = "⚠️ 대기", "wait"
+        else:
+            signal, signal_code = "⬜ 미해당", "none"
+
         if best_sim >= 35:
             recommendations.append({
                 "code": code,
@@ -377,17 +452,16 @@ async def _scan_recommendations(
                 "best_cluster_id": best_cluster_id,
                 "signal": signal,
                 "signal_code": signal_code,
-                "current_returns": current_returns[-5:],  # 최근 5일만 (UI용)
+                "current_returns": current_returns[-5:],
                 "current_volumes": current_volumes[-5:],
                 "last_date": candles[-1].date if candles else "",
                 "signal_date": candles[-1].date if candles else "",
             })
 
-    # 유사도 높은 순 정렬, 상위 30개
     recommendations.sort(key=lambda r: r["similarity"], reverse=True)
     recommendations = recommendations[:30]
 
-    logger.info(f"매수 추천 결과: {len(recommendations)}개 (35%+ 유사도)")
+    logger.info(f"[Phase2-fallback] {total_cands}개 스캔, {len(recommendations)}개 추천")
     return recommendations
 
 
