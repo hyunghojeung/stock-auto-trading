@@ -487,6 +487,26 @@ async def _run_analysis_task(
         # ══════════════════════════════════════════
         # 결과 저장
         # ══════════════════════════════════════════
+
+        # ★ 가상투자용 백테스트 추천 (과거 패턴 기반 — 역사적 날짜)
+        backtest_recs = []
+        for p in result.all_patterns:
+            surge = p.get("surge", {})
+            candles_data = p.get("candles", [])
+            backtest_recs.append({
+                "code": p.get("code", ""),
+                "name": p.get("name", ""),
+                "signal_date": surge.get("start_date", ""),
+                "buy_price": surge.get("start_price", 0),
+                "current_price": surge.get("start_price", 0),
+                "similarity": 100.0,
+                "signal": "📊 백테스트",
+                "signal_code": "backtest",
+                "surge_pct": surge.get("rise_pct", 0),
+                "surge_days": surge.get("rise_days", 0),
+                "candles": candles_data,
+            })
+
         _analysis_state["result"] = {
             "status": "done",
             "total_stocks": result.total_stocks,
@@ -494,7 +514,8 @@ async def _run_analysis_task(
             "total_patterns": result.total_patterns,
             "clusters": result.clusters,
             "all_patterns": result.all_patterns,
-            "recommendations": new_recommendations,  # ★ 전종목 스캔 결과로 교체!
+            "recommendations": new_recommendations,  # ★ 전종목 스캔 결과 (매수 추천 탭)
+            "backtest_recommendations": backtest_recs,  # ★ 가상투자용 (과거 날짜)
             "summary": result.summary,
             "raw_surges": result.raw_surges,
             # 추가 메타정보
