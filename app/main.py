@@ -1,5 +1,5 @@
 """FastAPI 메인 앱"""
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic
 from contextlib import asynccontextmanager
@@ -14,9 +14,32 @@ from app.api.pattern_routes import router as pattern_router
 from app.api.surge_scanner_routes import router as scanner_router
 from app.api.virtual_invest_routes import router as virtual_invest_router
 
+# ★ 패턴 벡터 수집기
+from app.services.stock_pattern_collector import run_pattern_collection
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_scheduler()
+
+    # ★ 전종목 패턴 벡터 수집 스케줄러 등록 (매일 18:30 KST)
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        import pytz
+
+        pattern_scheduler = BackgroundScheduler(timezone=pytz.timezone("Asia/Seoul"))
+        pattern_scheduler.add_job(
+            run_pattern_collection,
+            CronTrigger(hour=18, minute=30, timezone=pytz.timezone("Asia/Seoul")),
+            id="pattern_vector_collection",
+            name="전종목 패턴 벡터 수집",
+            replace_existing=True,
+        )
+        pattern_scheduler.start()
+        print("[스케줄러] 전종목 패턴 벡터 수집 등록 (매일 18:30 KST)")
+    except Exception as e:
+        print(f"[스케줄러] 패턴 수집 스케줄러 등록 실패 (무시): {e}")
+
     print("[서버] 10억 만들기 자동매매 서버 시작")
     yield
     print("[서버] 서버 종료")
@@ -86,6 +109,50 @@ async def trigger_trading(password: str = ""):
     from app.engine.trade_executor import execute_trading_cycle
     await execute_trading_cycle()
     return {"success": True, "message": "매매사이클 수동 실행 완료"}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ 전종목 패턴 벡터 수집 엔드포인트
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_pattern_collect_state = {"running": False, "result": None, "started_at": None}
+
+@app.post("/api/patterns/collect")
+async def collect_patterns(background_tasks: BackgroundTasks):
+    """전종목 패턴 벡터 수동 수집 (백그라운드 실행, 약 8~10분 소요)"""
+    if _pattern_collect_state["running"]:
+        return {
+            "status": "already_running",
+            "message": "이미 수집 중입니다",
+            "started_at": _pattern_collect_state["started_at"],
+        }
+
+    def _run():
+        _pattern_collect_state["running"] = True
+        _pattern_collect_state["started_at"] = datetime.now(KST).isoformat()
+        _pattern_collect_state["result"] = None
+        try:
+            result = run_pattern_collection()
+            _pattern_collect_state["result"] = result
+        except Exception as e:
+            _pattern_collect_state["result"] = {"error": str(e)}
+        finally:
+            _pattern_collect_state["running"] = False
+
+    background_tasks.add_task(_run)
+    return {
+        "status": "started",
+        "message": "전종목 패턴 벡터 수집 시작 (약 8~10분 소요)",
+    }
+
+@app.get("/api/patterns/collect/status")
+async def collect_patterns_status():
+    """패턴 벡터 수집 상태 확인"""
+    return {
+        "running": _pattern_collect_state["running"],
+        "started_at": _pattern_collect_state["started_at"],
+        "result": _pattern_collect_state["result"],
+    }
 
 if __name__ == "__main__":
     import uvicorn
