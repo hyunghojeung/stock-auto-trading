@@ -207,17 +207,13 @@ async def _scan_recommendations(
         progress_callback(78, "전종목 DB에서 후보 종목 로드 중...")
 
     try:
-        print("[Phase2-DB] stock_list 조회 시작...")
         resp = db.table("stock_list").select("code, name, market").execute()
         all_stocks = resp.data or []
-        print(f"[Phase2-DB] stock_list 조회 성공: {len(all_stocks)}개")
     except Exception as e:
-        print(f"[Phase2-DB] stock_list 조회 실패: {e}")
         logger.error(f"stock_list 조회 실패: {e}")
         return []
 
     if not all_stocks:
-        print("[Phase2-DB] stock_list 비어있음!")
         logger.warning("stock_list 테이블이 비어있습니다")
         return []
 
@@ -461,7 +457,6 @@ async def _run_analysis_task(
             progress_callback=progress_cb_phase1,
         )
 
-        print(f"[Phase1] 완료 — surges:{result.total_surges}, patterns:{result.total_patterns}, clusters:{len(result.clusters)}")
 
         # ══════════════════════════════════════════
         # Phase 2: 전종목 매수 추천 스캔 (★ 핵심 수정)
@@ -472,7 +467,6 @@ async def _run_analysis_task(
         analyzed_codes = set(codes)
         clusters_dicts = result.clusters  # 이미 dict 리스트
 
-        print(f"[Phase2] 클러스터 수: {len(clusters_dicts)}, 분석대상: {analyzed_codes}")
 
         def progress_cb_phase2(pct, msg):
             _analysis_state["progress"] = pct
@@ -480,7 +474,6 @@ async def _run_analysis_task(
 
         # 클러스터가 있을 때만 전종목 스캔 실행
         if clusters_dicts:
-            print(f"[Phase2] 전종목 스캔 시작 — {len(clusters_dicts)}개 클러스터")
             new_recommendations = await _scan_recommendations(
                 clusters_dicts=clusters_dicts,
                 analyzed_codes=analyzed_codes,
@@ -488,10 +481,8 @@ async def _run_analysis_task(
                 progress_callback=progress_cb_phase2,
                 max_candidates=300,
             )
-            print(f"[Phase2] 스캔 완료 — {len(new_recommendations)}개 추천")
         else:
             new_recommendations = []
-            print("[Phase2] 클러스터 0개 — 스캔 생략")
 
         # ══════════════════════════════════════════
         # 결과 저장
@@ -522,7 +513,6 @@ async def _run_analysis_task(
         )
 
     except Exception as e:
-        print(f"[분석 에러] {traceback.format_exc()}")
         logger.error(f"분석 실패: {traceback.format_exc()}")
         _analysis_state["running"] = False
         _analysis_state["error"] = str(e)
