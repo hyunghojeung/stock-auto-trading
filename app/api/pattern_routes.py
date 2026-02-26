@@ -489,23 +489,30 @@ async def _run_analysis_task(
         # ══════════════════════════════════════════
 
         # ★ 가상투자용 백테스트 추천 (과거 패턴 기반 — 역사적 날짜)
-        backtest_recs = []
+        # 종목별 가장 최근 패턴 1건만 사용 (중복 제거)
+        backtest_by_code = {}
         for p in result.all_patterns:
             surge = p.get("surge", {})
-            candles_data = p.get("candles", [])
-            backtest_recs.append({
-                "code": p.get("code", ""),
-                "name": p.get("name", ""),
-                "signal_date": surge.get("start_date", ""),
-                "buy_price": surge.get("start_price", 0),
-                "current_price": surge.get("start_price", 0),
-                "similarity": 100.0,
-                "signal": "📊 백테스트",
-                "signal_code": "backtest",
-                "surge_pct": surge.get("rise_pct", 0),
-                "surge_days": surge.get("rise_days", 0),
-                "candles": candles_data,
-            })
+            code = p.get("code", "")
+            signal_date = surge.get("start_date", "")
+
+            # 같은 종목이면 가장 최근 패턴만 유지
+            if code not in backtest_by_code or signal_date > backtest_by_code[code]["signal_date"]:
+                backtest_by_code[code] = {
+                    "code": code,
+                    "name": p.get("name", ""),
+                    "signal_date": signal_date,
+                    "buy_price": surge.get("start_price", 0),
+                    "current_price": surge.get("start_price", 0),
+                    "similarity": 100.0,
+                    "signal": "📊 백테스트",
+                    "signal_code": "backtest",
+                    "surge_pct": surge.get("rise_pct", 0),
+                    "surge_days": surge.get("rise_days", 0),
+                    "candles": p.get("candles", []),
+                }
+
+        backtest_recs = list(backtest_by_code.values())
 
         _analysis_state["result"] = {
             "status": "done",
