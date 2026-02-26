@@ -73,12 +73,13 @@ STRATEGY_PRESETS = {
     "smart": {
         "name": "🧠 스마트형",
         "name_en": "Smart",
-        "take_profit_pct": 0.0,   # 트레일링 스탑 사용 (고정 익절 없음)
-        "stop_loss_pct": 5.0,     # 종가 기준 손절
-        "max_hold_days": 20,
-        "trailing_stop_pct": 3.0, # 최고가 대비 -3% 하락 시 매도
-        "grace_days": 5,          # 매수 후 5일간 손절 유예 (급등 초기 보호)
-        "use_close_stop": True,   # 종가 기준 손절 (장중 저점 무시)
+        "take_profit_pct": 0.0,    # 트레일링 스탑 사용 (고정 익절 없음)
+        "stop_loss_pct": 12.0,     # 종가 기준 손절 (급등 전 눌림목 보호)
+        "max_hold_days": 30,       # 최대 보유일 확대 (급등 대기)
+        "trailing_stop_pct": 5.0,  # 최고가 대비 -5% 하락 시 매도 (여유)
+        "grace_days": 7,           # 매수 후 7일간 손절 유예 (눌림목 보호)
+        "profit_activation_pct": 15.0,  # ★ 15% 수익 달성 후에만 추적손절 활성화
+        "use_close_stop": True,    # 종가 기준 손절 (장중 저점 무시)
         "color": "#ff9800",
     },
 }
@@ -400,14 +401,21 @@ def _close_position(pos: Dict, sell_price: float, hold_days: int, result_type: s
 def simulate_smart_strategy(
     stocks_data: Dict[str, Dict],
     capital: float,
-    stop_loss_pct: float = 5.0,
-    trailing_stop_pct: float = 3.0,
-    grace_days: int = 5,
-    max_hold_days: int = 20,
+    stop_loss_pct: float = 12.0,
+    trailing_stop_pct: float = 5.0,
+    grace_days: int = 7,
+    max_hold_days: int = 30,
+    profit_activation_pct: float = 15.0,
 ) -> Tuple[List[TradeResult], List[DailySnapshot]]:
     """
     스마트형 전략 시뮬레이션 (재진입 포함)
-    Smart strategy: grace period + close-based stop + trailing stop + re-entry
+    Smart strategy: grace period + profit-activated trailing stop + re-entry
+
+    핵심 로직:
+      1) grace_days 동안 손절/추적 모두 유예
+      2) grace 이후에도 추적손절은 profit_activation_pct 달성 전까지 비활성
+      3) 수익 활성화 후 peak 대비 trailing_stop_pct 하락 시 매도
+      4) 손절은 grace 이후 매수가 대비 stop_loss_pct 적용
     """
     MAX_RE_ENTRIES = 3          # 최대 재진입 횟수
     RE_ENTRY_DIP_PCT = 2.0     # 매도가 대비 N% 하락 시 재진입 조건
@@ -516,8 +524,12 @@ def simulate_smart_strategy(
                 if current_price > pos["peak_price"]:
                     pos["peak_price"] = current_price
 
-                # ── 1) 트레일링 스탑 체크 (최고가 대비 하락) ──
-                if hold_day > grace_days and pos["peak_price"] > pos["buy_price"]:
+                # ── 1) 트레일링 스탑 체크 (★ 수익 활성화 후에만) ──
+                # 매수가 대비 profit_activation_pct 이상 상승 경험 후에만 추적손절 활성화
+                profit_from_buy = ((pos["peak_price"] - pos["buy_price"]) / pos["buy_price"]) * 100
+                trailing_active = hold_day > grace_days and profit_from_buy >= profit_activation_pct
+
+                if trailing_active:
                     drop_from_peak = ((current_price - pos["peak_price"]) / pos["peak_price"]) * 100
                     if drop_from_peak <= -trailing_stop_pct:
                         trade = _close_position(pos, current_price, hold_day, "trailing", per_stock_amount, sell_date=candle.get("date", ""))
@@ -667,14 +679,15 @@ async def run_comparison(
         mhd = preset["max_hold_days"]
 
         if key == "smart":
-            # 스마트형: 트레일링 스탑 + 종가 손절 + 유예기간
+            # 스마트형: 수익활성화 + 트레일링 스탑 + 종가 손절 + 유예기간
             trades, daily_assets = simulate_smart_strategy(
                 stocks_data=stocks_data,
                 capital=capital,
                 stop_loss_pct=sl,
-                trailing_stop_pct=preset.get("trailing_stop_pct", 3.0),
-                grace_days=preset.get("grace_days", 5),
+                trailing_stop_pct=preset.get("trailing_stop_pct", 5.0),
+                grace_days=preset.get("grace_days", 7),
                 max_hold_days=mhd,
+                profit_activation_pct=preset.get("profit_activation_pct", 15.0),
             )
         else:
             # 기존 전략: 고정 익절/손절
