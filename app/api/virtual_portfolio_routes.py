@@ -721,12 +721,19 @@ async def get_candles(code: str, days: int = 120):
         result = []
         for c in candles:
             try:
+                close = c.get("close", 0)
+                if close <= 0:
+                    continue
+                # ★ open/high/low가 0이면 close로 보정 (거래 희박 종목 대응)
+                op = c.get("open", 0) or close
+                hi = c.get("high", 0) or close
+                lo = c.get("low", 0) or close
                 result.append({
                     "date": c.get("date", ""),
-                    "open": c.get("open", 0),
-                    "high": c.get("high", 0),
-                    "low": c.get("low", 0),
-                    "close": c.get("close", 0),
+                    "open": op,
+                    "high": max(hi, op, close),
+                    "low": min(lo, op, close) if min(lo, op, close) > 0 else close,
+                    "close": close,
                     "volume": c.get("volume", 0),
                 })
             except Exception:
