@@ -490,6 +490,18 @@ async def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks)
         "result": None,
         "error": None,
         "has_result": False,
+        "saved_to_db": False,
+        "codes": req.codes,
+        "names": dict(req.names),
+        "params": {
+            "period_days": req.period_days,
+            "pre_rise_days": req.pre_rise_days,
+            "rise_pct": req.rise_pct,
+            "rise_window": req.rise_window,
+            "weight_returns": req.weight_returns,
+            "weight_candle": req.weight_candle,
+            "weight_volume": req.weight_volume,
+        },
     }
 
     background_tasks.add_task(
@@ -671,12 +683,98 @@ async def get_progress():
 
 @router.get("/result")
 async def get_result():
-    """분석 결과 조회"""
+    """분석 결과 조회 (최초 조회 시 DB 자동 저장)"""
     if _analysis_state.get("error"):
         return {"status": "error", "error": _analysis_state["error"]}
     if _analysis_state.get("result"):
+        # ━━━ DB 저장 (최초 1회만) ━━━
+        if not _analysis_state.get("saved_to_db"):
+            try:
+                result = _analysis_state["result"]
+                codes = _analysis_state.get("codes", [])
+                names = _analysis_state.get("names", {})
+                params = _analysis_state.get("params", {})
+
+                pattern_count = result.get("total_patterns", 0)
+
+                save_data = {
+                    "preset": params.get("preset", "custom"),
+                    "params": params,
+                    "stock_codes": codes,
+                    "stock_names": names,
+                    "stock_count": len(codes),
+                    "pattern_count": pattern_count,
+                    "result_summary": {
+                        "total_stocks": result.get("total_stocks", 0),
+                        "total_surges": result.get("total_surges", 0),
+                        "total_patterns": pattern_count,
+                        "clusters": len(result.get("clusters", [])),
+                        "recommendations": len(result.get("recommendations", [])),
+                    },
+                    "full_result": result,
+                }
+
+                db.table("pattern_analysis_sessions").insert(save_data).execute()
+                _analysis_state["saved_to_db"] = True
+                logger.info(f"✅ 패턴 분석 결과 DB 저장 완료 ({len(codes)}종목, {pattern_count}패턴)")
+            except Exception as e:
+                logger.error(f"⚠️ 패턴 분석 결과 DB 저장 실패: {e}")
+
         return _analysis_state["result"]
     return {"status": "waiting", "message": "분석 결과가 없습니다."}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 이전 분석 결과 조회 / Previous Results
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/previous")
+async def get_previous_results():
+    """이전 패턴 분석 결과 목록 (최근 10개)"""
+    try:
+        resp = (
+            db.table("pattern_analysis_sessions")
+            .select("id, created_at, preset, stock_codes, stock_names, stock_count, pattern_count, result_summary")
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+        sessions = resp.data or []
+        return {"status": "ok", "sessions": sessions, "count": len(sessions)}
+    except Exception as e:
+        logger.error(f"이전 분석 목록 조회 실패: {e}")
+        return {"status": "error", "message": str(e), "sessions": []}
+
+
+@router.get("/previous/{session_id}")
+async def get_previous_result_detail(session_id: int):
+    """특정 분석 세션의 전체 결과 조회"""
+    try:
+        resp = (
+            db.table("pattern_analysis_sessions")
+            .select("*")
+            .eq("id", session_id)
+            .single()
+            .execute()
+        )
+        if not resp.data:
+            return {"status": "not_found", "message": f"세션 {session_id}을 찾을 수 없습니다."}
+
+        session = resp.data
+        full_result = session.get("full_result", {})
+
+        return {
+            "status": "done",
+            "session_id": session["id"],
+            "created_at": session["created_at"],
+            "preset": session.get("preset"),
+            "stock_names": session.get("stock_names", {}),
+            "params": session.get("params", {}),
+            **full_result,
+        }
+    except Exception as e:
+        logger.error(f"분석 세션 {session_id} 조회 실패: {e}")
+        return {"status": "error", "message": str(e)}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
