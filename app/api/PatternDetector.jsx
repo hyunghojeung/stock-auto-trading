@@ -184,6 +184,12 @@ export default function PatternDetector() {
   const [error, setError] = useState('');
   const [activeTab, setActiveTab] = useState(0);
 
+  // ━━━ 이전 분석 결과 상태 ━━━
+  const [prevSessions, setPrevSessions] = useState([]);
+  const [loadingPrevAnalysis, setLoadingPrevAnalysis] = useState(false);
+  const [prevAnalysisSource, setPrevAnalysisSource] = useState('');  // '' | 'memory' | 'db_123'
+  const [showPrevList, setShowPrevList] = useState(false);  // 이전 기록 목록 토글
+
   const applyPreset = (presetKey) => {
     setActivePreset(presetKey);
     const preset = PRESETS[presetKey];
@@ -343,7 +349,7 @@ export default function PatternDetector() {
 
   const startAnalysis = async () => {
     if (stocks.length === 0) { setError('종목을 1개 이상 추가하세요.'); return; }
-    setError(''); setResult(null); setAnalyzing(true); setProgress(0); setProgressMsg('분석 요청 중...');
+    setError(''); setResult(null); setAnalyzing(true); setProgress(0); setProgressMsg('분석 요청 중...'); setPrevAnalysisSource('');
     try {
       const names = {}; stocks.forEach(s => { names[s.code] = s.name; });
       const resp = await fetch(`${API_BASE}/api/pattern/analyze`, {
@@ -370,7 +376,7 @@ export default function PatternDetector() {
           else if (data.has_result) {
             const resResp = await fetch(`${API_BASE}/api/pattern/result`);
             const resData = await resResp.json();
-            if (resData.status === 'done') { setResult(resData); setActiveTab(0); }
+            if (resData.status === 'done') { setResult(resData); setActiveTab(0); setPrevAnalysisSource('memory'); }
             else if (resData.status === 'error') setError(resData.error);
             setAnalyzing(false);
           }
@@ -378,6 +384,109 @@ export default function PatternDetector() {
       } catch (e) { clearInterval(interval); setError('진행률 조회 실패'); setAnalyzing(false); }
     }, 1000);
   }, []);
+
+  // ━━━ 분석기 모드 진입 시: 이전 결과 자동 로드 ━━━
+  useEffect(() => {
+    if (pageMode !== 'analyzer') return;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        // 1) 진행 중인 분석 확인
+        const progResp = await fetch(`${API_BASE}/api/pattern/progress`);
+        const progData = await progResp.json();
+        if (cancelled) return;
+
+        if (progData.running) {
+          setAnalyzing(true);
+          setProgress(progData.progress || 0);
+          setProgressMsg(progData.message || '분석 진행 중...');
+          pollProgress();
+          return;
+        }
+
+        // 2) 메모리에 방금 완료된 결과 있으면 표시
+        if (!progData.running && progData.has_result && !result) {
+          try {
+            const resResp = await fetch(`${API_BASE}/api/pattern/result`);
+            const resData = await resResp.json();
+            if (!cancelled && resData.status === 'done') {
+              setResult(resData);
+              setActiveTab(0);
+              setPrevAnalysisSource('memory');
+            }
+          } catch (e) { /* ignore */ }
+        }
+
+        // 3) DB에서 이전 세션 목록 로드
+        const prevResp = await fetch(`${API_BASE}/api/pattern/previous`);
+        const prevData = await prevResp.json();
+        if (cancelled) return;
+
+        if (prevData.status === 'ok') {
+          setPrevSessions(prevData.sessions || []);
+
+          // 4) ★ 결과가 아직 없으면 → 최신 세션 자동 로드
+          if (!result && !progData.has_result && prevData.sessions?.length > 0) {
+            const latestSession = prevData.sessions[0];
+            setLoadingPrevAnalysis(true);
+            try {
+              const detailResp = await fetch(`${API_BASE}/api/pattern/previous/${latestSession.id}`);
+              const detailData = await detailResp.json();
+              if (!cancelled && detailData.status === 'done') {
+                setResult(detailData);
+                setActiveTab(0);
+                setPrevAnalysisSource(`db_${latestSession.id}`);
+                // 종목 목록 복원
+                if (detailData.stock_names) {
+                  const restoredStocks = Object.entries(detailData.stock_names).map(([code, name]) => ({ code, name }));
+                  setStocks(restoredStocks);
+                }
+                if (detailData.preset && PRESETS[detailData.preset]) {
+                  applyPreset(detailData.preset);
+                }
+              }
+            } catch (e) { console.error('최신 결과 자동 로드 실패:', e); }
+            if (!cancelled) setLoadingPrevAnalysis(false);
+          }
+        }
+      } catch (e) {
+        console.error('이전 분석 결과 로드 실패:', e);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [pageMode]);
+
+  // ━━━ 이전 분석 결과 상세 로드 ━━━
+  const loadPreviousAnalysis = async (sessionId) => {
+    setLoadingPrevAnalysis(true);
+    setError('');
+    try {
+      const resp = await fetch(`${API_BASE}/api/pattern/previous/${sessionId}`);
+      const data = await resp.json();
+      if (data.status === 'done') {
+        setResult(data);
+        setActiveTab(0);
+        setPrevAnalysisSource(`db_${sessionId}`);
+        // 종목 목록 복원
+        if (data.stock_names) {
+          const restoredStocks = Object.entries(data.stock_names).map(([code, name]) => ({ code, name }));
+          setStocks(restoredStocks);
+        }
+        // 프리셋 복원
+        if (data.preset && PRESETS[data.preset]) {
+          applyPreset(data.preset);
+        }
+      } else {
+        setError(data.message || '결과를 불러올 수 없습니다.');
+      }
+    } catch (e) {
+      setError('이전 결과 로드 실패: ' + e.message);
+    } finally {
+      setLoadingPrevAnalysis(false);
+    }
+  };
 
   const currentPreset = PRESETS[activePreset];
 
@@ -486,6 +595,15 @@ export default function PatternDetector() {
 
       {/* ━━━ 페이지 2: 패턴 분석기 ━━━ */}
       {pageMode === 'analyzer' && (<div>
+
+        {/* ── 자동 로드 중 표시 ── */}
+        {loadingPrevAnalysis && !result && !analyzing && (
+          <div style={{ background:COLORS.card, border:`1px solid ${COLORS.cardBorder}`,
+            borderRadius:12, padding:20, marginBottom:16, textAlign:'center' }}>
+            <div style={{ fontSize:14, color:COLORS.accent }}>⏳ 마지막 분석 결과를 불러오는 중...</div>
+          </div>
+        )}
+
         <div style={{ display:'flex', gap:10, marginBottom:16, flexWrap:'wrap' }}>
           {Object.values(PRESETS).map(preset => {
             const isActive = activePreset === preset.key;
@@ -571,6 +689,103 @@ export default function PatternDetector() {
 
         {analyzing && <ProgressBar progress={progress} msg={progressMsg} color={currentPreset.color} />}
         {error && <ErrorBox msg={error} onClose={() => setError('')} />}
+
+        {/* ── 결과 출처 배너 + 이전 기록 토글 ── */}
+        {result && prevAnalysisSource && prevAnalysisSource !== '' && (
+          <div style={{ marginBottom:12 }}>
+            <div style={{
+              display:'flex', alignItems:'center', justifyContent:'space-between',
+              background: prevAnalysisSource.startsWith('db_') ? 'rgba(245,158,11,0.08)' : 'rgba(16,185,129,0.08)',
+              border: `1px solid ${prevAnalysisSource.startsWith('db_') ? 'rgba(245,158,11,0.2)' : 'rgba(16,185,129,0.2)'}`,
+              borderRadius: showPrevList ? '10px 10px 0 0' : 10,
+              padding:'10px 16px', fontSize:13,
+            }}>
+              <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                <span>{prevAnalysisSource.startsWith('db_') ? '📋' : '✅'}</span>
+                <span style={{ color: prevAnalysisSource.startsWith('db_') ? COLORS.yellow : COLORS.green }}>
+                  {prevAnalysisSource === 'memory' ? '방금 분석한 결과' : '마지막 분석 결과'}
+                </span>
+                {result.created_at && <span style={{ fontSize:11, color:COLORS.textDim }}>
+                  ({new Date(result.created_at).toLocaleString('ko-KR', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' })})
+                </span>}
+              </div>
+              <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+                {prevSessions.length > 1 && (
+                  <button onClick={() => setShowPrevList(!showPrevList)}
+                    style={{ background:'rgba(59,130,246,0.15)', border:'1px solid rgba(59,130,246,0.3)',
+                      borderRadius:8, padding:'4px 12px', color:COLORS.accent, fontSize:12,
+                      cursor:'pointer', fontFamily:'inherit' }}>
+                    📋 이전 기록 ({prevSessions.length}건) {showPrevList ? '▲' : '▼'}
+                  </button>
+                )}
+                {prevAnalysisSource.startsWith('db_') && (
+                  <button onClick={() => { setResult(null); setPrevAnalysisSource(''); setShowPrevList(false); }}
+                    style={{ background:'rgba(245,158,11,0.15)', border:'1px solid rgba(245,158,11,0.3)',
+                      borderRadius:8, padding:'4px 12px', color:COLORS.yellow, fontSize:12,
+                      cursor:'pointer', fontFamily:'inherit' }}>✕ 닫기</button>
+                )}
+              </div>
+            </div>
+
+            {/* ── 이전 기록 목록 (토글) ── */}
+            {showPrevList && prevSessions.length > 0 && (
+              <div style={{
+                background:COLORS.card, border:`1px solid ${COLORS.cardBorder}`, borderTop:'none',
+                borderRadius:'0 0 10px 10px', padding:12,
+              }}>
+                <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+                  {prevSessions.slice(0, 10).map((session) => {
+                    const dt = new Date(session.created_at);
+                    const timeStr = dt.toLocaleString('ko-KR', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+                    const presetLabel = session.preset === 'bluechip' ? '🏢 우량주'
+                      : session.preset === 'manipulation' ? '⚡ 작전주' : '🔧 사용자정의';
+                    const stockNames = session.stock_names
+                      ? Object.values(session.stock_names).slice(0,3).join(', ')
+                        + (Object.keys(session.stock_names).length > 3
+                          ? ` 외 ${Object.keys(session.stock_names).length - 3}개` : '')
+                      : `${session.stock_count}종목`;
+                    const isCurrentSession = prevAnalysisSource === `db_${session.id}`;
+                    return (
+                      <button key={session.id}
+                        onClick={() => { if (!isCurrentSession) { loadPreviousAnalysis(session.id); setShowPrevList(false); } }}
+                        disabled={loadingPrevAnalysis || isCurrentSession}
+                        style={{
+                          display:'flex', alignItems:'center', justifyContent:'space-between',
+                          background: isCurrentSession ? 'rgba(16,185,129,0.1)' : 'rgba(59,130,246,0.04)',
+                          border: `1px solid ${isCurrentSession ? 'rgba(16,185,129,0.3)' : 'rgba(59,130,246,0.1)'}`,
+                          borderRadius:8, padding:'10px 14px',
+                          cursor: isCurrentSession ? 'default' : loadingPrevAnalysis ? 'wait' : 'pointer',
+                          width:'100%', textAlign:'left', color:COLORS.text, fontFamily:'inherit',
+                          transition:'all 0.2s',
+                        }}
+                        onMouseEnter={e => { if (!isCurrentSession) e.currentTarget.style.background='rgba(59,130,246,0.1)'; }}
+                        onMouseLeave={e => { if (!isCurrentSession) e.currentTarget.style.background='rgba(59,130,246,0.04)'; }}
+                      >
+                        <div style={{ display:'flex', alignItems:'center', gap:8, flex:1 }}>
+                          {isCurrentSession && <span style={{ fontSize:10, color:COLORS.green }}>● 현재</span>}
+                          <span style={{ fontSize:12, color:COLORS.accent, fontWeight:600 }}>{timeStr}</span>
+                          <span style={{ fontSize:10, padding:'1px 6px', borderRadius:6,
+                            background:session.preset==='manipulation'?COLORS.redDim:COLORS.accentDim,
+                            color:session.preset==='manipulation'?COLORS.red:COLORS.accent }}>{presetLabel}</span>
+                          <span style={{ fontSize:12, color:COLORS.textDim }}>{stockNames}</span>
+                        </div>
+                        <div style={{ fontSize:11, color:COLORS.gray, flexShrink:0 }}>
+                          {session.pattern_count||0}패턴 · {session.stock_count}종목
+                        </div>
+                        {!isCurrentSession && <span style={{ marginLeft:8, fontSize:14, color:COLORS.accent }}>▶</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+                {loadingPrevAnalysis && (
+                  <div style={{ textAlign:'center', padding:'8px 0', fontSize:12, color:COLORS.accent }}>
+                    ⏳ 불러오는 중...
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {result && (<>
           <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(150px, 1fr))', gap:12, marginBottom:16 }}>
