@@ -6,6 +6,7 @@ KIS API 일봉 대신 네이버 금융 차트 API를 사용합니다.
 - 최대 600거래일(약 2.5년) 데이터 수집 가능
 - 모든 KOSPI/KOSDAQ 종목 지원
 - ★ 종목명도 함께 반환 (XML chartdata 태그의 name 속성)
+- ★ OHLC 보정: 거래 희박 종목의 open/high/low=0 자동 보정
 
 파일 경로: app/services/naver_stock.py
 """
@@ -42,6 +43,7 @@ def _fetch_naver_chart(code: str, count: int) -> Tuple[List[Dict], str]:
     """
     네이버 차트 API 호출 (내부 공통 함수)
     ★ XML의 chartdata 태그에서 종목명(name) 추출
+    ★ OHLC 보정: open/high/low가 0이면 close로 채움 (거래 희박 종목 대응)
     """
     url = (
         f"https://fchart.stock.naver.com/sise.nhn"
@@ -84,16 +86,37 @@ def _fetch_naver_chart(code: str, count: int) -> Tuple[List[Dict], str]:
                 continue
 
             try:
+                close_val = int(parts[4].strip())
+                if close_val <= 0:
+                    continue
+
+                open_val = int(parts[1].strip())
+                high_val = int(parts[2].strip())
+                low_val = int(parts[3].strip())
+                vol_val = int(parts[5].strip())
+
+                # ★ OHLC 보정: open/high/low가 0이면 close로 채움
+                # 거래가 극히 적은 종목에서 발생 (예: 선도전기, 에스디생명공학 등)
+                if open_val <= 0:
+                    open_val = close_val
+                if high_val <= 0:
+                    high_val = close_val
+                if low_val <= 0:
+                    low_val = close_val
+
+                # 정합성 보장: high >= max(open, close), low <= min(open, close)
+                high_val = max(high_val, open_val, close_val)
+                low_val = min(low_val, open_val, close_val) if min(low_val, open_val, close_val) > 0 else close_val
+
                 candle = {
                     "date": parts[0].strip(),        # "20260219"
-                    "open": int(parts[1].strip()),
-                    "high": int(parts[2].strip()),
-                    "low": int(parts[3].strip()),
-                    "close": int(parts[4].strip()),
-                    "volume": int(parts[5].strip()),
+                    "open": open_val,
+                    "high": high_val,
+                    "low": low_val,
+                    "close": close_val,
+                    "volume": max(vol_val, 0),
                 }
-                if candle["close"] > 0 and candle["volume"] >= 0:
-                    candles.append(candle)
+                candles.append(candle)
             except (ValueError, IndexError):
                 continue
 
@@ -125,6 +148,14 @@ def get_daily_candles_naver_batch(
     """
     여러 종목의 일봉 데이터를 배치로 수집합니다.
     Batch collect daily candles for multiple stocks.
+
+    Args:
+        codes: 종목코드 리스트
+        count: 종목당 일봉 개수
+        delay: API 호출 간격 (초) - 네이버 서버 부하 방지
+
+    Returns:
+        {"005930": [candles...], "000660": [candles...], ...}
     """
     result = {}
     success = 0
@@ -135,18 +166,62 @@ def get_daily_candles_naver_batch(
     for i, code in enumerate(codes):
         candles = get_daily_candles_naver(code, count)
 
-        if candles and len(candles) >= 60:
+        if candles and len(candles) >= 60:  # 최소 60일 필요
             result[code] = candles
             success += 1
         else:
             fail += 1
 
+        # 진행률 로그 (50개마다)
         if (i + 1) % 50 == 0:
             print(f"[네이버 배치] 진행: {i + 1}/{len(codes)} "
                   f"(성공: {success}, 실패: {fail})")
 
+        # 속도 제한 방지
         if delay > 0:
             time.sleep(delay)
 
     print(f"[네이버 배치] 완료: {success}개 성공, {fail}개 실패")
     return result
+
+
+def get_stock_info_naver(code: str) -> Optional[Dict]:
+    """
+    네이버 금융에서 종목 기본 정보를 가져옵니다.
+    Fetches basic stock info from Naver Finance.
+
+    Returns:
+        {"code": "005930", "name": "삼성전자", "price": 58000,
+         "market_cap": 3460000, ...}
+    """
+    url = f"https://finance.naver.com/item/main.naver?code={code}"
+
+    try:
+        res = requests.get(url, timeout=10, headers={
+            "User-Agent": "Mozilla/5.0"
+        })
+        res.encoding = "euc-kr"
+
+        if res.status_code != 200:
+            return None
+
+        # 간단한 텍스트 파싱 (BeautifulSoup 없이)
+        text = res.text
+
+        # 종목명 추출
+        name = ""
+        name_start = text.find('<title>')
+        name_end = text.find('</title>')
+        if name_start >= 0 and name_end >= 0:
+            title = text[name_start + 7:name_end]
+            # "삼성전자 : 네이버 금융" 형태
+            name = title.split(":")[0].strip()
+
+        return {
+            "code": code,
+            "name": name,
+        }
+
+    except Exception as e:
+        print(f"[네이버 종목정보] {code}: {e}")
+        return None
