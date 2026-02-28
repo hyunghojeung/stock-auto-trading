@@ -32,14 +32,13 @@ from app.services.virtual_invest import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/virtual-invest", tags=["virtual-invest"])
 
-# Supabase 연결 (선택적)
+# Supabase 연결 — app.core.database 사용 (다른 라우트와 동일)
 try:
-    from app.core.config import config
-    from supabase import create_client
-    supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+    from app.core.database import db as supabase
+    logger.info("[가상투자] DB 연결 성공 (app.core.database)")
 except Exception:
     supabase = None
-    logger.warning("[가상투자] Supabase 연결 실패 — DB 없이 동작")
+    logger.warning("[가상투자] DB 연결 실패 — DB 없이 동작")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
