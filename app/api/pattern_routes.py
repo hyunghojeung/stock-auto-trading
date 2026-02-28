@@ -406,15 +406,7 @@ async def _match_realtime_fallback(
 
         try:
             candles, fetched_name = await fetch_candles_for_code(code, pre_days + 30)
-            if not candles or len(candles) == 0:
-                # ★ 캔들 0개 = 거래정지/상장폐지 → 자동 비활성화
-                try:
-                    db.table("stock_list").update({"is_active": False}).eq("code", code).execute()
-                    logger.info(f"★ 종목 비활성화: {name}({code}) — 캔들 데이터 0개")
-                except Exception:
-                    pass
-                continue
-            if len(candles) < pre_days + 20:
+            if not candles or len(candles) < pre_days + 20:
                 continue
 
             current_returns, current_volumes = _compute_pattern_vectors(candles, pre_days)
@@ -643,6 +635,26 @@ async def _run_analysis_task(
                 }
 
         backtest_recs = list(backtest_by_code.values())
+
+        # ★ 버그 수정: recommendations의 signal_date를 과거 급상승 시작일로 보강
+        # recommendations는 "현재 패턴이 유사한 종목"이지만, 가상투자 비교에서
+        # signal_date=오늘이면 미래 데이터가 없어 시뮬레이션 불가.
+        # → backtest_by_code에 해당 종목이 있으면 역사적 signal_date/buy_price 추가
+        for rec in new_recommendations:
+            code = rec.get("code", "")
+            if code in backtest_by_code:
+                bt = backtest_by_code[code]
+                rec["backtest_signal_date"] = bt.get("signal_date", "")
+                rec["backtest_buy_price"] = bt.get("buy_price", 0)
+                rec["surge_pct"] = bt.get("surge_pct", 0)
+                rec["surge_days"] = bt.get("surge_days", 0)
+            else:
+                rec["backtest_signal_date"] = ""
+                rec["backtest_buy_price"] = 0
+
+        logger.info(f"[보강] recommendations {len(new_recommendations)}개 중 "
+                    f"{sum(1 for r in new_recommendations if r.get('backtest_signal_date'))}개에 "
+                    f"과거 signal_date 매핑 완료")
 
         _analysis_state["result"] = {
             "status": "done",
