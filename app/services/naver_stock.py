@@ -7,6 +7,7 @@ KIS API 일봉 대신 네이버 금융 차트 API를 사용합니다.
 - 모든 KOSPI/KOSDAQ 종목 지원
 - ★ 종목명도 함께 반환 (XML chartdata 태그의 name 속성)
 - ★ OHLC 보정: 거래 희박 종목의 open/high/low=0 자동 보정
+- ★ v2: 3단계 재시도 + 의심 데이터 감지 추가
 
 파일 경로: app/services/naver_stock.py
 """
@@ -16,6 +17,15 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 재시도 설정 / Retry Configuration
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RETRY_DELAYS = [2, 5, 10]  # 3단계 재시도 간격(초) / 3-step retry delays (seconds)
+MAX_RETRIES = len(RETRY_DELAYS)
 
 
 def get_daily_candles_naver(code: str, count: int = 250) -> List[Dict]:
@@ -39,6 +49,92 @@ def get_daily_candles_with_name(code: str, count: int = 250) -> Tuple[List[Dict]
     return _fetch_naver_chart(code, count)
 
 
+def get_daily_candles_naver_safe(code: str, count: int = 3) -> Dict:
+    """
+    ★ 안전한 일봉 조회 (스케줄러용) — 재시도 + 의심 데이터 감지
+    Safe daily candle fetch (for scheduler) — with retry + suspicious data detection
+
+    Returns:
+        {
+            "candles": [...],
+            "name": "삼성전자",
+            "suspicious": False,     # 데이터 의심 여부
+            "suspicious_reason": "",  # 의심 사유
+            "success": True,
+            "retries": 0,            # 재시도 횟수
+        }
+    """
+    result = {
+        "candles": [],
+        "name": code,
+        "suspicious": False,
+        "suspicious_reason": "",
+        "success": False,
+        "retries": 0,
+    }
+
+    # 3단계 재시도 / 3-step retry
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            candles, name = _fetch_naver_chart(code, count)
+            result["name"] = name
+
+            if candles and len(candles) > 0:
+                result["candles"] = candles
+                result["success"] = True
+                result["retries"] = attempt
+
+                # ★ 의심 데이터 감지 / Suspicious data detection
+                suspicious, reason = _check_suspicious(candles)
+                result["suspicious"] = suspicious
+                result["suspicious_reason"] = reason
+
+                return result
+
+        except Exception as e:
+            logger.warning(f"[네이버 안전조회] {code} 시도 {attempt + 1}/{MAX_RETRIES + 1} 실패: {e}")
+
+        # 재시도 대기 (마지막 시도 후에는 대기 없음)
+        if attempt < MAX_RETRIES:
+            delay = RETRY_DELAYS[attempt]
+            logger.info(f"[네이버 안전조회] {code} {delay}초 후 재시도...")
+            time.sleep(delay)
+            result["retries"] = attempt + 1
+
+    # 모든 재시도 실패
+    logger.error(f"[네이버 안전조회] {code}: {MAX_RETRIES + 1}회 시도 모두 실패")
+    return result
+
+
+def _check_suspicious(candles: List[Dict]) -> Tuple[bool, str]:
+    """
+    ★ 데이터 의심 여부 판단 / Check if data seems suspicious
+    - 최근 3일 종가가 모두 동일 → 의심
+    - OHLC 전체가 동일 → 의심 (거래 정지 가능성)
+
+    Returns:
+        (is_suspicious, reason)
+    """
+    if len(candles) < 3:
+        return False, ""
+
+    recent = candles[-3:]
+
+    # 최근 3일 종가 모두 동일 체크 / Check if last 3 days close prices are identical
+    closes = [c["close"] for c in recent]
+    if len(set(closes)) == 1:
+        return True, f"최근 3일 종가 동일({closes[0]}원) — 거래정지/데이터오류 의심"
+
+    # 최근 1일 OHLC 모두 동일 체크 / Check if latest day OHLC are all the same
+    latest = recent[-1]
+    if (latest["open"] == latest["high"] == latest["low"] == latest["close"]):
+        vol = latest.get("volume", 0)
+        if vol == 0:
+            return True, f"최근일 OHLC 동일 + 거래량 0 — 거래정지 의심"
+
+    return False, ""
+
+
 def _fetch_naver_chart(code: str, count: int) -> Tuple[List[Dict], str]:
     """
     네이버 차트 API 호출 (내부 공통 함수)
@@ -59,7 +155,7 @@ def _fetch_naver_chart(code: str, count: int) -> Tuple[List[Dict], str]:
         res.encoding = "euc-kr"
 
         if res.status_code != 200:
-            print(f"[네이버 일봉] {code}: HTTP {res.status_code}")
+            logger.warning(f"[네이버 일봉] {code}: HTTP {res.status_code}")
             return [], code
 
         # XML 파싱 / Parse XML
@@ -75,7 +171,7 @@ def _fetch_naver_chart(code: str, count: int) -> Tuple[List[Dict], str]:
         items = root.findall(".//item")
 
         if not items:
-            print(f"[네이버 일봉] {code}: 데이터 없음")
+            logger.info(f"[네이버 일봉] {code}: 데이터 없음")
             return [], stock_name
 
         candles = []
@@ -124,19 +220,19 @@ def _fetch_naver_chart(code: str, count: int) -> Tuple[List[Dict], str]:
         candles.sort(key=lambda x: x["date"])
 
         if candles:
-            print(f"[네이버 일봉] {code}({stock_name}): {len(candles)}개 수집 "
+            logger.debug(f"[네이버 일봉] {code}({stock_name}): {len(candles)}개 수집 "
                   f"({candles[0]['date']} ~ {candles[-1]['date']})")
 
         return candles, stock_name
 
     except requests.exceptions.Timeout:
-        print(f"[네이버 일봉] {code}: 타임아웃")
+        logger.warning(f"[네이버 일봉] {code}: 타임아웃")
         return [], code
     except ET.ParseError as e:
-        print(f"[네이버 일봉] {code}: XML 파싱 오류 - {e}")
+        logger.warning(f"[네이버 일봉] {code}: XML 파싱 오류 - {e}")
         return [], code
     except Exception as e:
-        print(f"[네이버 일봉] {code}: 오류 - {e}")
+        logger.warning(f"[네이버 일봉] {code}: 오류 - {e}")
         return [], code
 
 
@@ -161,7 +257,7 @@ def get_daily_candles_naver_batch(
     success = 0
     fail = 0
 
-    print(f"[네이버 배치] {len(codes)}개 종목 일봉 수집 시작 (count={count})")
+    logger.info(f"[네이버 배치] {len(codes)}개 종목 일봉 수집 시작 (count={count})")
 
     for i, code in enumerate(codes):
         candles = get_daily_candles_naver(code, count)
@@ -174,14 +270,14 @@ def get_daily_candles_naver_batch(
 
         # 진행률 로그 (50개마다)
         if (i + 1) % 50 == 0:
-            print(f"[네이버 배치] 진행: {i + 1}/{len(codes)} "
+            logger.info(f"[네이버 배치] 진행: {i + 1}/{len(codes)} "
                   f"(성공: {success}, 실패: {fail})")
 
         # 속도 제한 방지
         if delay > 0:
             time.sleep(delay)
 
-    print(f"[네이버 배치] 완료: {success}개 성공, {fail}개 실패")
+    logger.info(f"[네이버 배치] 완료: {success}개 성공, {fail}개 실패")
     return result
 
 
@@ -223,5 +319,5 @@ def get_stock_info_naver(code: str) -> Optional[Dict]:
         }
 
     except Exception as e:
-        print(f"[네이버 종목정보] {code}: {e}")
+        logger.warning(f"[네이버 종목정보] {code}: {e}")
         return None
