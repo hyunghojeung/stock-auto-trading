@@ -24,6 +24,7 @@ import json
 from datetime import datetime, timedelta
 
 from app.engine.pattern_analyzer import CandleDay, detect_surges
+from app.services.stock_pattern_collector import is_regular_stock
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/scanner", tags=["scanner"])
@@ -114,7 +115,9 @@ async def _fetch_candles_safe(code: str, period_days: int, max_retries: int = 3)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _get_stock_list(market: str = "ALL") -> List[Dict]:
-    """stock_list DB에서 전종목 리스트 조회 (페이지네이션 적용)"""
+    """stock_list DB에서 전종목 리스트 조회 (페이지네이션 적용)
+    ★ ETF/ETN/인버스/레버리지/우선주 자동 제외
+    """
     try:
         from app.core.database import db
         all_data = []
@@ -122,7 +125,10 @@ def _get_stock_list(market: str = "ALL") -> List[Dict]:
         offset = 0
 
         while True:
-            query = db.table("stock_list").select("code, name, market").eq("is_active", True)
+            query = db.table("stock_list").select("code, name, market") \
+                .eq("is_active", True) \
+                .eq("is_etf", False) \
+                .eq("is_preferred", False)
             if market == "KOSPI":
                 query = query.eq("market", "kospi")
             elif market == "KOSDAQ":
@@ -136,7 +142,13 @@ def _get_stock_list(market: str = "ALL") -> List[Dict]:
                 break
             offset += page_size
 
-        logger.info(f"stock_list 조회: {len(all_data)}개 ({market})")
+        # ★ 2차 필터: 이름 기반 ETF/ETN/스팩/리츠/우선주 제거
+        before_count = len(all_data)
+        all_data = [s for s in all_data if is_regular_stock(s)]
+        filtered_count = before_count - len(all_data)
+
+        logger.info(f"stock_list 조회: {len(all_data)}개 ({market}) "
+                    f"[DB필터 후 {before_count}개 → 이름필터로 {filtered_count}개 추가 제외]")
         return all_data
     except Exception as e:
         logger.error(f"stock_list DB 조회 실패: {e}")
@@ -543,6 +555,7 @@ async def _run_scan_task(
         all_results = []
         scanned = 0
         found = 0
+        deactivated_total = 0  # ★ 비활성화된 종목 수
         consecutive_failures = 0
 
         # ── 세션 생성 (status=running) ──
@@ -574,12 +587,16 @@ async def _run_scan_task(
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             batch_failures = 0
+            deactivated_in_batch = 0
             for r in results:
                 scanned += 1
                 if isinstance(r, dict) and r.get("surges"):
                     all_results.append(r)
                     unsaved_results.append(r)
                     found += 1
+                elif isinstance(r, dict) and r.get("deactivated"):
+                    deactivated_in_batch += 1
+                    deactivated_total += 1
                 elif isinstance(r, Exception):
                     batch_failures += 1
 
@@ -629,6 +646,7 @@ async def _run_scan_task(
             _scanner_state["message"] = (
                 f"스캔 중: {current_stock} ({scanned}/{total}) — "
                 f"급상승 {found}개 발견"
+                + (f", {deactivated_total}개 비활성화" if deactivated_total else "")
             )
 
             # ── 안전 딜레이: 1.5초 (네이버 차단 방지) ──
@@ -645,6 +663,7 @@ async def _run_scan_task(
             "total_scanned": scanned,
             "total_found": found,
             "total_surges": total_surges,
+            "deactivated_count": deactivated_total,  # ★ 비활성화 종목 수
             "high_manip_count": high_manip,
             "medium_manip_count": med_manip,
             "scan_params": scan_params,
@@ -671,12 +690,14 @@ async def _run_scan_task(
             "market": market,
         }
         _scanner_state["progress"] = 100
-        _scanner_state["message"] = f"스캔 완료! {scanned}개 스캔, {found}개 급상승 종목 발견"
+        deact_msg = f", {deactivated_total}개 비활성화" if deactivated_total else ""
+        _scanner_state["message"] = f"스캔 완료! {scanned}개 스캔, {found}개 급상승 종목 발견{deact_msg}"
         _scanner_state["running"] = False
 
         logger.info(
             f"스캔 완료: {scanned}개 종목 중 {found}개 급상승 발견, "
             f"총 {total_surges}건, 세력의심 {high_manip}건"
+            + (f", 비활성화 {deactivated_total}건" if deactivated_total else "")
         )
 
     except Exception as e:
@@ -687,6 +708,17 @@ async def _run_scan_task(
         _scanner_state["message"] = f"스캔 실패: {str(e)}"
 
 
+async def _deactivate_stock(code: str, name: str, reason: str):
+    """거래정지/상장폐지 종목 자동 비활성화
+    Auto-deactivate delisted or suspended stocks"""
+    try:
+        from app.core.database import db
+        db.table("stock_list").update({"is_active": False}).eq("code", code).execute()
+        logger.info(f"★ 종목 비활성화: {name}({code}) — {reason}")
+    except Exception as e:
+        logger.debug(f"비활성화 실패 {code}: {e}")
+
+
 async def _scan_single_stock(
     code: str, name: str, market: str,
     period_days: int, rise_pct: float, rise_window: int,
@@ -695,6 +727,12 @@ async def _scan_single_stock(
     """단일 종목 급상승 스캔"""
     try:
         candles = await _fetch_candles_safe(code, period_days)
+
+        # ★ 캔들 0개 = 거래정지/상장폐지 → 자동 비활성화
+        if len(candles) == 0:
+            await _deactivate_stock(code, name, "캔들 데이터 0개 (거래정지/상장폐지 추정)")
+            return {"code": code, "name": name, "surges": [], "deactivated": True}
+
         if len(candles) < rise_window + 20:
             return {"code": code, "name": name, "surges": []}
 

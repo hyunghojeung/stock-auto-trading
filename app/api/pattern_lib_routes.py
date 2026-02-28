@@ -107,6 +107,14 @@ async def evaluate_stock(req: EvaluateRequest):
         # 일봉 데이터 가져오기
         candles = get_daily_candles_naver(req.stock_code, count=60)
         if not candles or len(candles) < 22:
+            # ★ 캔들 0개 = 거래정지/상장폐지 → 자동 비활성화
+            if not candles or len(candles) == 0:
+                try:
+                    from app.core.database import db
+                    db.table("stock_list").update({"is_active": False}).eq("code", req.stock_code).execute()
+                    logger.info(f"★ 종목 비활성화: {req.stock_code} — 캔들 데이터 0개")
+                except Exception:
+                    pass
             raise HTTPException(400, f"종목 {req.stock_code}: 캔들 데이터 부족 ({len(candles) if candles else 0}일)")
 
         # 활성 패턴 조회

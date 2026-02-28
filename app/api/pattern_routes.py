@@ -406,7 +406,15 @@ async def _match_realtime_fallback(
 
         try:
             candles, fetched_name = await fetch_candles_for_code(code, pre_days + 30)
-            if not candles or len(candles) < pre_days + 20:
+            if not candles or len(candles) == 0:
+                # ★ 캔들 0개 = 거래정지/상장폐지 → 자동 비활성화
+                try:
+                    db.table("stock_list").update({"is_active": False}).eq("code", code).execute()
+                    logger.info(f"★ 종목 비활성화: {name}({code}) — 캔들 데이터 0개")
+                except Exception:
+                    pass
+                continue
+            if len(candles) < pre_days + 20:
                 continue
 
             current_returns, current_volumes = _compute_pattern_vectors(candles, pre_days)
