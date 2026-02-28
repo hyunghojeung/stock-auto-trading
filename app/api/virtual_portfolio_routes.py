@@ -427,6 +427,68 @@ async def update_prices(portfolio_id: int):
             except Exception as e:
                 logger.warning(f"[가상포트] {code} 가격 갱신 실패: {e}")
 
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ★ 수익 재투자 로직 (Compound Reinvest)
+        # 청산된 종목의 수익금을 남은 보유종목에 균등 재분배
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if closed_count > 0:
+            try:
+                # 이번 갱신에서 청산된 종목들의 회수금 합산
+                closed_resp = db.table("virtual_positions") \
+                    .select("id, invest_amount, profit_won, status") \
+                    .eq("portfolio_id", portfolio_id) \
+                    .neq("status", "holding") \
+                    .execute()
+
+                # 아직 보유중인 종목 조회
+                holding_resp = db.table("virtual_positions") \
+                    .select("id, code, current_price, quantity, invest_amount") \
+                    .eq("portfolio_id", portfolio_id) \
+                    .eq("status", "holding") \
+                    .execute()
+
+                holding_positions = holding_resp.data or []
+
+                if holding_positions:
+                    # 청산 종목들의 총 회수금 계산
+                    total_recovered = 0
+                    for cp in (closed_resp.data or []):
+                        recovered = (cp.get("invest_amount", 0) or 0) + (cp.get("profit_won", 0) or 0)
+                        total_recovered += recovered
+
+                    # 회수금 중 원래 투자금 제외 = 순수익
+                    # → 순수익을 남은 보유종목에 균등 분배
+                    # (원래 투자금은 이미 invest_amount에 포함되어 있으므로 순수익만 재투자)
+                    total_closed_invest = sum((cp.get("invest_amount", 0) or 0) for cp in (closed_resp.data or []))
+                    pure_profit = total_recovered - total_closed_invest
+
+                    if pure_profit > 0:
+                        reinvest_per_stock = pure_profit / len(holding_positions)
+                        logger.info(f"[가상포트] ★ 수익 재투자: 순수익 {pure_profit:,.0f}원 → "
+                                   f"{len(holding_positions)}종목 × {reinvest_per_stock:,.0f}원")
+
+                        for hp in holding_positions:
+                            cp = hp["current_price"]
+                            if cp <= 0:
+                                continue
+                            # 추가 매수 수량 계산
+                            add_qty = reinvest_per_stock / cp
+                            new_qty = round(hp["quantity"] + add_qty, 4)
+                            new_invest = round(hp["invest_amount"] + reinvest_per_stock)
+
+                            db.table("virtual_positions").update({
+                                "quantity": new_qty,
+                                "invest_amount": new_invest,
+                                "updated_at": now,
+                            }).eq("id", hp["id"]).execute()
+
+                            logger.info(f"[가상포트]   {hp['code']}: "
+                                       f"수량 {hp['quantity']:.2f}→{new_qty:.2f}, "
+                                       f"투자금 {hp['invest_amount']:,.0f}→{new_invest:,.0f}")
+
+            except Exception as e:
+                logger.warning(f"[가상포트] 수익 재투자 실패 (무시): {e}")
+
         # ── 포트폴리오 합산 업데이트 ──
         # 미보유 포지션(이미 청산됨)의 수익도 합산
         all_pos_resp = db.table("virtual_positions") \
@@ -709,6 +771,33 @@ async def close_portfolio(portfolio_id: int):
 
     except Exception as e:
         logger.error(f"[가상포트] 청산 실패: {e}")
+        raise HTTPException(500, str(e))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 6-1. 포트폴리오 제목 수정
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.put("/rename/{portfolio_id}")
+async def rename_portfolio(portfolio_id: int, req: dict):
+    """포트폴리오 제목 수정"""
+    try:
+        new_name = req.get("name", "").strip()
+        if not new_name:
+            raise HTTPException(400, "제목을 입력해주세요")
+
+        db.table("virtual_portfolios").update({
+            "name": new_name,
+            "updated_at": datetime.now().isoformat(),
+        }).eq("id", portfolio_id).execute()
+
+        logger.info(f"[가상포트] #{portfolio_id} 제목 변경: {new_name}")
+        return {"success": True, "message": f"제목이 '{new_name}'으로 변경되었습니다"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[가상포트] 제목 변경 실패: {e}")
         raise HTTPException(500, str(e))
 
 
@@ -1125,4 +1214,71 @@ async def stop_compound_group(group_id: int):
 
         return {"success": True, "message": f"복리 그룹 #{group_id} 중단됨"}
     except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.put("/compound/{group_id}/edit")
+async def edit_compound_group(group_id: int, req: dict):
+    """복리 그룹 수정 (이름, 목표금액, 전략)"""
+    try:
+        grp = db.table("compound_groups").select("*").eq("id", group_id).execute()
+        if not grp.data:
+            raise HTTPException(404, f"복리 그룹 #{group_id}를 찾을 수 없습니다")
+
+        update_data = {"updated_at": datetime.now().isoformat()}
+
+        if "name" in req and req["name"]:
+            update_data["name"] = req["name"]
+        if "goal_amount" in req and req["goal_amount"] > 0:
+            update_data["goal_amount"] = req["goal_amount"]
+        if "strategy" in req and req["strategy"]:
+            update_data["strategy"] = req["strategy"]
+
+        # 시드머니는 아직 1회차 시작 전이면 수정 가능
+        group = grp.data[0]
+        if "seed_money" in req and req["seed_money"] > 0:
+            if group.get("total_rounds", 0) == 0 and group.get("current_round", 1) == 1:
+                update_data["seed_money"] = req["seed_money"]
+                update_data["current_capital"] = req["seed_money"]
+            else:
+                logger.warning(f"[복리] 그룹 #{group_id} 이미 회차 진행 중 → 시드머니 수정 불가")
+
+        db.table("compound_groups").update(update_data).eq("id", group_id).execute()
+
+        logger.info(f"[복리] 그룹 #{group_id} 수정: {update_data}")
+        return {"success": True, "message": f"복리 그룹 '{update_data.get('name', group['name'])}' 수정 완료"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[복리] 그룹 수정 실패: {e}")
+        raise HTTPException(500, str(e))
+
+
+@router.delete("/compound/{group_id}")
+async def delete_compound_group(group_id: int):
+    """복리 그룹 삭제 (연결된 포트폴리오는 compound_group_id만 해제)"""
+    try:
+        grp = db.table("compound_groups").select("id, name").eq("id", group_id).execute()
+        if not grp.data:
+            raise HTTPException(404, f"복리 그룹 #{group_id}를 찾을 수 없습니다")
+
+        name = grp.data[0]["name"]
+
+        # 연결된 포트폴리오의 compound_group_id 해제 (포트폴리오 자체는 보존)
+        db.table("virtual_portfolios").update({
+            "compound_group_id": None,
+            "updated_at": datetime.now().isoformat(),
+        }).eq("compound_group_id", group_id).execute()
+
+        # 그룹 삭제
+        db.table("compound_groups").delete().eq("id", group_id).execute()
+
+        logger.info(f"[복리] 그룹 #{group_id} '{name}' 삭제")
+        return {"success": True, "message": f"복리 그룹 '{name}' 삭제 완료"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[복리] 그룹 삭제 실패: {e}")
         raise HTTPException(500, str(e))
