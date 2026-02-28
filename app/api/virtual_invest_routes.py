@@ -4,11 +4,15 @@
 파일경로: app/api/virtual_invest_routes.py
 
 엔드포인트:
-  POST /api/virtual-invest/compare     — 5가지 전략 동시 비교 (백테스트)
-  POST /api/virtual-invest/start       — 실시간 모의투자 시작
-  GET  /api/virtual-invest/status      — 실시간 모의투자 현황
-  POST /api/virtual-invest/update      — 실시간 포지션 업데이트 (장 마감 후)
-  GET  /api/virtual-invest/presets     — 프리셋 목록 조회
+  POST /api/virtual-invest/compare           — 5가지 전략 동시 비교 (백테스트)
+  GET  /api/virtual-invest/compare/progress  — 비교 실행 진행 상태
+  GET  /api/virtual-invest/compare/result    — 비교 결과 조회
+  POST /api/virtual-invest/realtime/start    — 실시간 모의투자 시작 (포트폴리오+포지션 생성)
+  GET  /api/virtual-invest/realtime/sessions — 세션(포트폴리오) 목록 조회
+  GET  /api/virtual-invest/realtime/status   — 실시간 모의투자 현황
+  POST /api/virtual-invest/realtime/update   — 실시간 포지션 업데이트 (장 마감 후)
+  GET  /api/virtual-invest/presets           — 프리셋 목록 조회
+  GET  /api/virtual-invest/candles/{code}    — 종목 일봉 데이터 조회
 """
 
 from fastapi import APIRouter, BackgroundTasks
@@ -63,9 +67,13 @@ class CompareRequest(BaseModel):
 class RealtimeStartRequest(BaseModel):
     stocks: List[StockInput]
     capital: float = DEFAULT_CAPITAL
+    title: str = ""
+    preset: str = "standard"
     take_profit_pct: float = 7.0
     stop_loss_pct: float = 3.0
     max_hold_days: int = 10
+    trailing_stop_pct: float = 0.0
+    grace_days: int = 0
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -220,10 +228,14 @@ async def compare_result():
 @router.post("/realtime/start")
 async def realtime_start(req: RealtimeStartRequest):
     """
-    실시간 모의투자 시작
-    Start realtime virtual trading
+    실시간 모의투자 시작 → virtual_portfolios + virtual_positions 생성
+    Start realtime virtual trading → create portfolio & positions in DB
     """
+    from datetime import datetime
+
     stocks_list = [s.dict() for s in req.stocks]
+
+    # ── 1) 기존 서비스 호출 (메모리/레거시) ──
     result = await start_realtime(
         stocks=stocks_list,
         capital=req.capital,
@@ -232,7 +244,151 @@ async def realtime_start(req: RealtimeStartRequest):
         max_hold_days=req.max_hold_days,
         supabase=supabase,
     )
+
+    # ── 2) virtual_portfolios 테이블에 포트폴리오 생성 ──
+    portfolio_id = None
+    if supabase:
+        try:
+            per_stock = req.capital / max(len(stocks_list), 1)
+            pf_data = {
+                "name": req.title or datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "capital": req.capital,
+                "strategy": req.preset,
+                "status": "active",
+                "stock_count": len(stocks_list),
+                "current_value": req.capital,
+            }
+            pf_res = supabase.table("virtual_portfolios").insert(pf_data).execute()
+            if pf_res.data and len(pf_res.data) > 0:
+                portfolio_id = pf_res.data[0]["id"]
+                logger.info(f"[가상투자] 포트폴리오 생성: id={portfolio_id}, name={pf_data['name']}")
+
+                # ── 3) virtual_positions 생성 ──
+                for s in stocks_list:
+                    buy_price = s.get("buy_price", 0)
+                    qty = int(per_stock / buy_price) if buy_price > 0 else 0
+                    invest = qty * buy_price
+
+                    pos_data = {
+                        "portfolio_id": portfolio_id,
+                        "code": s.get("code", ""),
+                        "name": s.get("name", ""),
+                        "buy_price": buy_price,
+                        "current_price": buy_price,
+                        "quantity": qty,
+                        "invest_amount": invest,
+                        "status": "holding",
+                        "peak_price": buy_price,
+                        "similarity": s.get("similarity", 0),
+                        "signal": s.get("signal", ""),
+                    }
+                    supabase.table("virtual_positions").insert(pos_data).execute()
+
+                logger.info(f"[가상투자] {len(stocks_list)}개 포지션 생성 완료")
+        except Exception as e:
+            logger.error(f"[가상투자] 포트폴리오 DB 저장 실패: {e}")
+
+    # session_id 또는 portfolio_id 반환
+    if not result:
+        result = {}
+    if portfolio_id:
+        result["portfolio_id"] = portfolio_id
+    if "session_id" not in result and portfolio_id:
+        result["session_id"] = str(portfolio_id)
+
     return result
+
+
+@router.get("/realtime/sessions")
+async def realtime_sessions():
+    """
+    실시간 모의투자 세션 목록 조회 (virtual_portfolios 기반)
+    Get list of all realtime trading sessions from virtual_portfolios
+    """
+    if not supabase:
+        return {"sessions": [], "error": "DB 미연결"}
+
+    try:
+        # ── 포트폴리오 목록 조회 ──
+        res = supabase.table("virtual_portfolios") \
+            .select("*") \
+            .order("created_at", desc=True) \
+            .limit(50) \
+            .execute()
+
+        portfolios = res.data or []
+        sessions = []
+
+        for pf in portfolios:
+            pid = pf.get("id")
+
+            # ── 각 포트폴리오의 포지션 조회 ──
+            positions = []
+            if pid:
+                try:
+                    pos_res = supabase.table("virtual_positions") \
+                        .select("*") \
+                        .eq("portfolio_id", pid) \
+                        .execute()
+                    positions = pos_res.data or []
+                except Exception as e:
+                    logger.warning(f"[가상투자] 포지션 조회 실패 (pf={pid}): {e}")
+
+            # ── 수익 계산 ──
+            capital = pf.get("capital", 1000000)
+            total_invest = sum(p.get("invest_amount", 0) for p in positions)
+            total_current = sum(
+                (p.get("current_price", 0) * p.get("quantity", 0))
+                for p in positions if p.get("status") == "holding"
+            )
+            # 매도 완료 종목 손익
+            realized = sum(p.get("profit_won", 0) for p in positions if p.get("status") != "holding")
+            cash = capital - total_invest + realized
+            holding_value = total_current
+            total_asset = cash + holding_value
+            profit = total_asset - capital
+            profit_pct = (profit / capital * 100) if capital > 0 else 0
+
+            sessions.append({
+                "session_id": str(pid),
+                "id": pid,
+                "title": pf.get("name", ""),
+                "preset": pf.get("strategy", "standard"),
+                "capital": capital,
+                "status": pf.get("status", "active"),
+                "stock_count": pf.get("stock_count", len(positions)),
+                "stock_names": [p.get("name", p.get("code", "")) for p in positions],
+                "stocks": [p.get("name", p.get("code", "")) for p in positions],
+                "total_profit": round(profit),
+                "total_profit_pct": round(profit_pct, 2),
+                "total_asset": round(total_asset),
+                "cash": round(cash),
+                "holding_value": round(holding_value),
+                "holding_count": len([p for p in positions if p.get("status") == "holding"]),
+                "win_count": pf.get("win_count", 0),
+                "loss_count": pf.get("loss_count", 0),
+                "created_at": pf.get("created_at", ""),
+                "updated_at": pf.get("updated_at", ""),
+                "positions": [{
+                    "stock_code": p.get("code", ""),
+                    "stock_name": p.get("name", ""),
+                    "buy_price": p.get("buy_price", 0),
+                    "current_price": p.get("current_price", 0),
+                    "quantity": p.get("quantity", 0),
+                    "status": p.get("status", "holding"),
+                    "profit_pct": p.get("profit_pct", 0),
+                    "profit_won": p.get("profit_won", 0),
+                    "hold_days": p.get("hold_days", 0),
+                    "peak_price": p.get("peak_price", 0),
+                    "similarity": p.get("similarity", 0),
+                } for p in positions],
+            })
+
+        return {"sessions": sessions}
+
+    except Exception as e:
+        logger.error(f"[가상투자] 세션 목록 조회 오류: {e}")
+        return {"sessions": [], "error": str(e)}
 
 
 @router.get("/realtime/status/{session_id}")
