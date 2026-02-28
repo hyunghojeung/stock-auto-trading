@@ -10,6 +10,12 @@ Pattern Surge Detector — DTW-based Analysis Engine
 
 [v2] 프리셋(우량주/작전주) 지원 — DTW 가중치를 외부에서 전달받음
 [v3] 눌림목 패턴 라이브러리 연동 — Step 2.5 삽입 + 매수추천에 패턴 가산점
+[v4] DTW 알고리즘 5대 강화:
+     1) Z-Score 정규화 → 차원 간 스케일 통일
+     2) 5차원 DTW → RSI 흐름 + MA20 이격도 추가
+     3) 유사도 공식 → 선형 정규화 (변별력 향상)
+     4) 클러스터 신뢰도 → 멤버수+유사도 기반 점수
+     5) 3단계 급상승 탐지 → S/A/B급
 """
 
 import numpy as np
@@ -26,7 +32,21 @@ logger = logging.getLogger(__name__)
 # 기본 가중치 / Default Weights
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-DEFAULT_WEIGHTS = {'returns': 0.5, 'candle': 0.2, 'volume': 0.3}
+# ★ v4: 5차원 가중치 (기존 3차원에서 RSI + MA이격도 추가)
+DEFAULT_WEIGHTS = {
+    'returns': 0.35,
+    'candle': 0.15,
+    'volume': 0.20,
+    'rsi': 0.15,
+    'ma_dist': 0.15,
+}
+
+# v4: 3단계 급상승 탐지 기준
+SURGE_TIERS = [
+    {"grade": "S", "rise_pct": 30.0, "rise_days": 5,  "weight": 1.0},
+    {"grade": "A", "rise_pct": 20.0, "rise_days": 5,  "weight": 0.8},
+    {"grade": "B", "rise_pct": 25.0, "rise_days": 10, "weight": 0.6},
+]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -57,6 +77,8 @@ class SurgeZone:
     peak_price: float
     rise_pct: float         # 상승률 %
     rise_days: int          # 상승 소요 거래일
+    grade: str = "S"        # ★ v4: 등급 (S/A/B)
+    tier_weight: float = 1.0  # ★ v4: 등급 가중치
 
 
 @dataclass
@@ -65,13 +87,15 @@ class PreRisePattern:
     code: str
     name: str
     surge: dict             # SurgeZone 정보
-    # 3차원 패턴 벡터
+    # 5차원 패턴 벡터 (★ v4: 3→5차원)
     returns: List[float]    # 등락률 흐름 (%)
     candle_shapes: List[Dict]  # 봉 모양 (양/음, 꼬리비율, 몸통크기)
     volume_ratios: List[float]  # 거래량 변화 (20일평균 대비)
+    rsi_flow: List[float] = field(default_factory=list)      # ★ v4: RSI 흐름 (0~1)
+    ma_dist_flow: List[float] = field(default_factory=list)  # ★ v4: MA20 이격도 (%)
     # 원본 일봉
-    candles: List[Dict]
-    pre_days: int           # 분석 구간 (일)
+    candles: List[Dict] = field(default_factory=list)
+    pre_days: int = 10      # 분석 구간 (일)
 
 
 @dataclass
@@ -82,11 +106,14 @@ class PatternCluster:
     avg_similarity: float       # 평균 유사도
     avg_return_flow: List[float]  # 평균 등락률 흐름
     avg_volume_flow: List[float]  # 평균 거래량 흐름
-    avg_rise_pct: float         # 평균 상승폭
-    avg_rise_days: float        # 평균 상승 소요일
-    win_rate: float             # 이 패턴 후 실제 상승 확률
-    members: List[Dict]         # 소속 패턴 목록
-    description: str            # 패턴 설명 (자동 생성)
+    avg_rsi_flow: List[float] = field(default_factory=list)      # ★ v4: 평균 RSI 흐름
+    avg_ma_dist_flow: List[float] = field(default_factory=list)  # ★ v4: 평균 MA이격도
+    avg_rise_pct: float = 0.0          # 평균 상승폭
+    avg_rise_days: float = 0.0         # 평균 상승 소요일
+    win_rate: float = 100.0            # 이 패턴 후 실제 상승 확률
+    confidence: float = 0.0    # ★ v4: 신뢰도 점수 (0~100)
+    members: List[Dict] = field(default_factory=list)  # 소속 패턴 목록
+    description: str = ""      # 패턴 설명 (자동 생성)
 
 
 @dataclass
@@ -139,18 +166,32 @@ def dtw_distance(s1: List[float], s2: List[float], window: int = None) -> float:
     return dtw_matrix[n, m]
 
 
-def dtw_similarity(s1: List[float], s2: List[float], window: int = None) -> float:
+def dtw_similarity(s1: List[float], s2: List[float], window: int = None, normalize: bool = True) -> float:
     """
     DTW 유사도 (0~100%, 높을수록 유사)
+    [v4] 선형 정규화 + Z-Score 옵션 → 변별력 대폭 향상
     """
+    if not s1 or not s2:
+        return 0.0
+
+    # ★ v4: Z-Score 정규화 옵션
+    if normalize:
+        from app.utils.indicators import z_normalize
+        s1 = z_normalize(s1)
+        s2 = z_normalize(s2)
+
     dist = dtw_distance(s1, s2, window)
-    # 정규화: 길이로 나누어 스케일 통일
     norm = max(len(s1), len(s2))
     if norm == 0:
         return 0.0
+
     normalized = dist / norm
-    # 유사도로 변환 (지수 감쇠)
-    similarity = math.exp(-normalized) * 100
+
+    # ★ v4: 선형 정규화 (기존 exp 감쇠 → 선형, max_dist=3.0 기준)
+    # normalized가 0이면 100%, 3.0 이상이면 0%
+    MAX_DIST = 3.0
+    similarity = max(0.0, (1.0 - normalized / MAX_DIST)) * 100
+
     return round(similarity, 2)
 
 
@@ -160,9 +201,10 @@ def multi_dim_dtw_similarity(
     weights: Dict[str, float] = None
 ) -> float:
     """
-    다차원 DTW 유사도 — 등락률 + 봉모양 + 거래량 종합
+    다차원 DTW 유사도 — 등락률 + 봉모양 + 거래량 + RSI + MA이격도
     [v2] weights를 외부에서 전달받아 사용
-    weights: {'returns': 0.5, 'candle': 0.2, 'volume': 0.3}
+    [v4] 3차원 → 5차원 확장 (RSI + MA 이격도 추가)
+    weights: {'returns': 0.35, 'candle': 0.15, 'volume': 0.20, 'rsi': 0.15, 'ma_dist': 0.15}
     """
     if weights is None:
         weights = DEFAULT_WEIGHTS
@@ -178,11 +220,39 @@ def multi_dim_dtw_similarity(
     # 3) 거래량 DTW
     sim_volume = dtw_similarity(p1.volume_ratios, p2.volume_ratios)
 
-    # 가중 합산
+    # ★ v4: 4) RSI 흐름 DTW
+    sim_rsi = 0.0
+    if p1.rsi_flow and p2.rsi_flow:
+        sim_rsi = dtw_similarity(p1.rsi_flow, p2.rsi_flow)
+
+    # ★ v4: 5) MA20 이격도 DTW
+    sim_ma = 0.0
+    if p1.ma_dist_flow and p2.ma_dist_flow:
+        sim_ma = dtw_similarity(p1.ma_dist_flow, p2.ma_dist_flow)
+
+    # 가중 합산 (v4: 5차원)
+    # RSI/MA가 비어있으면 기존 3차원 가중치로 재분배
+    w_r = weights.get('returns', 0.35)
+    w_c = weights.get('candle', 0.15)
+    w_v = weights.get('volume', 0.20)
+    w_rsi = weights.get('rsi', 0.15) if (p1.rsi_flow and p2.rsi_flow) else 0
+    w_ma = weights.get('ma_dist', 0.15) if (p1.ma_dist_flow and p2.ma_dist_flow) else 0
+
+    # 미사용 가중치 재분배
+    total_w = w_r + w_c + w_v + w_rsi + w_ma
+    if total_w > 0:
+        w_r /= total_w
+        w_c /= total_w
+        w_v /= total_w
+        w_rsi /= total_w
+        w_ma /= total_w
+
     total = (
-        weights.get('returns', 0.5) * sim_returns +
-        weights.get('candle', 0.2) * sim_candle +
-        weights.get('volume', 0.3) * sim_volume
+        w_r * sim_returns +
+        w_c * sim_candle +
+        w_v * sim_volume +
+        w_rsi * sim_rsi +
+        w_ma * sim_ma
     )
     return round(total, 2)
 
@@ -200,47 +270,73 @@ def detect_surges(
 ) -> List[SurgeZone]:
     """
     급상승 구간 탐지
-    - rise_pct: 최소 상승률 (기본 30%)
-    - rise_days: 상승 기간 (기본 5거래일)
+    [v4] 3단계 탐지: S급(5일/+30%), A급(5일/+20%), B급(10일/+25%)
+    - rise_pct, rise_days 인자는 호환성 유지용 (실제로는 SURGE_TIERS 사용)
     """
     surges = []
     n = len(candles)
 
-    if n < rise_days + 1:
+    if n < 6:
         return surges
 
-    i = 0
-    while i < n - rise_days:
-        base_price = candles[i].close
+    # ★ v4: 이미 탐지된 구간 인덱스 추적 (중복 방지)
+    used_indices = set()
 
-        # 향후 rise_days 내 최고 종가 찾기
-        max_price = base_price
-        max_idx = i
-        for j in range(i + 1, min(i + rise_days + 1, n)):
-            if candles[j].close > max_price:
-                max_price = candles[j].close
-                max_idx = j
+    for tier in SURGE_TIERS:
+        t_pct = tier["rise_pct"]
+        t_days = tier["rise_days"]
+        t_grade = tier["grade"]
+        t_weight = tier["weight"]
 
-        pct = ((max_price - base_price) / base_price) * 100
+        if n < t_days + 1:
+            continue
 
-        if pct >= rise_pct:
-            surge = SurgeZone(
-                code=code,
-                name=name,
-                start_idx=i,
-                end_idx=max_idx,
-                start_date=candles[i].date,
-                end_date=candles[max_idx].date,
-                start_price=base_price,
-                peak_price=max_price,
-                rise_pct=round(pct, 2),
-                rise_days=max_idx - i
-            )
-            surges.append(surge)
-            # 급상승 구간 이후로 건너뛰기 (중복 방지)
-            i = max_idx + 1
-        else:
-            i += 1
+        i = 0
+        while i < n - t_days:
+            # 이미 사용된 구간이면 건너뛰기
+            if i in used_indices:
+                i += 1
+                continue
+
+            base_price = candles[i].close
+
+            # 향후 t_days 내 최고 종가 찾기
+            max_price = base_price
+            max_idx = i
+            for j in range(i + 1, min(i + t_days + 1, n)):
+                if candles[j].close > max_price:
+                    max_price = candles[j].close
+                    max_idx = j
+
+            pct = ((max_price - base_price) / base_price) * 100
+
+            if pct >= t_pct:
+                # 중복 체크: 이 구간이 이미 상위 등급에서 탐지되었는지
+                overlap = any(idx in used_indices for idx in range(i, max_idx + 1))
+                if not overlap:
+                    surge = SurgeZone(
+                        code=code,
+                        name=name,
+                        start_idx=i,
+                        end_idx=max_idx,
+                        start_date=candles[i].date,
+                        end_date=candles[max_idx].date,
+                        start_price=base_price,
+                        peak_price=max_price,
+                        rise_pct=round(pct, 2),
+                        rise_days=max_idx - i,
+                        grade=t_grade,
+                        tier_weight=t_weight,
+                    )
+                    surges.append(surge)
+                    # 구간 인덱스 등록
+                    for idx in range(i, max_idx + 1):
+                        used_indices.add(idx)
+                    i = max_idx + 1
+                else:
+                    i += 1
+            else:
+                i += 1
 
     return surges
 
@@ -330,6 +426,42 @@ def extract_pre_rise_pattern(
             'volume': c.volume
         })
 
+    # ★ v4: RSI 흐름 추출 (패턴 구간의 RSI/100 값)
+    rsi_flow = []
+    try:
+        from app.utils.indicators import rsi_series
+        # RSI 계산에 충분한 이전 데이터 포함
+        rsi_start = max(0, pattern_start - 20)
+        rsi_closes = [c.close for c in candles[rsi_start:start_idx]]
+        rsi_vals = rsi_series(rsi_closes, 14)
+        # 패턴 구간만 추출
+        offset = pattern_start - rsi_start
+        for k in range(len(pattern_candles)):
+            idx = offset + k
+            if idx < len(rsi_vals) and rsi_vals[idx] is not None:
+                rsi_flow.append(rsi_vals[idx])
+            else:
+                rsi_flow.append(0.5)  # 기본값
+    except Exception:
+        rsi_flow = [0.5] * len(pattern_candles)
+
+    # ★ v4: MA20 이격도 추출
+    ma_dist_flow = []
+    try:
+        from app.utils.indicators import ma_distance_ratio
+        ma_start = max(0, pattern_start - 25)
+        ma_closes = [c.close for c in candles[ma_start:start_idx]]
+        ma_vals = ma_distance_ratio(ma_closes, 20)
+        offset = pattern_start - ma_start
+        for k in range(len(pattern_candles)):
+            idx = offset + k
+            if idx < len(ma_vals) and ma_vals[idx] is not None:
+                ma_dist_flow.append(ma_vals[idx])
+            else:
+                ma_dist_flow.append(0.0)
+    except Exception:
+        ma_dist_flow = [0.0] * len(pattern_candles)
+
     return PreRisePattern(
         code=surge.code,
         name=surge.name,
@@ -337,6 +469,8 @@ def extract_pre_rise_pattern(
         returns=returns,
         candle_shapes=candle_shapes,
         volume_ratios=volume_ratios,
+        rsi_flow=rsi_flow,
+        ma_dist_flow=ma_dist_flow,
         candles=raw_candles,
         pre_days=pre_days
     )
@@ -400,11 +534,19 @@ def cluster_patterns(
         min_len = min(len(p.returns) for p in member_patterns)
         avg_returns = []
         avg_volumes = []
+        avg_rsi = []
+        avg_ma_dist = []
         for d in range(min_len):
             r_vals = [p.returns[d] for p in member_patterns if d < len(p.returns)]
             v_vals = [p.volume_ratios[d] for p in member_patterns if d < len(p.volume_ratios)]
             avg_returns.append(round(sum(r_vals) / len(r_vals), 4) if r_vals else 0)
             avg_volumes.append(round(sum(v_vals) / len(v_vals), 4) if v_vals else 1)
+
+            # ★ v4: RSI + MA이격도 평균
+            rsi_vals = [p.rsi_flow[d] for p in member_patterns if d < len(p.rsi_flow)]
+            ma_vals = [p.ma_dist_flow[d] for p in member_patterns if d < len(p.ma_dist_flow)]
+            avg_rsi.append(round(sum(rsi_vals) / len(rsi_vals), 4) if rsi_vals else 0.5)
+            avg_ma_dist.append(round(sum(ma_vals) / len(ma_vals), 4) if ma_vals else 0)
 
         # 평균 유사도
         sims = []
@@ -416,6 +558,14 @@ def cluster_patterns(
         avg_rise = sum(p.surge['rise_pct'] for p in member_patterns) / len(member_patterns)
         avg_days = sum(p.surge['rise_days'] for p in member_patterns) / len(member_patterns)
 
+        # ★ v4: 신뢰도 점수 (멤버수 × 15 + 평균유사도 × 0.3, 최대 100)
+        confidence = min(100.0, len(member_patterns) * 15 + avg_sim * 0.3)
+
+        # ★ v4: 등급별 가중 win_rate (S급은 100%, B급은 tier_weight 반영)
+        grade_weights = [p.surge.get('tier_weight', 1.0) for p in member_patterns]
+        avg_grade_weight = sum(grade_weights) / len(grade_weights) if grade_weights else 1.0
+        win_rate = round(100.0 * avg_grade_weight, 1)
+
         # 멤버 정보
         member_dicts = []
         for p in member_patterns:
@@ -425,6 +575,7 @@ def cluster_patterns(
                 'surge_date': p.surge['start_date'],
                 'rise_pct': p.surge['rise_pct'],
                 'rise_days': p.surge['rise_days'],
+                'grade': p.surge.get('grade', 'S'),  # ★ v4
             })
 
         # 패턴 설명 자동 생성
@@ -436,9 +587,12 @@ def cluster_patterns(
             avg_similarity=avg_sim,
             avg_return_flow=avg_returns,
             avg_volume_flow=avg_volumes,
+            avg_rsi_flow=avg_rsi,
+            avg_ma_dist_flow=avg_ma_dist,
             avg_rise_pct=round(avg_rise, 2),
             avg_rise_days=round(avg_days, 1),
-            win_rate=100.0,  # 이 패턴들은 모두 급상승한 것이므로
+            win_rate=win_rate,
+            confidence=round(confidence, 1),
             members=member_dicts,
             description=desc
         )
@@ -530,18 +684,6 @@ def find_current_matches(
     if dip_results is None:
         dip_results = {}
 
-    # [v2] 가중치 기반 추천 유사도 비율 계산
-    # returns + volume 기준으로 비례 배분 (candle은 추천에서 제외)
-    w_r = weights.get('returns', 0.5)
-    w_v = weights.get('volume', 0.3)
-    total_rv = w_r + w_v
-    if total_rv > 0:
-        rec_weight_returns = w_r / total_rv
-        rec_weight_volume = w_v / total_rv
-    else:
-        rec_weight_returns = 0.6
-        rec_weight_volume = 0.4
-
     for code, candles in candles_by_code.items():
         if len(candles) < pre_days + 20:
             continue
@@ -571,24 +713,74 @@ def find_current_matches(
             ratio = round(recent[k].volume / avg_vol, 4) if avg_vol > 0 else 1.0
             current_volumes.append(ratio)
 
+        # ★ v4: RSI 흐름 추출
+        current_rsi = []
+        try:
+            from app.utils.indicators import rsi_series
+            rsi_start = max(0, len(candles) - pre_days - 20)
+            rsi_closes = [c.close for c in candles[rsi_start:]]
+            rsi_vals = rsi_series(rsi_closes, 14)
+            offset = len(candles) - pre_days - rsi_start
+            for k in range(pre_days):
+                idx = offset + k
+                if idx < len(rsi_vals) and rsi_vals[idx] is not None:
+                    current_rsi.append(rsi_vals[idx])
+                else:
+                    current_rsi.append(0.5)
+        except Exception:
+            current_rsi = [0.5] * pre_days
+
+        # ★ v4: MA20 이격도 추출
+        current_ma_dist = []
+        try:
+            from app.utils.indicators import ma_distance_ratio
+            ma_start = max(0, len(candles) - pre_days - 25)
+            ma_closes = [c.close for c in candles[ma_start:]]
+            ma_vals = ma_distance_ratio(ma_closes, 20)
+            offset = len(candles) - pre_days - ma_start
+            for k in range(pre_days):
+                idx = offset + k
+                if idx < len(ma_vals) and ma_vals[idx] is not None:
+                    current_ma_dist.append(ma_vals[idx])
+                else:
+                    current_ma_dist.append(0.0)
+        except Exception:
+            current_ma_dist = [0.0] * pre_days
+
         # 각 클러스터와 DTW 유사도
         best_sim = 0
         best_cluster_id = 0
+        best_confidence = 0
 
         for cluster in clusters:
             if not cluster.avg_return_flow:
                 continue
 
-            # 등락률 DTW
+            # ★ v4: 5차원 DTW 유사도 (Z-Score 정규화 적용)
             sim_r = dtw_similarity(current_returns, cluster.avg_return_flow)
-            # 거래량 DTW
             sim_v = dtw_similarity(current_volumes, cluster.avg_volume_flow)
-            # [v2] 가중치 기반 종합 (기존 하드코딩 0.6/0.4 → 동적)
-            sim = sim_r * rec_weight_returns + sim_v * rec_weight_volume
+            sim_rsi = dtw_similarity(current_rsi, cluster.avg_rsi_flow) if cluster.avg_rsi_flow else 0
+            sim_ma = dtw_similarity(current_ma_dist, cluster.avg_ma_dist_flow) if cluster.avg_ma_dist_flow else 0
+
+            # 5차원 가중 합산 (미사용 차원 재분배)
+            w_r = weights.get('returns', 0.35)
+            w_v = weights.get('volume', 0.20)
+            w_rsi = weights.get('rsi', 0.15) if cluster.avg_rsi_flow else 0
+            w_ma = weights.get('ma_dist', 0.15) if cluster.avg_ma_dist_flow else 0
+            tw = w_r + w_v + w_rsi + w_ma
+            if tw > 0:
+                sim = (w_r * sim_r + w_v * sim_v + w_rsi * sim_rsi + w_ma * sim_ma) / tw
+            else:
+                sim = sim_r * 0.6 + sim_v * 0.4
+
+            # ★ v4: 신뢰도 50 미만 클러스터는 유사도 50% 감쇠
+            if cluster.confidence < 50:
+                sim *= 0.5
 
             if sim > best_sim:
                 best_sim = sim
                 best_cluster_id = cluster.cluster_id
+                best_confidence = cluster.confidence
 
         # ★ v3: 패턴 라이브러리 가산점
         dip_info = dip_results.get(code)
@@ -620,6 +812,7 @@ def find_current_matches(
             'current_price': recent[-1].close if recent else 0,
             'similarity': round(best_sim, 1),
             'best_cluster_id': best_cluster_id,
+            'confidence': round(best_confidence, 1),  # ★ v4
             'signal': signal,
             'signal_code': signal_code,
             'current_returns': current_returns,
@@ -753,6 +946,8 @@ def run_pattern_analysis(
             'returns': p.returns,
             'candle_shapes': p.candle_shapes,
             'volume_ratios': p.volume_ratios,
+            'rsi_flow': p.rsi_flow,          # ★ v4
+            'ma_dist_flow': p.ma_dist_flow,  # ★ v4
             'candles': p.candles,
             'pre_days': p.pre_days,
         })
