@@ -103,19 +103,41 @@ async def evaluate_stock(req: EvaluateRequest):
     try:
         from app.services.naver_stock import get_daily_candles_naver
         from app.engine.pattern_library import evaluate_dip_patterns, get_active_patterns_from_db
+        from app.core.database import db
+
+        # ★ 종목명 → 종목코드 변환 (6자리 숫자가 아니면 DB에서 검색)
+        stock_code = req.stock_code.strip()
+        stock_name = stock_code  # 기본값: 입력 그대로
+
+        if not (len(stock_code) == 6 and stock_code.isdigit()):
+            # 이름으로 검색
+            try:
+                resp = db.table("stock_list").select("code, name") \
+                    .eq("is_active", True) \
+                    .ilike("name", f"%{stock_code}%") \
+                    .limit(1).execute()
+                if resp.data:
+                    stock_name = resp.data[0]["name"]
+                    stock_code = resp.data[0]["code"]
+                    logger.info(f"[패턴 평가] 종목명 변환: {req.stock_code} → {stock_name}({stock_code})")
+                else:
+                    raise HTTPException(400, f"종목 '{req.stock_code}'을(를) DB에서 찾을 수 없습니다")
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(400, f"종목 검색 실패: {e}")
 
         # 일봉 데이터 가져오기
-        candles = get_daily_candles_naver(req.stock_code, count=60)
+        candles = get_daily_candles_naver(stock_code, count=60)
         if not candles or len(candles) < 22:
             # ★ 캔들 0개 = 거래정지/상장폐지 → 자동 비활성화
             if not candles or len(candles) == 0:
                 try:
-                    from app.core.database import db
-                    db.table("stock_list").update({"is_active": False}).eq("code", req.stock_code).execute()
-                    logger.info(f"★ 종목 비활성화: {req.stock_code} — 캔들 데이터 0개")
+                    db.table("stock_list").update({"is_active": False}).eq("code", stock_code).execute()
+                    logger.info(f"★ 종목 비활성화: {stock_name}({stock_code}) — 캔들 데이터 0개")
                 except Exception:
                     pass
-            raise HTTPException(400, f"종목 {req.stock_code}: 캔들 데이터 부족 ({len(candles) if candles else 0}일)")
+            raise HTTPException(400, f"종목 {stock_name}({stock_code}): 캔들 데이터 부족 ({len(candles) if candles else 0}일)")
 
         # 활성 패턴 조회
         active = get_active_patterns_from_db()
@@ -129,7 +151,8 @@ async def evaluate_stock(req: EvaluateRequest):
 
         return {
             "success": True,
-            "stock_code": req.stock_code,
+            "stock_code": stock_code,
+            "stock_name": stock_name,
             "candle_count": len(candles),
             "active_patterns": active,
             "evaluation": result,
