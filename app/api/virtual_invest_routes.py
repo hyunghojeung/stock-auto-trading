@@ -227,75 +227,73 @@ async def compare_result():
 @router.post("/realtime/start")
 async def realtime_start(req: RealtimeStartRequest):
     """
-    실시간 모의투자 시작 → virtual_portfolios + virtual_positions 생성
+    실시간 모의투자 시작 → virtual_portfolios + virtual_positions(FK) 생성
     Start realtime virtual trading → create portfolio & positions in DB
+    ※ 레거시 start_realtime() 미사용 — FK 기반 테이블 직접 INSERT
     """
     from datetime import datetime
+    import uuid
 
     stocks_list = [s.dict() for s in req.stocks]
 
-    # ── 1) 기존 서비스 호출 (메모리/레거시) ──
-    result = await start_realtime(
-        stocks=stocks_list,
-        capital=req.capital,
-        take_profit_pct=req.take_profit_pct,
-        stop_loss_pct=req.stop_loss_pct,
-        max_hold_days=req.max_hold_days,
-        supabase=supabase,
-    )
+    if not supabase:
+        return {"error": "DB 미연결", "session_id": None}
 
-    # ── 2) virtual_portfolios 테이블에 포트폴리오 생성 ──
     portfolio_id = None
-    if supabase:
-        try:
-            per_stock = req.capital / max(len(stocks_list), 1)
-            pf_data = {
-                "name": req.title or datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "capital": req.capital,
-                "strategy": req.preset,
+    try:
+        per_stock = req.capital / max(len(stocks_list), 1)
+
+        # ── 1) virtual_portfolios INSERT ──
+        pf_data = {
+            "name": req.title or datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "capital": req.capital,
+            "strategy": req.preset,
+            "status": "active",
+            "stock_count": len(stocks_list),
+            "current_value": req.capital,
+        }
+        pf_res = supabase.table("virtual_portfolios").insert(pf_data).execute()
+        if pf_res.data and len(pf_res.data) > 0:
+            portfolio_id = pf_res.data[0]["id"]
+            logger.info(f"[가상투자] 포트폴리오 생성: id={portfolio_id}, name={pf_data['name']}")
+
+            # ── 2) virtual_positions INSERT (FK 버전) ──
+            positions = []
+            for s in stocks_list:
+                buy_price = s.get("buy_price", 0)
+                qty = int(per_stock / buy_price) if buy_price > 0 else 0
+                invest = qty * buy_price
+
+                positions.append({
+                    "portfolio_id": portfolio_id,
+                    "code": s.get("code", ""),
+                    "name": s.get("name", ""),
+                    "buy_price": buy_price,
+                    "current_price": buy_price,
+                    "quantity": qty,
+                    "invest_amount": invest,
+                    "status": "holding",
+                    "peak_price": buy_price,
+                    "similarity": s.get("similarity", 0),
+                    "signal": s.get("signal", ""),
+                })
+
+            if positions:
+                supabase.table("virtual_positions").insert(positions).execute()
+                logger.info(f"[가상투자] {len(positions)}개 포지션 생성 완료")
+
+            return {
+                "session_id": str(portfolio_id),
+                "portfolio_id": portfolio_id,
                 "status": "active",
-                "stock_count": len(stocks_list),
-                "current_value": req.capital,
+                "message": f"{len(stocks_list)}종목 가상투자 등록 완료",
             }
-            pf_res = supabase.table("virtual_portfolios").insert(pf_data).execute()
-            if pf_res.data and len(pf_res.data) > 0:
-                portfolio_id = pf_res.data[0]["id"]
-                logger.info(f"[가상투자] 포트폴리오 생성: id={portfolio_id}, name={pf_data['name']}")
+        else:
+            return {"error": "포트폴리오 생성 실패", "session_id": None}
 
-                # ── 3) virtual_positions 생성 ──
-                for s in stocks_list:
-                    buy_price = s.get("buy_price", 0)
-                    qty = int(per_stock / buy_price) if buy_price > 0 else 0
-                    invest = qty * buy_price
-
-                    pos_data = {
-                        "portfolio_id": portfolio_id,
-                        "code": s.get("code", ""),
-                        "name": s.get("name", ""),
-                        "buy_price": buy_price,
-                        "current_price": buy_price,
-                        "quantity": qty,
-                        "invest_amount": invest,
-                        "status": "holding",
-                        "peak_price": buy_price,
-                        "similarity": s.get("similarity", 0),
-                        "signal": s.get("signal", ""),
-                    }
-                    supabase.table("virtual_positions").insert(pos_data).execute()
-
-                logger.info(f"[가상투자] {len(stocks_list)}개 포지션 생성 완료")
-        except Exception as e:
-            logger.error(f"[가상투자] 포트폴리오 DB 저장 실패: {e}")
-
-    # session_id 또는 portfolio_id 반환
-    if not result:
-        result = {}
-    if portfolio_id:
-        result["portfolio_id"] = portfolio_id
-    if "session_id" not in result and portfolio_id:
-        result["session_id"] = str(portfolio_id)
-
-    return result
+    except Exception as e:
+        logger.error(f"[가상투자] 포트폴리오 생성 실패: {e}")
+        return {"error": str(e), "session_id": None}
 
 
 @router.get("/realtime/sessions")
