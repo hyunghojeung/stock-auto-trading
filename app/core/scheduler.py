@@ -1,12 +1,11 @@
 """자동매매 스케줄러 (눌림목 + 갭상승전략 통합)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ★ v2: 통합 스케줄러 + job 래퍼 + DB 로깅 + 카카오 알림
+★ v3: 시장 지수 수집 job 추가 (18:00 야간 스캔 직전)
 
-변경사항:
-  - 모든 job에 id/name 추가 (모니터링 용이)
-  - job_wrapper로 모든 job 감싸기 (try/except + DB 로그)
-  - scheduler_logs 테이블에 실행 결과 기록
-  - 실패율 20% 초과 시 카카오 알림 발송
+변경사항 (v3):
+  - market_index_job() 추가: KOSPI/KOSDAQ 지수 수집 + 시장 상태 DB 저장
+  - 18:00 야간 스캔 전에 지수 먼저 수집 → 다음날 매매 사이클에서 참조
 
 파일경로: app/core/scheduler.py
 """
@@ -83,6 +82,63 @@ def _alert_if_needed(job_name: str, success_count: int, fail_count: int):
             )
         except Exception as e:
             logger.error(f"[스케줄러 알림] 카카오 전송 실패: {e}")
+
+
+# ============================================================
+# ★ v3: 시장 지수 수집 작업 (신규)
+# ============================================================
+
+async def market_index_job():
+    """매일 17:55: KOSPI/KOSDAQ 지수 수집 + 시장 상태 DB 저장
+    야간 스캔(18:00) 전에 실행하여 다음 거래일 매매 판단에 활용
+    """
+    start = datetime.now()
+    job_name = "market_index"
+    try:
+        import asyncio
+        from app.services.market_index import get_market_status, save_market_status_to_db
+
+        logger.info(f"[{now_kst()}] 시장 지수 수집 시작")
+
+        loop = asyncio.get_event_loop()
+        status = await loop.run_in_executor(None, get_market_status)
+
+        if status:
+            await loop.run_in_executor(None, save_market_status_to_db, status)
+
+            can_buy = status.get("can_buy", True)
+            reason = status.get("reason", "정상")
+            kospi = status.get("kospi", {})
+            kosdaq = status.get("kosdaq", {})
+
+            duration = (datetime.now() - start).total_seconds()
+            logger.info(f"[{now_kst()}] 시장 지수 수집 완료: "
+                       f"KOSPI {kospi.get('close', 0)}({kospi.get('change_pct', 0)}%) "
+                       f"KOSDAQ {kosdaq.get('close', 0)}({kosdaq.get('change_pct', 0)}%) "
+                       f"매수허용={'🟢' if can_buy else '🔴'}")
+            _log_to_db(job_name, "success", duration, success_count=1)
+
+            # 시장 하락 시 카카오 알림
+            if not can_buy:
+                try:
+                    from app.services.kakao_alert import kakao
+                    kakao.alert_system(
+                        f"🔴 시장 하락 감지 — 내일 매수 차단\n"
+                        f"KOSPI: {kospi.get('close', 0)} ({kospi.get('change_pct', 0)}%) {kospi.get('trend', '')}\n"
+                        f"KOSDAQ: {kosdaq.get('close', 0)} ({kosdaq.get('change_pct', 0)}%) {kosdaq.get('trend', '')}\n"
+                        f"사유: {reason}"
+                    )
+                except Exception:
+                    pass
+        else:
+            duration = (datetime.now() - start).total_seconds()
+            logger.warning(f"[{now_kst()}] 시장 지수 수집 결과 없음")
+            _log_to_db(job_name, "error", duration, error_detail="status is None")
+
+    except Exception as e:
+        duration = (datetime.now() - start).total_seconds()
+        logger.error(f"[시장지수] 오류: {e}\n{traceback.format_exc()}")
+        _log_to_db(job_name, "error", duration, error_detail=str(e))
 
 
 # ============================================================
@@ -356,6 +412,11 @@ async def gap_close_job():
 def setup_scheduler():
     """모든 스케줄 작업을 단일 스케줄러에 등록 / Register all jobs in unified scheduler"""
 
+    # ── ★ v3: 시장 지수 수집 (야간 스캔 전 실행) ──
+    scheduler.add_job(market_index_job,
+                      CronTrigger(hour=17, minute=55, day_of_week="mon-fri"),
+                      id="market_index", name="시장 지수 수집 (KOSPI/KOSDAQ)", replace_existing=True)
+
     # ── 눌림목전략 ──
     scheduler.add_job(night_scan_job,
                       CronTrigger(hour=18, minute=0, day_of_week="mon-fri"),
@@ -404,7 +465,7 @@ def setup_scheduler():
                       id="gap_close", name="갭전략 장마감 정리", replace_existing=True)
 
     scheduler.start()
-    logger.info("[스케줄러] ★ 통합 스케줄러 시작 (눌림목 + 갭상승 + 패턴수집 + 가상포트)")
+    logger.info("[스케줄러] ★ 통합 스케줄러 시작 (v3: 시장지수 + 눌림목 + 갭상승 + 패턴수집 + 가상포트)")
 
     # 등록된 job 목록 출력
     jobs = scheduler.get_jobs()
