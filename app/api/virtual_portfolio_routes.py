@@ -4,20 +4,17 @@ Virtual Portfolio Tracking API Routes
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 파일경로: app/api/virtual_portfolio_routes.py
 
-★ v2 변경사항:
-  - _sync_update_prices: get_daily_candles_naver_safe() 사용 (3단계 재시도)
-  - 의심 데이터(suspicious) 감지 시 청산 판단 보류
-  - update_all_active_portfolios: 성공/실패/스킵 카운트 반환
-
 기능:
   - 매수추천 종목 → 가상투자 포트폴리오 등록
   - 포트폴리오 목록/상세 조회
   - 일별 가격 갱신 + 자동 청산 (스마트형 전략)
   - 포트폴리오 수동 청산
+  - ★ 복리 그룹: 시드머니→목표금액 복리 성장 추적 (v2)
 """
 
 import json
 import logging
+import math
 import traceback
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -43,6 +40,19 @@ class RegisterRequest(BaseModel):
 
 class UpdatePriceRequest(BaseModel):
     portfolio_id: int
+
+
+# ★ v2: 복리 그룹 요청 모델
+class CompoundCreateRequest(BaseModel):
+    name: str = "10억 도전"
+    seed_money: float = 100000           # 시드머니 (기본 10만)
+    goal_amount: float = 1000000000      # 목표 (기본 10억)
+    strategy: str = "smart"
+    stocks: List[Dict] = []              # 1회차 종목 (빈 배열이면 대기)
+
+
+class CompoundNextRoundRequest(BaseModel):
+    stocks: List[Dict]                   # 다음 회차 종목
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -231,7 +241,7 @@ async def get_portfolio_detail(portfolio_id: int):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 4. 가격 갱신 + 자동 청산 체크 (수동 API)
+# 4. 가격 갱신 + 자동 청산 체크
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.post("/update-prices/{portfolio_id}")
@@ -453,6 +463,10 @@ async def update_prices(portfolio_id: int):
             "updated_at": now,
         }).eq("id", portfolio_id).execute()
 
+        # ★ v2: 포트폴리오 종료 시 복리 그룹 업데이트
+        if pf_status == "closed":
+            _check_compound_reinvest(portfolio_id, pf_total_value, pf_return_pct)
+
         logger.info(f"[가상포트] #{portfolio_id} 갱신: {updated_count}종목, 청산:{closed_count}, 수익:{pf_return_pct}%")
 
         return {
@@ -475,17 +489,10 @@ async def update_prices(portfolio_id: int):
 # 5. 전체 활성 포트폴리오 일괄 갱신 (스케줄러용)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def update_all_active_portfolios() -> Dict:
-    """
-    매일 18:35 스케줄러에서 호출 — 모든 활성 포트폴리오 가격 갱신
-    ★ v2: 성공/실패/스킵 카운트를 반환하여 스케줄러 로깅에 활용
-
-    Returns:
-        {"success_count": 5, "fail_count": 1, "skip_count": 0, "portfolios_total": 6}
-    """
+def update_all_active_portfolios():
+    """매일 18:35 스케줄러에서 호출 — 모든 활성 포트폴리오 가격 갱신"""
+    import requests
     import time
-
-    result = {"success_count": 0, "fail_count": 0, "skip_count": 0, "portfolios_total": 0}
 
     try:
         resp = db.table("virtual_portfolios") \
@@ -494,41 +501,25 @@ def update_all_active_portfolios() -> Dict:
             .execute()
 
         portfolios = resp.data or []
-        result["portfolios_total"] = len(portfolios)
         logger.info(f"[가상포트] 일괄 갱신 시작: {len(portfolios)}개 포트폴리오")
 
         for pf in portfolios:
             try:
+                # 내부 API 호출 대신 직접 로직 실행
                 _sync_update_prices(pf["id"])
-                result["success_count"] += 1
                 time.sleep(0.5)
             except Exception as e:
-                result["fail_count"] += 1
                 logger.warning(f"[가상포트] #{pf['id']} 갱신 실패: {e}")
 
-        logger.info(f"[가상포트] 일괄 갱신 완료: 성공 {result['success_count']}, "
-                    f"실패 {result['fail_count']}")
+        logger.info(f"[가상포트] 일괄 갱신 완료")
 
     except Exception as e:
         logger.error(f"[가상포트] 일괄 갱신 실패: {e}")
-        result["fail_count"] = result.get("portfolios_total", 1)
 
-    return result
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ★ 동기 방식 가격 갱신 (스케줄러용) — v2: 재시도 + 의심 데이터 감지
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _sync_update_prices(portfolio_id: int):
-    """
-    동기 방식 가격 갱신 (스케줄러용)
-    ★ v2 변경사항:
-      - get_daily_candles_naver_safe() 사용 (3단계 재시도)
-      - 의심 데이터(suspicious) 감지 시 청산 판단 보류
-      - 가격은 업데이트하되 매매 결정만 스킵
-    """
-    from app.services.naver_stock import get_daily_candles_naver_safe
+    """동기 방식 가격 갱신 (스케줄러용)"""
+    from app.services.naver_stock import get_daily_candles_naver
     import time
 
     pf_resp = db.table("virtual_portfolios").select("*").eq("id", portfolio_id).execute()
@@ -552,18 +543,9 @@ def _sync_update_prices(portfolio_id: int):
     for pos in positions:
         code = pos["code"]
         try:
-            # ★ v2: 안전한 조회 (3단계 재시도 + 의심 감지)
-            fetch_result = get_daily_candles_naver_safe(code, count=3)
-
-            if not fetch_result["success"] or not fetch_result["candles"]:
-                logger.warning(f"[가상포트] {code}: 데이터 수집 실패 (재시도 {fetch_result['retries']}회)")
+            candles = get_daily_candles_naver(code, count=3)
+            if not candles:
                 continue
-
-            candles = fetch_result["candles"]
-            is_suspicious = fetch_result["suspicious"]
-
-            if is_suspicious:
-                logger.warning(f"[가상포트] {code}: 의심 데이터 — {fetch_result['suspicious_reason']}")
 
             latest = candles[-1]
             current_price = latest.get("close", 0)
@@ -603,37 +585,31 @@ def _sync_update_prices(portfolio_id: int):
             profit_won = round((sell_amount - sell_comm - sell_tax) - (buy_amount + buy_comm))
             net_pct = round((profit_won / pos["invest_amount"]) * 100, 2) if pos["invest_amount"] else 0
 
-            # ★ v2: 의심 데이터일 경우 청산 판단 보류
-            # 가격/수익률은 업데이트하되, 매매 결정은 스킵
+            # 청산 체크
             sell_reason = None
+            if strategy == "smart":
+                grace_days = params.get("grace_days", 7)
+                peak_pct = ((peak_price - buy_price) / buy_price) * 100
 
-            if not is_suspicious:
-                # 정상 데이터일 때만 청산 체크
-                if strategy == "smart":
-                    grace_days = params.get("grace_days", 7)
-                    peak_pct = ((peak_price - buy_price) / buy_price) * 100
-
-                    if hold_days > grace_days:
-                        if peak_pct >= params.get("profit_activation_pct", 15.0):
-                            drop = ((current_price - peak_price) / peak_price) * 100
-                            if drop <= -params.get("trailing_stop_pct", 5.0):
-                                sell_reason = "trailing"
-                        if net_pct <= -params.get("stop_loss_pct", 12.0):
-                            sell_reason = "loss"
-                    if hold_days >= params.get("max_hold_days", 30):
-                        sell_reason = "timeout"
-                else:
-                    tp = params.get("take_profit_pct", 7.0)
-                    sl = params.get("stop_loss_pct", 3.0)
-                    gross_pct = ((current_price - buy_price) / buy_price) * 100
-                    if gross_pct >= tp:
-                        sell_reason = "profit"
-                    elif gross_pct <= -sl:
+                if hold_days > grace_days:
+                    if peak_pct >= params.get("profit_activation_pct", 15.0):
+                        drop = ((current_price - peak_price) / peak_price) * 100
+                        if drop <= -params.get("trailing_stop_pct", 5.0):
+                            sell_reason = "trailing"
+                    if net_pct <= -params.get("stop_loss_pct", 12.0):
                         sell_reason = "loss"
-                    elif hold_days >= params.get("max_hold_days", 10):
-                        sell_reason = "timeout"
+                if hold_days >= params.get("max_hold_days", 30):
+                    sell_reason = "timeout"
             else:
-                logger.info(f"[가상포트] {code}: 의심 데이터 → 청산 판단 보류 (가격만 업데이트)")
+                tp = params.get("take_profit_pct", 7.0)
+                sl = params.get("stop_loss_pct", 3.0)
+                gross_pct = ((current_price - buy_price) / buy_price) * 100
+                if gross_pct >= tp:
+                    sell_reason = "profit"
+                elif gross_pct <= -sl:
+                    sell_reason = "loss"
+                elif hold_days >= params.get("max_hold_days", 10):
+                    sell_reason = "timeout"
 
             update_data = {
                 "current_price": current_price,
@@ -687,6 +663,10 @@ def _sync_update_prices(portfolio_id: int):
         "closed_at": now if pf_status == "closed" else None,
         "updated_at": now,
     }).eq("id", portfolio_id).execute()
+
+    # ★ v2: 포트폴리오 종료 시 복리 그룹 업데이트
+    if pf_status == "closed":
+        _check_compound_reinvest(portfolio_id, total_value, pf_return_pct)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -789,3 +769,384 @@ async def get_candles(code: str, days: int = 120):
     except Exception as e:
         logger.error(f"[가상포트] 캔들 조회 실패 {code}: {e}")
         return {"candles": [], "code": code, "error": str(e)}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ v2: 복리 그룹 헬퍼 함수
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _check_compound_reinvest(portfolio_id: int, final_value: float, round_return_pct: float):
+    """
+    포트폴리오 종료 시 복리 그룹 업데이트
+    - compound_group_id가 있으면 그룹의 current_capital 갱신
+    - 목표 도달 시 status = 'goal_reached'
+    """
+    try:
+        pf = db.table("virtual_portfolios") \
+            .select("compound_group_id, round_number, capital") \
+            .eq("id", portfolio_id) \
+            .execute()
+
+        if not pf.data or not pf.data[0].get("compound_group_id"):
+            return  # 복리 그룹 아님
+
+        group_id = pf.data[0]["compound_group_id"]
+        round_num = pf.data[0].get("round_number", 1)
+
+        # 그룹 정보 조회
+        grp = db.table("compound_groups").select("*").eq("id", group_id).execute()
+        if not grp.data:
+            return
+
+        group = grp.data[0]
+        seed = group["seed_money"]
+        goal = group["goal_amount"]
+        now = datetime.now().isoformat()
+
+        # 누적 수익률: (최종자산 / 시드머니 - 1) × 100
+        total_return = ((final_value / seed) - 1) * 100 if seed > 0 else 0
+
+        # 회차별 통계
+        win_rounds = group.get("win_rounds", 0)
+        loss_rounds = group.get("loss_rounds", 0)
+        total_rounds = group.get("total_rounds", 0) + 1
+
+        if round_return_pct > 0:
+            win_rounds += 1
+        elif round_return_pct < 0:
+            loss_rounds += 1
+
+        best = max(group.get("best_round_pct", 0), round_return_pct)
+        worst = min(group.get("worst_round_pct", 0), round_return_pct)
+
+        # 목표 도달 체크
+        status = "goal_reached" if final_value >= goal else "active"
+
+        db.table("compound_groups").update({
+            "current_capital": round(final_value),
+            "current_round": round_num + 1,
+            "total_return_pct": round(total_return, 2),
+            "total_rounds": total_rounds,
+            "win_rounds": win_rounds,
+            "loss_rounds": loss_rounds,
+            "best_round_pct": round(best, 2),
+            "worst_round_pct": round(worst, 2),
+            "status": status,
+            "updated_at": now,
+        }).eq("id", group_id).execute()
+
+        if status == "goal_reached":
+            logger.info(f"[복리] 🎉 그룹 #{group_id} 목표 달성! {seed:,.0f} → {final_value:,.0f}")
+        else:
+            logger.info(f"[복리] 그룹 #{group_id} {round_num}회차 종료: "
+                       f"{group['current_capital']:,.0f} → {final_value:,.0f} ({round_return_pct:+.1f}%)")
+
+    except Exception as e:
+        logger.warning(f"[복리] 재투자 체크 오류 (무시): {e}")
+
+
+def _calc_goal_progress(seed: float, current: float, goal: float) -> float:
+    """목표 진행률 (로그 스케일) — 10만→10억은 선형이면 0.01%지만 로그면 체감 가능"""
+    if seed <= 0 or goal <= seed or current <= 0:
+        return 0.0
+    try:
+        progress = math.log(current / seed) / math.log(goal / seed) * 100
+        return round(min(max(progress, 0), 100), 2)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ v2: 복리 그룹 API 엔드포인트
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.post("/compound/create")
+async def create_compound_group(req: CompoundCreateRequest):
+    """복리 그룹 생성 + 1회차 포트폴리오 (종목 있으면 즉시 등록)"""
+    now = datetime.now().isoformat()
+
+    try:
+        # 복리 그룹 생성
+        grp_resp = db.table("compound_groups").insert({
+            "name": req.name,
+            "seed_money": req.seed_money,
+            "goal_amount": req.goal_amount,
+            "current_capital": req.seed_money,
+            "current_round": 1,
+            "strategy": req.strategy,
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+        }).execute()
+
+        group = grp_resp.data[0]
+        group_id = group["id"]
+        result = {
+            "success": True,
+            "group_id": group_id,
+            "name": req.name,
+            "seed_money": req.seed_money,
+            "goal_amount": req.goal_amount,
+            "portfolio_id": None,
+        }
+
+        # 종목이 있으면 1회차 포트폴리오 즉시 생성
+        if req.stocks:
+            pf_name = f"{req.name} - 1회차"
+            pf_resp = db.table("virtual_portfolios").insert({
+                "name": pf_name,
+                "capital": req.seed_money,
+                "strategy": req.strategy,
+                "status": "active",
+                "stock_count": len(req.stocks),
+                "current_value": req.seed_money,
+                "compound_group_id": group_id,
+                "round_number": 1,
+                "created_at": now,
+                "updated_at": now,
+            }).execute()
+
+            portfolio_id = pf_resp.data[0]["id"]
+
+            # 포지션 생성
+            per_stock = req.seed_money / len(req.stocks)
+            positions = []
+            for stock in req.stocks:
+                buy_price = stock.get("current_price", 0)
+                if buy_price <= 0:
+                    continue
+                commission = per_stock * COMMISSION_RATE
+                actual_invest = per_stock - commission
+                quantity = actual_invest / buy_price
+
+                positions.append({
+                    "portfolio_id": portfolio_id,
+                    "code": stock["code"],
+                    "name": stock.get("name", stock["code"]),
+                    "buy_price": buy_price,
+                    "current_price": buy_price,
+                    "quantity": round(quantity, 4),
+                    "invest_amount": round(per_stock),
+                    "status": "holding",
+                    "peak_price": buy_price,
+                    "similarity": stock.get("similarity", 0),
+                    "signal": stock.get("signal", ""),
+                    "price_history": json.dumps([{"date": now[:10], "close": buy_price}]),
+                    "buy_date": now,
+                    "updated_at": now,
+                })
+
+            if positions:
+                db.table("virtual_positions").insert(positions).execute()
+
+            result["portfolio_id"] = portfolio_id
+            result["stock_count"] = len(positions)
+            result["message"] = f"복리 그룹 '{req.name}' + 1회차 포트폴리오 등록 ({len(positions)}종목)"
+        else:
+            result["message"] = f"복리 그룹 '{req.name}' 생성 (종목 선택 대기 중)"
+
+        logger.info(f"[복리] 그룹 생성: {req.name}, 시드={req.seed_money:,.0f}, 목표={req.goal_amount:,.0f}")
+        return result
+
+    except Exception as e:
+        logger.error(f"[복리] 그룹 생성 실패: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"복리 그룹 생성 실패: {e}")
+
+
+@router.get("/compound/list")
+async def list_compound_groups():
+    """복리 그룹 목록 조회"""
+    try:
+        resp = db.table("compound_groups") \
+            .select("*") \
+            .order("created_at", desc=True) \
+            .execute()
+
+        groups = resp.data or []
+
+        # 각 그룹에 진행률 + 회차별 포트폴리오 수 추가
+        for g in groups:
+            g["goal_progress"] = _calc_goal_progress(
+                g["seed_money"], g["current_capital"], g["goal_amount"]
+            )
+            # 해당 그룹의 포트폴리오 수
+            pf_resp = db.table("virtual_portfolios") \
+                .select("id, status, round_number, total_return_pct, capital, current_value") \
+                .eq("compound_group_id", g["id"]) \
+                .order("round_number") \
+                .execute()
+            g["portfolios"] = pf_resp.data or []
+            g["growth_multiple"] = round(g["current_capital"] / g["seed_money"], 2) if g["seed_money"] > 0 else 1
+
+        return {"success": True, "groups": groups, "total": len(groups)}
+
+    except Exception as e:
+        logger.error(f"[복리] 목록 조회 실패: {e}")
+        raise HTTPException(500, str(e))
+
+
+@router.get("/compound/{group_id}")
+async def get_compound_detail(group_id: int):
+    """복리 그룹 상세 (회차별 이력 포함)"""
+    try:
+        grp = db.table("compound_groups").select("*").eq("id", group_id).execute()
+        if not grp.data:
+            raise HTTPException(404, f"복리 그룹 #{group_id}를 찾을 수 없습니다")
+
+        group = grp.data[0]
+        group["goal_progress"] = _calc_goal_progress(
+            group["seed_money"], group["current_capital"], group["goal_amount"]
+        )
+        group["growth_multiple"] = round(group["current_capital"] / group["seed_money"], 2) if group["seed_money"] > 0 else 1
+
+        # 회차별 포트폴리오
+        pf_resp = db.table("virtual_portfolios") \
+            .select("id, name, status, round_number, capital, current_value, "
+                    "total_return_pct, total_return_won, win_count, loss_count, "
+                    "stock_count, created_at, closed_at") \
+            .eq("compound_group_id", group_id) \
+            .order("round_number") \
+            .execute()
+
+        rounds = pf_resp.data or []
+
+        # 회차별 누적 자본 추적
+        cumulative = group["seed_money"]
+        for r in rounds:
+            r["start_capital"] = round(cumulative)
+            end_val = r.get("current_value", cumulative)
+            r["end_capital"] = round(end_val)
+            r["round_return_pct"] = round(((end_val / cumulative) - 1) * 100, 2) if cumulative > 0 else 0
+            if r["status"] != "active":
+                cumulative = end_val
+
+        return {
+            "success": True,
+            "group": group,
+            "rounds": rounds,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[복리] 상세 조회 실패: {e}")
+        raise HTTPException(500, str(e))
+
+
+@router.post("/compound/{group_id}/next-round")
+async def start_next_round(group_id: int, req: CompoundNextRoundRequest):
+    """다음 회차 포트폴리오 생성 (종목 선택 후 호출)"""
+    now = datetime.now().isoformat()
+
+    try:
+        # 그룹 조회
+        grp = db.table("compound_groups").select("*").eq("id", group_id).execute()
+        if not grp.data:
+            raise HTTPException(404, f"복리 그룹 #{group_id}를 찾을 수 없습니다")
+
+        group = grp.data[0]
+
+        if group["status"] == "goal_reached":
+            raise HTTPException(400, "이미 목표 달성한 그룹입니다")
+
+        if group["status"] == "stopped":
+            raise HTTPException(400, "중단된 그룹입니다")
+
+        # 현재 활성 포트폴리오가 있는지 체크
+        active_check = db.table("virtual_portfolios") \
+            .select("id") \
+            .eq("compound_group_id", group_id) \
+            .eq("status", "active") \
+            .execute()
+
+        if active_check.data:
+            raise HTTPException(400, f"아직 활성 포트폴리오(#{active_check.data[0]['id']})가 있습니다")
+
+        if not req.stocks:
+            raise HTTPException(400, "종목을 선택해주세요")
+
+        round_num = group["current_round"]
+        capital = group["current_capital"]
+        strategy = group["strategy"]
+
+        # 포트폴리오 생성
+        pf_name = f"{group['name']} - {round_num}회차"
+        pf_resp = db.table("virtual_portfolios").insert({
+            "name": pf_name,
+            "capital": capital,
+            "strategy": strategy,
+            "status": "active",
+            "stock_count": len(req.stocks),
+            "current_value": capital,
+            "compound_group_id": group_id,
+            "round_number": round_num,
+            "created_at": now,
+            "updated_at": now,
+        }).execute()
+
+        portfolio_id = pf_resp.data[0]["id"]
+
+        # 포지션 생성
+        per_stock = capital / len(req.stocks)
+        positions = []
+        for stock in req.stocks:
+            buy_price = stock.get("current_price", 0)
+            if buy_price <= 0:
+                continue
+            commission = per_stock * COMMISSION_RATE
+            actual_invest = per_stock - commission
+            quantity = actual_invest / buy_price
+
+            positions.append({
+                "portfolio_id": portfolio_id,
+                "code": stock["code"],
+                "name": stock.get("name", stock["code"]),
+                "buy_price": buy_price,
+                "current_price": buy_price,
+                "quantity": round(quantity, 4),
+                "invest_amount": round(per_stock),
+                "status": "holding",
+                "peak_price": buy_price,
+                "similarity": stock.get("similarity", 0),
+                "signal": stock.get("signal", ""),
+                "price_history": json.dumps([{"date": now[:10], "close": buy_price}]),
+                "buy_date": now,
+                "updated_at": now,
+            })
+
+        if positions:
+            db.table("virtual_positions").insert(positions).execute()
+
+        logger.info(f"[복리] 그룹 #{group_id} {round_num}회차 시작: "
+                   f"원금 {capital:,.0f}원, {len(positions)}종목")
+
+        return {
+            "success": True,
+            "group_id": group_id,
+            "portfolio_id": portfolio_id,
+            "round_number": round_num,
+            "capital": capital,
+            "stock_count": len(positions),
+            "message": f"{round_num}회차 시작 ({len(positions)}종목, {capital:,.0f}원)",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[복리] 다음 회차 생성 실패: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, str(e))
+
+
+@router.put("/compound/{group_id}/stop")
+async def stop_compound_group(group_id: int):
+    """복리 그룹 중단"""
+    try:
+        now = datetime.now().isoformat()
+        db.table("compound_groups").update({
+            "status": "stopped",
+            "updated_at": now,
+        }).eq("id", group_id).execute()
+
+        return {"success": True, "message": f"복리 그룹 #{group_id} 중단됨"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
