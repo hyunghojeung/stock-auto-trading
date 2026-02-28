@@ -148,6 +148,61 @@ class StrategyResult:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 from app.services.naver_stock import get_daily_candles_naver
 
+def _find_last_surge_start(candles: List[Dict], threshold_pct: float = 20.0) -> tuple:
+    """
+    캔들 데이터에서 가장 최근 급상승(threshold% 이상)의 시작점을 찾는다.
+    Find the most recent surge start point from candle data.
+
+    Returns: (start_date, start_price) or (None, 0)
+    """
+    if not candles or len(candles) < 20:
+        return None, 0
+
+    closes = [c["close"] for c in candles]
+
+    best_start_idx = None
+    best_rise_pct = 0
+
+    # 뒤에서부터 탐색 (최근 급상승 우선)
+    for i in range(len(closes) - 5, 19, -1):
+        low_val = closes[i]
+        if low_val <= 0:
+            continue
+
+        # i 이후 20일 내 최고점
+        end = min(i + 20, len(closes))
+        max_val = max(closes[i:end])
+        rise_pct = ((max_val - low_val) / low_val) * 100
+
+        if rise_pct >= threshold_pct and rise_pct > best_rise_pct:
+            best_rise_pct = rise_pct
+            best_start_idx = i
+
+        # 충분히 좋은 급상승 찾으면 중단 (최근 것 우선)
+        if best_rise_pct >= threshold_pct:
+            break
+
+    # 급상승 못 찾으면 기준 낮춰서 재시도
+    if best_start_idx is None:
+        for i in range(len(closes) - 5, 19, -1):
+            low_val = closes[i]
+            if low_val <= 0:
+                continue
+            end = min(i + 30, len(closes))
+            max_val = max(closes[i:end])
+            rise_pct = ((max_val - low_val) / low_val) * 100
+            if rise_pct >= 10.0:
+                best_start_idx = i
+                break
+
+    if best_start_idx is not None:
+        date = candles[best_start_idx]["date"].replace("'", "").strip()
+        price = closes[best_start_idx]
+        return date, price
+
+    return None, 0
+
+
 def fetch_daily_candles(stock_code: str, days: int = 60) -> List[Dict]:
     """
     네이버 금융에서 일봉 데이터 수집 (naver_stock.py 재사용)
@@ -620,19 +675,35 @@ async def run_comparison(
     stocks_data = {}
     for stock in stocks[:MAX_POSITIONS]:
         code = stock["code"]
-
-        # ★ signal_date 기반으로 충분한 기간 계산
         signal_date = stock.get("signal_date", "")
-        fetch_days = 120  # 기본값
+
+        # ★★★ 핵심 수정: signal_date가 최근 3일 이내면 "오늘 날짜 버그"로 판단
+        # → 캔들에서 가장 최근 급상승 시작점을 자동 탐색
+        is_signal_too_recent = False
         if signal_date:
             try:
-                sd_clean = signal_date.replace("-", "").replace(".", "").strip()
-                sd_dt = datetime.strptime(sd_clean[:8], "%Y%m%d")
-                days_diff = (datetime.now() - sd_dt).days
-                fetch_days = max(120, days_diff + 60)  # signal_date 이전 여유 + 이후 전체
-                fetch_days = min(fetch_days, 600)  # 네이버 최대 600일
+                sd_clean = signal_date.replace("-", "").replace(".", "").strip()[:8]
+                sd_dt = datetime.strptime(sd_clean, "%Y%m%d")
+                days_from_now = (datetime.now() - sd_dt).days
+                if days_from_now <= 3:
+                    is_signal_too_recent = True
+                    logger.warning(f"[가상투자] {code} signal_date={signal_date}가 최근 {days_from_now}일 → 자동 보정 시도")
             except Exception:
-                fetch_days = 600  # 파싱 실패시 최대치
+                is_signal_too_recent = True
+
+        # 일봉 수집: signal_date 기반 기간 계산
+        fetch_days = 120
+        if signal_date and not is_signal_too_recent:
+            try:
+                sd_clean = signal_date.replace("-", "").replace(".", "").strip()[:8]
+                sd_dt = datetime.strptime(sd_clean, "%Y%m%d")
+                days_diff = (datetime.now() - sd_dt).days
+                fetch_days = max(120, days_diff + 60)
+                fetch_days = min(fetch_days, 600)
+            except Exception:
+                fetch_days = 600
+        else:
+            fetch_days = 400  # 최근 날짜면 넉넉히 수집
 
         candles = fetch_daily_candles(code, days=fetch_days)
 
@@ -640,20 +711,38 @@ async def run_comparison(
             logger.warning(f"[가상투자] {code} 일봉 데이터 없음, 스킵")
             continue
 
+        # ★★★ signal_date가 너무 최근이면 → 캔들에서 급상승 시작점 자동 탐색
+        if is_signal_too_recent and len(candles) >= 30:
+            auto_date, auto_price = _find_last_surge_start(candles)
+            if auto_date:
+                logger.info(f"[가상투자] {code} 자동 보정: {signal_date} → {auto_date} (가격: {auto_price})")
+                signal_date = auto_date
+                stock = {**stock, "signal_date": auto_date, "buy_price": auto_price}
+            else:
+                # 급상승 못 찾으면 60일 전부터 시뮬레이션
+                fallback_idx = max(0, len(candles) - 60)
+                signal_date = candles[fallback_idx]["date"].replace("'", "").strip()
+                auto_price = candles[fallback_idx]["close"]
+                logger.info(f"[가상투자] {code} 급상승 미발견 → 60일 전({signal_date}) 사용")
+                stock = {**stock, "signal_date": signal_date, "buy_price": auto_price}
+
         # signal_date 이후의 캔들만 추출
-        signal_date = stock.get("signal_date", "")
         if signal_date:
-            # signal_date 이후 캔들 필터링
             filtered = []
             found = False
+            sd_norm = signal_date.replace("-", "").replace(".", "").replace("'", "").strip()
             for c in candles:
+                c_date = c["date"].replace("'", "").strip()
                 if found:
                     filtered.append(c)
-                elif c["date"].replace("'", "").strip() >= signal_date.replace("-", ""):
+                elif c_date >= sd_norm:
                     found = True
                     filtered.append(c)
-            if filtered:
+            if filtered and len(filtered) >= 2:
                 candles = filtered
+                logger.info(f"[가상투자] {code} signal_date={signal_date} 이후 캔들: {len(candles)}개")
+            else:
+                logger.warning(f"[가상투자] {code} signal_date={signal_date} 이후 캔들 부족({len(filtered)}개), 전체 사용")
 
         stocks_data[code] = {
             "name": stock.get("name", code),
