@@ -4,6 +4,11 @@ Virtual Portfolio Tracking API Routes
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 파일경로: app/api/virtual_portfolio_routes.py
 
+★ v2 변경사항:
+  - _sync_update_prices: get_daily_candles_naver_safe() 사용 (3단계 재시도)
+  - 의심 데이터(suspicious) 감지 시 청산 판단 보류
+  - update_all_active_portfolios: 성공/실패/스킵 카운트 반환
+
 기능:
   - 매수추천 종목 → 가상투자 포트폴리오 등록
   - 포트폴리오 목록/상세 조회
@@ -226,7 +231,7 @@ async def get_portfolio_detail(portfolio_id: int):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 4. 가격 갱신 + 자동 청산 체크
+# 4. 가격 갱신 + 자동 청산 체크 (수동 API)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.post("/update-prices/{portfolio_id}")
@@ -470,10 +475,17 @@ async def update_prices(portfolio_id: int):
 # 5. 전체 활성 포트폴리오 일괄 갱신 (스케줄러용)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def update_all_active_portfolios():
-    """매일 18:35 스케줄러에서 호출 — 모든 활성 포트폴리오 가격 갱신"""
-    import requests
+def update_all_active_portfolios() -> Dict:
+    """
+    매일 18:35 스케줄러에서 호출 — 모든 활성 포트폴리오 가격 갱신
+    ★ v2: 성공/실패/스킵 카운트를 반환하여 스케줄러 로깅에 활용
+
+    Returns:
+        {"success_count": 5, "fail_count": 1, "skip_count": 0, "portfolios_total": 6}
+    """
     import time
+
+    result = {"success_count": 0, "fail_count": 0, "skip_count": 0, "portfolios_total": 0}
 
     try:
         resp = db.table("virtual_portfolios") \
@@ -482,25 +494,41 @@ def update_all_active_portfolios():
             .execute()
 
         portfolios = resp.data or []
+        result["portfolios_total"] = len(portfolios)
         logger.info(f"[가상포트] 일괄 갱신 시작: {len(portfolios)}개 포트폴리오")
 
         for pf in portfolios:
             try:
-                # 내부 API 호출 대신 직접 로직 실행
                 _sync_update_prices(pf["id"])
+                result["success_count"] += 1
                 time.sleep(0.5)
             except Exception as e:
+                result["fail_count"] += 1
                 logger.warning(f"[가상포트] #{pf['id']} 갱신 실패: {e}")
 
-        logger.info(f"[가상포트] 일괄 갱신 완료")
+        logger.info(f"[가상포트] 일괄 갱신 완료: 성공 {result['success_count']}, "
+                    f"실패 {result['fail_count']}")
 
     except Exception as e:
         logger.error(f"[가상포트] 일괄 갱신 실패: {e}")
+        result["fail_count"] = result.get("portfolios_total", 1)
 
+    return result
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ 동기 방식 가격 갱신 (스케줄러용) — v2: 재시도 + 의심 데이터 감지
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _sync_update_prices(portfolio_id: int):
-    """동기 방식 가격 갱신 (스케줄러용)"""
-    from app.services.naver_stock import get_daily_candles_naver
+    """
+    동기 방식 가격 갱신 (스케줄러용)
+    ★ v2 변경사항:
+      - get_daily_candles_naver_safe() 사용 (3단계 재시도)
+      - 의심 데이터(suspicious) 감지 시 청산 판단 보류
+      - 가격은 업데이트하되 매매 결정만 스킵
+    """
+    from app.services.naver_stock import get_daily_candles_naver_safe
     import time
 
     pf_resp = db.table("virtual_portfolios").select("*").eq("id", portfolio_id).execute()
@@ -524,9 +552,18 @@ def _sync_update_prices(portfolio_id: int):
     for pos in positions:
         code = pos["code"]
         try:
-            candles = get_daily_candles_naver(code, count=3)
-            if not candles:
+            # ★ v2: 안전한 조회 (3단계 재시도 + 의심 감지)
+            fetch_result = get_daily_candles_naver_safe(code, count=3)
+
+            if not fetch_result["success"] or not fetch_result["candles"]:
+                logger.warning(f"[가상포트] {code}: 데이터 수집 실패 (재시도 {fetch_result['retries']}회)")
                 continue
+
+            candles = fetch_result["candles"]
+            is_suspicious = fetch_result["suspicious"]
+
+            if is_suspicious:
+                logger.warning(f"[가상포트] {code}: 의심 데이터 — {fetch_result['suspicious_reason']}")
 
             latest = candles[-1]
             current_price = latest.get("close", 0)
@@ -566,31 +603,37 @@ def _sync_update_prices(portfolio_id: int):
             profit_won = round((sell_amount - sell_comm - sell_tax) - (buy_amount + buy_comm))
             net_pct = round((profit_won / pos["invest_amount"]) * 100, 2) if pos["invest_amount"] else 0
 
-            # 청산 체크
+            # ★ v2: 의심 데이터일 경우 청산 판단 보류
+            # 가격/수익률은 업데이트하되, 매매 결정은 스킵
             sell_reason = None
-            if strategy == "smart":
-                grace_days = params.get("grace_days", 7)
-                peak_pct = ((peak_price - buy_price) / buy_price) * 100
 
-                if hold_days > grace_days:
-                    if peak_pct >= params.get("profit_activation_pct", 15.0):
-                        drop = ((current_price - peak_price) / peak_price) * 100
-                        if drop <= -params.get("trailing_stop_pct", 5.0):
-                            sell_reason = "trailing"
-                    if net_pct <= -params.get("stop_loss_pct", 12.0):
+            if not is_suspicious:
+                # 정상 데이터일 때만 청산 체크
+                if strategy == "smart":
+                    grace_days = params.get("grace_days", 7)
+                    peak_pct = ((peak_price - buy_price) / buy_price) * 100
+
+                    if hold_days > grace_days:
+                        if peak_pct >= params.get("profit_activation_pct", 15.0):
+                            drop = ((current_price - peak_price) / peak_price) * 100
+                            if drop <= -params.get("trailing_stop_pct", 5.0):
+                                sell_reason = "trailing"
+                        if net_pct <= -params.get("stop_loss_pct", 12.0):
+                            sell_reason = "loss"
+                    if hold_days >= params.get("max_hold_days", 30):
+                        sell_reason = "timeout"
+                else:
+                    tp = params.get("take_profit_pct", 7.0)
+                    sl = params.get("stop_loss_pct", 3.0)
+                    gross_pct = ((current_price - buy_price) / buy_price) * 100
+                    if gross_pct >= tp:
+                        sell_reason = "profit"
+                    elif gross_pct <= -sl:
                         sell_reason = "loss"
-                if hold_days >= params.get("max_hold_days", 30):
-                    sell_reason = "timeout"
+                    elif hold_days >= params.get("max_hold_days", 10):
+                        sell_reason = "timeout"
             else:
-                tp = params.get("take_profit_pct", 7.0)
-                sl = params.get("stop_loss_pct", 3.0)
-                gross_pct = ((current_price - buy_price) / buy_price) * 100
-                if gross_pct >= tp:
-                    sell_reason = "profit"
-                elif gross_pct <= -sl:
-                    sell_reason = "loss"
-                elif hold_days >= params.get("max_hold_days", 10):
-                    sell_reason = "timeout"
+                logger.info(f"[가상포트] {code}: 의심 데이터 → 청산 판단 보류 (가격만 업데이트)")
 
             update_data = {
                 "current_price": current_price,
