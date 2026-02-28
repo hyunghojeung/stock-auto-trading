@@ -15,8 +15,7 @@ from app.api.surge_scanner_routes import router as scanner_router
 from app.api.virtual_invest_routes import router as virtual_invest_router
 from app.api.virtual_portfolio_routes import router as virtual_portfolio_router
 from app.api.pattern_lib_routes import router as pattern_lib_router  # ★ v3: 패턴 라이브러리
-from app.api.surge_sim_routes import router as surge_sim_router
-app.include_router(surge_sim_router)
+
 
 # ★ 패턴 벡터 수집기
 from app.services.stock_pattern_collector import run_pattern_collection
