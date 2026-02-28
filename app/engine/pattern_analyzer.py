@@ -9,6 +9,7 @@ Pattern Surge Detector — DTW-based Analysis Engine
 공통 패턴을 도출합니다.
 
 [v2] 프리셋(우량주/작전주) 지원 — DTW 가중치를 외부에서 전달받음
+[v3] 눌림목 패턴 라이브러리 연동 — Step 2.5 삽입 + 매수추천에 패턴 가산점
 """
 
 import numpy as np
@@ -99,6 +100,7 @@ class AnalysisResult:
     recommendations: List[Dict]  # 현재 매수 추천
     summary: Dict               # 공통 패턴 요약
     raw_surges: List[Dict]      # 급상승 구간 목록
+    dip_matches: Dict = field(default_factory=dict)  # ★ v3: 눌림목 패턴 매칭 결과
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -508,12 +510,14 @@ def find_current_matches(
     names: Dict[str, str],
     clusters: List[PatternCluster],
     pre_days: int = 10,
-    weights: Dict[str, float] = None
+    weights: Dict[str, float] = None,
+    dip_results: Dict = None,  # ★ v3: 패턴 라이브러리 결과
 ) -> List[Dict]:
     """
     현재 일봉 흐름이 도출된 공통 패턴과 얼마나 유사한지 계산
     → 매수 추천 목록 생성
     [v2] weights를 사용하여 등락률/거래량 비중 조절
+    [v3] dip_results: 패턴 라이브러리 매칭 결과 → 가산점 + 최소 임계 완화
     """
     recommendations = []
 
@@ -522,6 +526,9 @@ def find_current_matches(
 
     if weights is None:
         weights = DEFAULT_WEIGHTS
+
+    if dip_results is None:
+        dip_results = {}
 
     # [v2] 가중치 기반 추천 유사도 비율 계산
     # returns + volume 기준으로 비례 배분 (candle은 추천에서 제외)
@@ -583,11 +590,21 @@ def find_current_matches(
                 best_sim = sim
                 best_cluster_id = cluster.cluster_id
 
-        # 시그널 판단
+        # ★ v3: 패턴 라이브러리 가산점
+        dip_info = dip_results.get(code)
+        dip_bonus = 0
+        dip_pattern = None
+        if dip_info and dip_info.get("is_dip"):
+            dip_bonus = min(dip_info.get("total_score", 0) * 0.15, 15)  # 최대 +15
+            dip_pattern = dip_info.get("best_pattern")
+            best_sim = min(best_sim + dip_bonus, 100)
+
+        # 시그널 판단 (★ v3: 패턴 매칭 시 임계 완화 50→40)
+        min_threshold = 40 if dip_pattern else 50
         if best_sim >= 65:
             signal = "🟢 강력 매수"
             signal_code = "strong_buy"
-        elif best_sim >= 50:
+        elif best_sim >= min_threshold:
             signal = "🟡 관심"
             signal_code = "watch"
         elif best_sim >= 40:
@@ -608,6 +625,10 @@ def find_current_matches(
             'current_returns': current_returns,
             'current_volumes': current_volumes,
             'last_date': recent[-1].date if recent else '',
+            # ★ v3: 패턴 라이브러리 정보
+            'dip_pattern': dip_pattern,
+            'dip_bonus': round(dip_bonus, 1),
+            'dip_matched_patterns': dip_info.get("matched_patterns", []) if dip_info else [],
         })
 
     # 유사도 높은 순 정렬
@@ -677,12 +698,43 @@ def run_pattern_analysis(
     if progress_callback:
         progress_callback(75, f"클러스터링 완료: {len(clusters)}개 패턴 그룹")
 
+    # ── ★ Step 2.5: 눌림목 패턴 라이브러리 필터 (v3 신규) ──
+    dip_results = {}
+    try:
+        from app.engine.pattern_library import evaluate_dip_patterns, get_active_patterns_from_db
+        active_patterns = get_active_patterns_from_db()
+
+        if progress_callback:
+            progress_callback(77, f"눌림목 패턴 라이브러리 적용 중... ({len(active_patterns)}개 패턴)")
+
+        for code, candles_list in candles_by_code.items():
+            # CandleDay → dict 변환
+            candles_dict = [
+                {"date": c.date, "open": c.open, "high": c.high,
+                 "low": c.low, "close": c.close, "volume": c.volume}
+                for c in candles_list
+            ]
+            result = evaluate_dip_patterns(candles_dict, active_patterns, require_gates=True)
+            if result["is_dip"]:
+                dip_results[code] = result
+
+        if dip_results:
+            dip_summary = ", ".join(f"{k}({v.get('best_pattern','')})" for k, v in list(dip_results.items())[:5])
+            logger.info(f"[v3] 눌림목 패턴 매칭: {len(dip_results)}개 종목 ({dip_summary})")
+            if progress_callback:
+                progress_callback(79, f"눌림목 패턴 {len(dip_results)}개 종목 매칭")
+    except ImportError:
+        logger.info("[v3] pattern_library 미설치 — Step 2.5 스킵")
+    except Exception as e:
+        logger.warning(f"[v3] 패턴 라이브러리 오류 (무시): {e}")
+
     # ── Step 3: 현재 매수 추천 — [v2] weights 전달 ──
     if progress_callback:
         progress_callback(80, "현재 매수 추천 분석 중...")
 
     recommendations = find_current_matches(
-        candles_by_code, names, clusters_raw, pre_days, weights=weights
+        candles_by_code, names, clusters_raw, pre_days, weights=weights,
+        dip_results=dip_results  # ★ v3: 패턴 라이브러리 결과 전달
     )
 
     # ── Step 4: 요약 생성 ──
@@ -719,7 +771,8 @@ def run_pattern_analysis(
         all_patterns=patterns_dict,
         recommendations=recommendations,
         summary=summary,
-        raw_surges=surges_dict
+        raw_surges=surges_dict,
+        dip_matches=dip_results,  # ★ v3
     )
 
 
