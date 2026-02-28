@@ -1,13 +1,29 @@
 """점수제 종목 선별 (100점 만점) / Score-based Stock Selection
-개선사항:
-- 절대 거래량 → 회전율(상대 거래량) 기반 점수
-- 눌림목 후보 가점 (소폭 하락 + 고거래량)
-- 가격대/시가총액 필터링
-- 야간스캔 시 scan_date를 다음 거래일로 저장
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+★ v2: 거래대금 필터 강화
+  - _passes_filter(): 거래대금 10억 원 이상 필수 조건 추가
+  - _theme_score(): 기준 강화 (10억 미만 → 0점)
+
+기존 기능 유지:
+  - 절대 거래량 → 회전율(상대 거래량) 기반 점수
+  - 눌림목 후보 가점 (소폭 하락 + 고거래량)
+  - 가격대/시가총액 필터링
+  - 야간스캔 시 scan_date를 다음 거래일로 저장
+
+파일경로: app/engine/scorer.py
 """
 from datetime import datetime, date, timedelta
 from app.core.database import db
 from app.core.config import KST
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ 필터 상수 / Filter Constants
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MIN_TRADE_VALUE = 1_000_000_000    # 최소 거래대금: 10억 원
+MIN_VOLUME = 50_000                 # 최소 거래량: 5만주
+MIN_MARKET_CAP = 50_000_000_000     # 최소 시가총액: 500억 원
+MIN_PRICE = 1_000                   # 최소 가격: 1,000원
+MAX_PRICE = 500_000                 # 최대 가격: 50만원
 
 
 async def score_and_select(stocks, top_n=10):
@@ -18,14 +34,18 @@ async def score_and_select(stocks, top_n=10):
 
     scored = []
     filtered_count = 0
+    filter_reasons = {"price": 0, "volume": 0, "market_cap": 0, "trade_value": 0, "name": 0}
 
     for stock in stocks:
         # 사전 필터: 투자 부적합 종목 제거
-        if not _passes_filter(stock):
+        passed, reason = _passes_filter(stock)
+        if not passed:
             filtered_count += 1
+            if reason in filter_reasons:
+                filter_reasons[reason] += 1
             continue
 
-         = calculate_score(stock)
+        score = calculate_score(stock)
         if score > 30:
             stock["score"] = score
             scored.append(stock)
@@ -33,7 +53,11 @@ async def score_and_select(stocks, top_n=10):
     scored.sort(key=lambda x: x["score"], reverse=True)
     top = scored[:top_n]
 
-    print(f"[선별] 전체 {len(stocks)}개 → 필터 제외 {filtered_count}개 → "
+    # ★ 필터 사유별 카운트 로그
+    print(f"[선별] 전체 {len(stocks)}개 → 필터 제외 {filtered_count}개 "
+          f"(가격:{filter_reasons['price']}, 거래량:{filter_reasons['volume']}, "
+          f"시총:{filter_reasons['market_cap']}, 거래대금:{filter_reasons['trade_value']}, "
+          f"이름:{filter_reasons['name']}) → "
           f"30점 이상 {len(scored)}개 → 상위 {len(top)}개 선별")
 
     # DB 저장 — 야간(18시 이후)이면 다음 거래일로 저장
@@ -99,31 +123,42 @@ def _get_scan_date():
 
 
 def _passes_filter(stock):
-    """사전 필터: 투자 부적합 종목 제거 / Pre-filter unsuitable stocks"""
+    """
+    사전 필터: 투자 부적합 종목 제거 / Pre-filter unsuitable stocks
+    ★ v2: 거래대금 10억 원 필수 조건 추가
+
+    Returns:
+        (passed: bool, reason: str)
+    """
     price = stock.get("price", 0)
     volume = stock.get("volume", 0)
     market_cap = stock.get("market_cap", 0)
     name = stock.get("name", "")
 
     # 가격 필터: 1,000원 미만 (동전주) 또는 50만원 초과 (고가주) 제외
-    if price < 1000 or price > 500000:
-        return False
+    if price < MIN_PRICE or price > MAX_PRICE:
+        return False, "price"
 
     # 거래량 필터: 최소 5만주 이상
-    if volume < 50000:
-        return False
+    if volume < MIN_VOLUME:
+        return False, "volume"
 
     # 시가총액 필터: 500억 미만 제외 (극소형주 리스크)
-    if market_cap < 50000000000:
-        return False
+    if market_cap < MIN_MARKET_CAP:
+        return False, "market_cap"
+
+    # ★ v2: 거래대금 필터 — 10억 원 이상 필수 (유동성 보장)
+    trade_value = volume * price
+    if trade_value < MIN_TRADE_VALUE:
+        return False, "trade_value"
 
     # 이름 필터: 우선주, 스팩 등 제외
     exclude_keywords = ["우B", "우C", "스팩", "SPAC", "리츠", "인프라"]
     for kw in exclude_keywords:
         if kw in name:
-            return False
+            return False, "name"
 
-    return True
+    return True, ""
 
 
 def calculate_score(stock):
@@ -140,7 +175,7 @@ def calculate_score(stock):
     stock["trend_score"] = trend_score
     total += trend_score
 
-    # 3. 거래대금 활성도 점수 (15점)
+    # 3. 거래대금 활성도 점수 (15점) — ★ v2 기준 강화
     theme_score = _theme_score(stock)
     stock["theme_score"] = theme_score
     total += theme_score
@@ -217,22 +252,31 @@ def _trend_score(stock):
 
 
 def _theme_score(stock):
-    """거래대금 활성도 점수 (15점)"""
+    """
+    거래대금 활성도 점수 (15점)
+    ★ v2: 기준 강화 — 10억 미만 0점, 구간별 세분화
+    """
     volume = stock.get("volume", 0)
     price = stock.get("price", 0)
     trade_value = volume * price
 
-    if trade_value > 100_000_000_000:
+    # ★ v2: 강화된 기준
+    if trade_value > 1_000_000_000_000:   # 1조 이상
         return 15
-    elif trade_value > 50_000_000_000:
+    elif trade_value > 500_000_000_000:   # 5000억 이상
+        return 13
+    elif trade_value > 100_000_000_000:   # 1000억 이상
         return 12
-    elif trade_value > 10_000_000_000:
-        return 9
-    elif trade_value > 5_000_000_000:
+    elif trade_value > 50_000_000_000:    # 500억 이상
+        return 10
+    elif trade_value > 10_000_000_000:    # 100억 이상
+        return 8
+    elif trade_value > 5_000_000_000:     # 50억 이상
         return 6
-    elif trade_value > 1_000_000_000:
+    elif trade_value > 1_000_000_000:     # 10억 이상
         return 3
-    return 1
+    # ★ 10억 미만은 _passes_filter에서 이미 제거되지만, 방어용 0점
+    return 0
 
 
 def _technical_score(stock):

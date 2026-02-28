@@ -1,4 +1,12 @@
-"""매매 실행 총괄 모듈"""
+"""매매 실행 총괄 모듈
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+★ v2: 시장 상태 매수 게이트 추가
+  - execute_trading_cycle() 최상단에 시장 상태 체크
+  - can_buy == False → 매수 스킵 (매도만 실행)
+  - 기존 보유 종목 매도 체크는 항상 실행
+
+파일경로: app/engine/trade_executor.py
+"""
 from datetime import datetime, date, timedelta
 from app.core.database import db
 from app.services.kis_stock import get_current_price, get_minute_candles, get_orderbook
@@ -13,11 +21,27 @@ from app.utils.indicators import atr, vwap
 # 전략별 트레일링 스톱 인스턴스
 trailing_stops = {}
 
+
 async def execute_trading_cycle():
-    """1분 간격 매매 사이클"""
+    """1분 간격 매매 사이클
+    ★ v2: 시장 상태 게이트 — 하락장에서 신규 매수 자동 차단
+    """
     try:
         print(f"[매매사이클] 실행 시작")
-        
+
+        # ★ v2: 시장 상태 체크 (DB 캐시 우선 → 없으면 실시간 조회)
+        market_can_buy = True
+        market_reason = ""
+        try:
+            from app.services.market_index import get_cached_market_status
+            market_status = get_cached_market_status()
+            market_can_buy = market_status.get("can_buy", True)
+            market_reason = market_status.get("reason", "")
+            if not market_can_buy:
+                print(f"[매매사이클] 🔴 시장 하락 → 신규 매수 차단 ({market_reason})")
+        except Exception as e:
+            print(f"[매매사이클] 시장 상태 조회 실패 (매수 허용으로 진행): {e}")
+
         # 활성 전략 가져오기
         strategies = db.table("strategies").select("*").eq("is_active", True).execute()
         if not strategies.data:
@@ -26,31 +50,39 @@ async def execute_trading_cycle():
         # 감시종목 가져오기
         today = date.today().isoformat()
         watchlist = db.table("watchlist").select("*").eq("scan_date", today).eq("status", "감시중").execute()
-        print(f"[매매사이클] 전략 {len(strategies.data)}개, 감시종목 {len(watchlist.data or [])}개")
-        
+        print(f"[매매사이클] 전략 {len(strategies.data)}개, 감시종목 {len(watchlist.data or [])}개, "
+              f"매수허용={'🟢' if market_can_buy else '🔴'}")
+
         for strategy in strategies.data:
-            await _process_strategy(strategy, watchlist.data or [])
+            await _process_strategy(strategy, watchlist.data or [], market_can_buy)
 
     except Exception as e:
         print(f"[매매 사이클 오류] {e}")
         _log("에러", f"매매 사이클 오류: {e}")
 
-async def _process_strategy(strategy, watchlist):
-    """전략별 매매 처리"""
+
+async def _process_strategy(strategy, watchlist, market_can_buy=True):
+    """전략별 매매 처리
+    ★ v2: market_can_buy 파라미터 추가 — False면 매수 스킵
+    """
     sid = strategy["id"]
     is_live = strategy.get("is_live", False)
 
-    # 1. 보유종목 매도 확인
+    # 1. 보유종목 매도 확인 — ★ 시장 상태와 무관하게 항상 실행
     holdings = db.table("holdings").select("*").eq("strategy_id", sid).execute()
     for holding in (holdings.data or []):
         await _check_sell(strategy, holding, is_live)
 
-    # 2. 신규 매수 확인
+    # 2. 신규 매수 확인 — ★ v2: 시장 하락 시 전체 스킵
+    if not market_can_buy:
+        return
+
     for stock in watchlist:
         # 차단 종목 확인
         if await _is_blocked(sid, stock["stock_code"]):
             continue
         await _check_buy(strategy, stock, is_live)
+
 
 async def _check_buy(strategy, stock, is_live):
     """매수 조건 확인"""
