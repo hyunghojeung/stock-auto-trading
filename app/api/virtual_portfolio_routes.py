@@ -889,6 +889,116 @@ async def get_candles(code: str, days: int = 120):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ 기존 포지션 buy_price 교정 (네이버 종가 기준)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.post("/fix-buy-prices")
+async def fix_buy_prices():
+    """기존 포지션의 buy_price를 네이버 종가로 교정"""
+    import time
+
+    try:
+        # 모든 활성 포지션 조회
+        pos_resp = db.table("virtual_positions") \
+            .select("id, code, name, buy_price, portfolio_id") \
+            .eq("status", "holding") \
+            .execute()
+
+        positions = pos_resp.data or []
+        fixed = []
+        errors = []
+
+        for pos in positions:
+            code = pos["code"]
+            old_price = pos["buy_price"]
+
+            try:
+                candles = get_daily_candles_naver(code, count=3)
+                if not candles:
+                    errors.append(f"{code}: 캔들 데이터 없음")
+                    continue
+
+                new_price = candles[-1].get("close", 0)
+                if new_price <= 0:
+                    errors.append(f"{code}: 종가 0")
+                    continue
+
+                if old_price == new_price:
+                    continue  # 이미 동일
+
+                # buy_price, current_price, peak_price 교정 + 수익률 재계산
+                quantity = pos.get("quantity", 0)
+                invest_amount = pos.get("invest_amount", 0)
+
+                # 수량 재계산 (투자금 / 새 매수가)
+                if invest_amount > 0 and new_price > 0:
+                    commission = invest_amount * COMMISSION_RATE
+                    actual_invest = invest_amount - commission
+                    new_quantity = round(actual_invest / new_price, 4)
+                else:
+                    new_quantity = quantity
+
+                db.table("virtual_positions").update({
+                    "buy_price": new_price,
+                    "current_price": new_price,
+                    "peak_price": new_price,
+                    "quantity": new_quantity,
+                    "profit_pct": 0,
+                    "profit_won": 0,
+                    "updated_at": datetime.now().isoformat(),
+                }).eq("id", pos["id"]).execute()
+
+                fixed.append({
+                    "code": code,
+                    "name": pos["name"],
+                    "old_price": old_price,
+                    "new_price": new_price,
+                    "old_qty": quantity,
+                    "new_qty": new_quantity,
+                })
+                time.sleep(0.3)
+
+            except Exception as e:
+                errors.append(f"{code}: {str(e)}")
+
+        # 포트폴리오 합산 값도 리셋
+        pf_ids = set(pos["portfolio_id"] for pos in positions)
+        for pf_id in pf_ids:
+            all_pos = db.table("virtual_positions") \
+                .select("invest_amount, profit_won, status") \
+                .eq("portfolio_id", pf_id) \
+                .execute()
+
+            total_value = sum(
+                (p.get("invest_amount", 0) + (p.get("profit_won", 0) or 0))
+                for p in (all_pos.data or [])
+            )
+            total_profit = sum(
+                (p.get("profit_won", 0) or 0) for p in (all_pos.data or [])
+            )
+
+            db.table("virtual_portfolios").update({
+                "current_value": round(total_value),
+                "total_return_won": round(total_profit),
+                "total_return_pct": 0,
+                "updated_at": datetime.now().isoformat(),
+            }).eq("id", pf_id).execute()
+
+        logger.info(f"[가상포트] buy_price 교정 완료: {len(fixed)}건 수정, {len(errors)}건 오류")
+
+        return {
+            "success": True,
+            "fixed_count": len(fixed),
+            "fixed": fixed,
+            "errors": errors,
+        }
+
+    except Exception as e:
+        logger.error(f"[가상포트] buy_price 교정 실패: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, str(e))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ★ 복리 그룹 헬퍼 함수
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
