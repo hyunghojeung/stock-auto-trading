@@ -24,6 +24,7 @@ import json
 from datetime import datetime, timedelta
 
 from app.engine.pattern_analyzer import CandleDay, detect_surges
+from app.engine.entry_strategies import evaluate_entry
 from app.services.stock_pattern_collector import is_regular_stock
 
 logger = logging.getLogger(__name__)
@@ -659,6 +660,12 @@ async def _run_scan_task(
         high_manip = sum(1 for r in all_results if r.get("top_manip_level") == "high")
         med_manip = sum(1 for r in all_results if r.get("top_manip_level") == "medium")
 
+        # ★ 진입 시그널 통계
+        entry_signal_count = sum(
+            1 for r in all_results
+            if r.get("entry_signals") and r["entry_signals"].get("should_buy")
+        )
+
         stats = {
             "total_scanned": scanned,
             "total_found": found,
@@ -666,6 +673,7 @@ async def _run_scan_task(
             "deactivated_count": deactivated_total,  # ★ 비활성화 종목 수
             "high_manip_count": high_manip,
             "medium_manip_count": med_manip,
+            "entry_signal_count": entry_signal_count,  # ★ 진입 시그널 종목 수
             "scan_params": scan_params,
         }
 
@@ -771,6 +779,18 @@ async def _scan_single_stock(
         current_price = candles[-1].close
         last_date = candles[-1].date
 
+        # ★ 진입 전략 평가 (OBV + VCP + 부분 DTW)
+        entry_result = None
+        try:
+            candle_dicts = [
+                {"date": c.date, "open": c.open, "high": c.high,
+                 "low": c.low, "close": c.close, "volume": c.volume}
+                for c in candles
+            ]
+            entry_result = evaluate_entry(candle_dicts, clusters=[], strategy_config=None)
+        except Exception as ee:
+            logger.debug(f"[{code}] 진입전략 평가 실패: {ee}")
+
         return {
             "code": code,
             "name": name,
@@ -785,6 +805,7 @@ async def _scan_single_stock(
             "latest_rise_pct": surge_details[0]["rise_pct"] if surge_details else 0,
             "latest_surge_date": surge_details[0]["start_date"] if surge_details else "",
             "latest_from_peak": surge_details[0]["from_peak_pct"] if surge_details else 0,
+            "entry_signals": entry_result if entry_result else None,
         }
 
     except Exception as e:
