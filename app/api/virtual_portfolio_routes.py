@@ -161,7 +161,7 @@ async def register_portfolio(req: RegisterRequest):
             actual_invest = per_stock - commission
             quantity = actual_invest / buy_price
 
-            positions.append({
+            pos_data = {
                 "portfolio_id": portfolio_id,
                 "code": stock["code"],
                 "name": stock.get("name", stock["code"]),
@@ -179,7 +179,12 @@ async def register_portfolio(req: RegisterRequest):
                 }]),
                 "buy_date": now,
                 "updated_at": now,
-            })
+            }
+            if stock.get("pattern_id"):
+                pos_data["pattern_id"] = stock["pattern_id"]
+            if stock.get("pattern_name"):
+                pos_data["pattern_name"] = stock["pattern_name"]
+            positions.append(pos_data)
 
         if positions:
             db.table("virtual_positions").insert(positions).execute()
@@ -1195,7 +1200,7 @@ async def create_compound_group(req: CompoundCreateRequest):
                 actual_invest = per_stock - commission
                 quantity = actual_invest / buy_price
 
-                positions.append({
+                pos_data = {
                     "portfolio_id": portfolio_id,
                     "code": code,
                     "name": stock.get("name", code),
@@ -1207,7 +1212,12 @@ async def create_compound_group(req: CompoundCreateRequest):
                     "peak_price": buy_price,
                     "similarity": stock.get("similarity", 0),
                     "signal": stock.get("signal", ""),
-                })
+                }
+                if stock.get("pattern_id"):
+                    pos_data["pattern_id"] = stock["pattern_id"]
+                if stock.get("pattern_name"):
+                    pos_data["pattern_name"] = stock["pattern_name"]
+                positions.append(pos_data)
 
             if positions:
                 db.table("virtual_positions").insert(positions).execute()
@@ -1371,7 +1381,7 @@ async def start_next_round(group_id: int, req: CompoundNextRoundRequest):
             actual_invest = per_stock - commission
             quantity = actual_invest / buy_price
 
-            positions.append({
+            pos_data = {
                 "portfolio_id": portfolio_id,
                 "code": code,
                 "name": stock.get("name", code),
@@ -1383,7 +1393,12 @@ async def start_next_round(group_id: int, req: CompoundNextRoundRequest):
                 "peak_price": buy_price,
                 "similarity": stock.get("similarity", 0),
                 "signal": stock.get("signal", ""),
-            })
+            }
+            if stock.get("pattern_id"):
+                pos_data["pattern_id"] = stock["pattern_id"]
+            if stock.get("pattern_name"):
+                pos_data["pattern_name"] = stock["pattern_name"]
+            positions.append(pos_data)
 
         if positions:
             db.table("virtual_positions").insert(positions).execute()

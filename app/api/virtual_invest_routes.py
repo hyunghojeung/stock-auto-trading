@@ -278,6 +278,7 @@ async def realtime_start(req: RealtimeStartRequest):
                     "signal": s.get("signal", ""),
                 }
                 # ★ 패턴 라이브러리 연동
+                logger.info(f"[가상투자] 종목 {s.get('name')} pattern_id={s.get('pattern_id')}, pattern_name={s.get('pattern_name')}")
                 if s.get("pattern_id"):
                     pos_data["pattern_id"] = s["pattern_id"]
                 if s.get("pattern_name"):
