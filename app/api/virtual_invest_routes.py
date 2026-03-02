@@ -264,7 +264,7 @@ async def realtime_start(req: RealtimeStartRequest):
                 qty = int(per_stock / buy_price) if buy_price > 0 else 0
                 invest = qty * buy_price
 
-                positions.append({
+                pos_data = {
                     "portfolio_id": portfolio_id,
                     "code": s.get("code", ""),
                     "name": s.get("name", ""),
@@ -276,7 +276,13 @@ async def realtime_start(req: RealtimeStartRequest):
                     "peak_price": buy_price,
                     "similarity": s.get("similarity", 0),
                     "signal": s.get("signal", ""),
-                })
+                }
+                # ★ 패턴 라이브러리 연동
+                if s.get("pattern_id"):
+                    pos_data["pattern_id"] = s["pattern_id"]
+                if s.get("pattern_name"):
+                    pos_data["pattern_name"] = s["pattern_name"]
+                positions.append(pos_data)
 
             if positions:
                 supabase.table("virtual_positions").insert(positions).execute()

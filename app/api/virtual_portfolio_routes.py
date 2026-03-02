@@ -437,6 +437,23 @@ async def update_prices(portfolio_id: int):
                     else:
                         loss += 1
 
+                    # ★ 패턴 성과 자동 기록
+                    if pos.get("pattern_id"):
+                        try:
+                            p_resp = db.table("saved_patterns").select(
+                                "total_trades, win_trades, total_profit_pct"
+                            ).eq("id", pos["pattern_id"]).single().execute()
+                            if p_resp.data:
+                                pc = p_resp.data
+                                db.table("saved_patterns").update({
+                                    "total_trades": (pc.get("total_trades") or 0) + 1,
+                                    "win_trades": (pc.get("win_trades") or 0) + (1 if profit_won > 0 else 0),
+                                    "total_profit_pct": round((pc.get("total_profit_pct") or 0) + net_pct, 2),
+                                    "updated_at": now,
+                                }).eq("id", pos["pattern_id"]).execute()
+                        except Exception as pe:
+                            logger.warning(f"패턴 성과 기록 실패: {pe}")
+
                 db.table("virtual_positions") \
                     .update(update_data) \
                     .eq("id", pos["id"]) \

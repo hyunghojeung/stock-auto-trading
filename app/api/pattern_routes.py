@@ -854,3 +854,281 @@ async def search_stock(req: SearchRequest):
         results.append({"code": keyword, "name": f"종목코드 {keyword}"})
 
     return {"results": results}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ 패턴 라이브러리 — 저장/조회/수정/삭제/스캔
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class SavePatternRequest(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    session_id: Optional[str] = None
+    cluster_id: Optional[int] = None
+    avg_return_flow: list
+    avg_volume_flow: Optional[list] = None
+    avg_rsi_flow: Optional[list] = None
+    avg_ma_dist_flow: Optional[list] = None
+    avg_similarity: Optional[float] = 0
+    avg_rise_pct: Optional[float] = 0
+    avg_rise_days: Optional[float] = 0
+    member_count: Optional[int] = 0
+    members: Optional[list] = []
+    confidence: Optional[float] = 0
+    tags: Optional[list] = []
+
+
+class UpdatePatternRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    tags: Optional[list] = None
+    is_active: Optional[bool] = None
+
+
+class PatternScanRequest(BaseModel):
+    pattern_ids: List[str]
+    min_similarity: float = 60
+    market: str = "ALL"
+    limit: int = 50
+
+
+class RecordTradeRequest(BaseModel):
+    profit_pct: float
+    is_win: bool
+
+
+@router.post("/library/save")
+async def save_pattern(req: SavePatternRequest):
+    """클러스터 패턴을 라이브러리에 저장"""
+    try:
+        data = {
+            "name": req.name,
+            "description": req.description or "",
+            "source_session_id": req.session_id,
+            "source_cluster_id": req.cluster_id,
+            "avg_return_flow": req.avg_return_flow,
+            "avg_volume_flow": req.avg_volume_flow,
+            "avg_rsi_flow": req.avg_rsi_flow,
+            "avg_ma_dist_flow": req.avg_ma_dist_flow,
+            "avg_similarity": req.avg_similarity or 0,
+            "avg_rise_pct": req.avg_rise_pct or 0,
+            "avg_rise_days": req.avg_rise_days or 0,
+            "member_count": req.member_count or 0,
+            "member_codes": req.members or [],
+            "confidence": req.confidence or 0,
+            "tags": req.tags or [],
+            "is_active": True,
+            "use_count": 0,
+            "total_trades": 0,
+            "win_trades": 0,
+            "total_profit_pct": 0,
+        }
+        resp = db.table("saved_patterns").insert(data).execute()
+        new_id = resp.data[0]["id"] if resp.data else None
+        logger.info(f"패턴 저장 완료: {req.name} (id={new_id})")
+        return {"success": True, "pattern_id": new_id, "message": "패턴이 저장되었습니다"}
+    except Exception as e:
+        logger.error(f"패턴 저장 실패: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@router.get("/library/list")
+async def list_saved_patterns():
+    """저장된 패턴 목록 조회 (성과 통계 포함)"""
+    try:
+        resp = (
+            db.table("saved_patterns")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
+        patterns = resp.data or []
+        return {"success": True, "patterns": patterns, "count": len(patterns)}
+    except Exception as e:
+        logger.error(f"패턴 목록 조회 실패: {e}")
+        return {"success": False, "patterns": [], "message": str(e)}
+
+
+@router.put("/library/{pattern_id}")
+async def update_saved_pattern(pattern_id: str, req: UpdatePatternRequest):
+    """저장된 패턴 수정 (이름/태그/활성상태)"""
+    try:
+        update_data = {}
+        if req.name is not None:
+            update_data["name"] = req.name
+        if req.description is not None:
+            update_data["description"] = req.description
+        if req.tags is not None:
+            update_data["tags"] = req.tags
+        if req.is_active is not None:
+            update_data["is_active"] = req.is_active
+        if not update_data:
+            return {"success": False, "message": "수정할 항목이 없습니다"}
+        update_data["updated_at"] = "now()"
+        db.table("saved_patterns").update(update_data).eq("id", pattern_id).execute()
+        logger.info(f"패턴 수정 완료: {pattern_id}")
+        return {"success": True, "message": "패턴이 수정되었습니다"}
+    except Exception as e:
+        logger.error(f"패턴 수정 실패: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@router.delete("/library/{pattern_id}")
+async def delete_saved_pattern(pattern_id: str):
+    """저장된 패턴 삭제"""
+    try:
+        db.table("saved_patterns").delete().eq("id", pattern_id).execute()
+        logger.info(f"패턴 삭제 완료: {pattern_id}")
+        return {"success": True, "message": "패턴이 삭제되었습니다"}
+    except Exception as e:
+        logger.error(f"패턴 삭제 실패: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@router.post("/library/scan")
+async def scan_with_saved_patterns(req: PatternScanRequest):
+    """저장된 패턴으로 전종목 매칭 스캔"""
+    try:
+        # 1) 요청된 패턴 로드
+        patterns_resp = (
+            db.table("saved_patterns")
+            .select("id, name, avg_return_flow, avg_volume_flow")
+            .in_("id", req.pattern_ids)
+            .execute()
+        )
+        patterns = patterns_resp.data or []
+        if not patterns:
+            return {"success": False, "message": "선택된 패턴이 없습니다", "matches": []}
+
+        # avg_return_flow 파싱
+        for p in patterns:
+            if isinstance(p.get("avg_return_flow"), str):
+                p["avg_return_flow"] = json.loads(p["avg_return_flow"])
+            if isinstance(p.get("avg_volume_flow"), str):
+                p["avg_volume_flow"] = json.loads(p["avg_volume_flow"])
+
+        # 2) 전종목 벡터 로드
+        query = db.table("stock_patterns").select(
+            "code, name, market, returns_30d, volumes_30d, last_close, last_date"
+        )
+        if req.market and req.market != "ALL":
+            query = query.ilike("market", req.market)
+        stock_resp = query.execute()
+        all_stocks = stock_resp.data or []
+
+        if not all_stocks:
+            return {"success": False, "message": "stock_patterns 데이터가 없습니다", "matches": []}
+
+        # 3) DTW 매칭
+        matches = []
+        for stock in all_stocks:
+            try:
+                returns_raw = stock.get("returns_30d", [])
+                volumes_raw = stock.get("volumes_30d", [])
+                if isinstance(returns_raw, str):
+                    returns_raw = json.loads(returns_raw)
+                if isinstance(volumes_raw, str):
+                    volumes_raw = json.loads(volumes_raw)
+                if not returns_raw:
+                    continue
+
+                best_sim = 0
+                best_pattern_id = None
+                best_pattern_name = None
+
+                for p in patterns:
+                    p_returns = p.get("avg_return_flow", [])
+                    p_volumes = p.get("avg_volume_flow", [])
+                    if not p_returns:
+                        continue
+
+                    sim_r = dtw_similarity(returns_raw[-len(p_returns):], p_returns)
+                    sim_v = 0
+                    if p_volumes and volumes_raw:
+                        sim_v = dtw_similarity(volumes_raw[-len(p_volumes):], p_volumes)
+                    sim = sim_r * 0.6 + sim_v * 0.4 if sim_v > 0 else sim_r
+
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_pattern_id = p["id"]
+                        best_pattern_name = p["name"]
+
+                if best_sim >= req.min_similarity:
+                    matches.append({
+                        "code": stock["code"],
+                        "name": stock["name"],
+                        "market": stock.get("market", ""),
+                        "current_price": stock.get("last_close", 0),
+                        "similarity": round(best_sim, 1),
+                        "matched_pattern_id": best_pattern_id,
+                        "matched_pattern_name": best_pattern_name,
+                        "returns_30d": returns_raw[-10:],
+                        "last_date": stock.get("last_date", ""),
+                    })
+            except Exception:
+                continue
+
+        # 유사도 높은 순 정렬
+        matches.sort(key=lambda x: x["similarity"], reverse=True)
+        matches = matches[:req.limit]
+
+        # use_count 증가
+        for pid in req.pattern_ids:
+            try:
+                cur = db.table("saved_patterns").select("use_count").eq("id", pid).single().execute()
+                cnt = (cur.data.get("use_count") or 0) + 1 if cur.data else 1
+                db.table("saved_patterns").update(
+                    {"use_count": cnt, "last_used_at": "now()"}
+                ).eq("id", pid).execute()
+            except Exception:
+                pass
+
+        # 패턴별 매치 통계
+        pattern_stats = {}
+        for m in matches:
+            pid = m["matched_pattern_id"]
+            if pid not in pattern_stats:
+                pattern_stats[pid] = {"id": pid, "name": m["matched_pattern_name"], "match_count": 0}
+            pattern_stats[pid]["match_count"] += 1
+
+        logger.info(f"패턴 스캔 완료: {len(all_stocks)}개 중 {len(matches)}개 매칭")
+        return {
+            "success": True,
+            "total_scanned": len(all_stocks),
+            "matches": matches,
+            "patterns_used": list(pattern_stats.values()),
+        }
+    except Exception as e:
+        logger.error(f"패턴 스캔 실패: {traceback.format_exc()}")
+        return {"success": False, "message": str(e), "matches": []}
+
+
+@router.post("/library/{pattern_id}/record-trade")
+async def record_pattern_trade(pattern_id: str, req: RecordTradeRequest):
+    """패턴 성과 기록 (포지션 종료 시 호출)"""
+    try:
+        # 현재 통계 조회
+        resp = db.table("saved_patterns").select(
+            "total_trades, win_trades, total_profit_pct"
+        ).eq("id", pattern_id).single().execute()
+
+        if not resp.data:
+            return {"success": False, "message": "패턴을 찾을 수 없습니다"}
+
+        current = resp.data
+        new_total = (current.get("total_trades") or 0) + 1
+        new_wins = (current.get("win_trades") or 0) + (1 if req.is_win else 0)
+        new_profit = (current.get("total_profit_pct") or 0) + req.profit_pct
+
+        db.table("saved_patterns").update({
+            "total_trades": new_total,
+            "win_trades": new_wins,
+            "total_profit_pct": round(new_profit, 2),
+            "updated_at": "now()",
+        }).eq("id", pattern_id).execute()
+
+        logger.info(f"패턴 {pattern_id} 성과 기록: profit={req.profit_pct}%, win={req.is_win}")
+        return {"success": True, "message": "성과가 기록되었습니다"}
+    except Exception as e:
+        logger.error(f"패턴 성과 기록 실패: {e}")
+        return {"success": False, "message": str(e)}
