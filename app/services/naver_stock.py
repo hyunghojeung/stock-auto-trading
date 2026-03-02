@@ -28,6 +28,44 @@ RETRY_DELAYS = [2, 5, 10]  # 3단계 재시도 간격(초) / 3-step retry delays
 MAX_RETRIES = len(RETRY_DELAYS)
 
 
+def get_realtime_price_naver(code: str) -> Optional[Dict]:
+    """
+    네이버 금융에서 실시간 현재가를 조회합니다.
+    Returns: {"price": 현재가, "open": 시가, "high": 고가, "low": 저가, "volume": 거래량} or None
+    """
+    url = f"https://finance.naver.com/item/sise_day.naver?code={code}&page=1"
+    try:
+        # 네이버 시세 페이지 대신 JSON API 사용
+        api_url = f"https://m.stock.naver.com/api/stock/{code}/basic"
+        res = requests.get(api_url, timeout=10, headers={
+            "User-Agent": "Mozilla/5.0"
+        })
+        if res.status_code == 200:
+            data = res.json()
+            price_info = data.get("dealTrendInfos", [{}])
+            current = data.get("stockEndPrice") or data.get("closePrice")
+
+            # 모바일 API에서 현재가 추출
+            if current:
+                return {
+                    "price": int(str(current).replace(",", "")),
+                    "name": data.get("stockName", code),
+                }
+
+        # 폴백: 네이버 시세 API (chartdata)
+        candles = get_daily_candles_naver(code, count=1)
+        if candles:
+            return {
+                "price": candles[-1].get("close", 0),
+                "name": code,
+            }
+
+    except Exception as e:
+        logger.warning(f"[네이버 현재가] {code} 조회 실패: {e}")
+
+    return None
+
+
 def get_daily_candles_naver(code: str, count: int = 250) -> List[Dict]:
     """
     네이버 금융에서 일봉 데이터를 가져옵니다 (캔들만 반환).

@@ -21,8 +21,8 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
 from app.core.database import db
-from app.utils.kr_holiday import is_market_open_day, get_market_status
-from app.services.naver_stock import get_daily_candles_naver
+from app.utils.kr_holiday import is_market_open_day, get_market_status, is_market_open_now
+from app.services.naver_stock import get_daily_candles_naver, get_realtime_price_naver
 
 logger = logging.getLogger(__name__)
 
@@ -135,13 +135,21 @@ async def register_portfolio(req: RegisterRequest):
         for stock in req.stocks:
             code = stock["code"]
 
-            # ★ 서버에서 네이버 시가(open)를 직접 조회하여 buy_price 결정
+            # ★ 매수가 결정: 장중이면 실시간 현재가, 아니면 당일 시가
             try:
-                candles = get_daily_candles_naver(code, count=3)
-                if candles and len(candles) > 0:
-                    buy_price = candles[-1].get("open", 0) or candles[-1].get("close", 0)
+                if is_market_open_now():
+                    rt = get_realtime_price_naver(code)
+                    buy_price = rt["price"] if rt and rt.get("price", 0) > 0 else 0
                 else:
-                    buy_price = stock.get("current_price", 0)
+                    buy_price = 0
+
+                # 실시간 조회 실패 시 → 일봉 시가 폴백
+                if buy_price <= 0:
+                    candles = get_daily_candles_naver(code, count=3)
+                    if candles and len(candles) > 0:
+                        buy_price = candles[-1].get("open", 0) or candles[-1].get("close", 0)
+                    else:
+                        buy_price = stock.get("current_price", 0)
             except Exception:
                 buy_price = stock.get("current_price", 0)
 
