@@ -14,6 +14,7 @@ Virtual Portfolio Tracking API Routes
 import json
 import math
 import logging
+import asyncio
 import traceback
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -219,13 +220,24 @@ async def list_portfolios():
 
         portfolios = resp.data or []
 
-        # 각 포트폴리오에 종목 요약 추가
-        for pf in portfolios:
-            pos_resp = db.table("virtual_positions") \
-                .select("code, name, status, profit_pct, pattern_id, pattern_name") \
-                .eq("portfolio_id", pf["id"]) \
+        # ★ N+1 제거: 전체 포지션을 1회 쿼리로 로드 후 메모리에서 그룹화
+        pf_ids = [pf["id"] for pf in portfolios]
+        if pf_ids:
+            all_pos_resp = db.table("virtual_positions") \
+                .select("portfolio_id, code, name, status, profit_pct, pattern_id, pattern_name") \
+                .in_("portfolio_id", pf_ids) \
                 .execute()
-            pf["positions_summary"] = pos_resp.data or []
+            pos_by_pf = {}
+            for pos in (all_pos_resp.data or []):
+                pid = pos["portfolio_id"]
+                if pid not in pos_by_pf:
+                    pos_by_pf[pid] = []
+                pos_by_pf[pid].append(pos)
+            for pf in portfolios:
+                pf["positions_summary"] = pos_by_pf.get(pf["id"], [])
+        else:
+            for pf in portfolios:
+                pf["positions_summary"] = []
 
         return {"portfolios": portfolios}
 
@@ -312,6 +324,21 @@ async def update_prices(portfolio_id: int):
         if not positions:
             return {"message": "보유 중인 종목이 없습니다", "updated": 0}
 
+        # ★ 네이버 API 병렬 호출 — 모든 종목의 가격을 한번에 조회
+        codes = [pos["code"] for pos in positions]
+
+        async def _fetch_one(code):
+            try:
+                return await asyncio.to_thread(get_daily_candles_naver, code, 3)
+            except Exception:
+                return None
+
+        candles_results = await asyncio.gather(*[_fetch_one(c) for c in codes])
+        candles_map = {}
+        for code, candles in zip(codes, candles_results):
+            if candles:
+                candles_map[code] = candles
+
         now = datetime.now().isoformat()
         today = now[:10]
         updated_count = 0
@@ -324,7 +351,7 @@ async def update_prices(portfolio_id: int):
         for pos in positions:
             code = pos["code"]
             try:
-                candles = get_daily_candles_naver(code, count=3)
+                candles = candles_map.get(code)
                 if not candles:
                     continue
 
