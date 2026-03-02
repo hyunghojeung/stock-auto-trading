@@ -217,7 +217,7 @@ async def list_portfolios():
         # 각 포트폴리오에 종목 요약 추가
         for pf in portfolios:
             pos_resp = db.table("virtual_positions") \
-                .select("code, name, status, profit_pct") \
+                .select("code, name, status, profit_pct, pattern_id, pattern_name") \
                 .eq("portfolio_id", pf["id"]) \
                 .execute()
             pf["positions_summary"] = pos_resp.data or []
