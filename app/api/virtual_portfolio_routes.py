@@ -135,11 +135,11 @@ async def register_portfolio(req: RegisterRequest):
         for stock in req.stocks:
             code = stock["code"]
 
-            # ★ 서버에서 네이버 종가를 직접 조회하여 buy_price 결정
+            # ★ 서버에서 네이버 시가(open)를 직접 조회하여 buy_price 결정
             try:
                 candles = get_daily_candles_naver(code, count=3)
                 if candles and len(candles) > 0:
-                    buy_price = candles[-1].get("close", 0)
+                    buy_price = candles[-1].get("open", 0) or candles[-1].get("close", 0)
                 else:
                     buy_price = stock.get("current_price", 0)
             except Exception:
@@ -918,7 +918,7 @@ async def fix_buy_prices():
                     errors.append(f"{code}: 캔들 데이터 없음")
                     continue
 
-                new_price = candles[-1].get("close", 0)
+                new_price = candles[-1].get("open", 0) or candles[-1].get("close", 0)
                 if new_price <= 0:
                     errors.append(f"{code}: 종가 0")
                     continue
