@@ -30,7 +30,13 @@ from app.engine.pattern_analyzer import (
     run_pattern_analysis,
 )
 
-# dtw_similarity가 pattern_analyzer에서 import 가능하면 사용, 아니면 내장 버전 사용
+# dtw_similarity + z_normalize 캐시 함수
+try:
+    from app.engine.pattern_analyzer import dtw_similarity, _z_normalize_cached
+except ImportError:
+    def _z_normalize_cached(s):
+        return s
+
 try:
     from app.engine.pattern_analyzer import dtw_similarity
 except ImportError:
@@ -247,9 +253,19 @@ def _match_from_db_vectors(
 ) -> list:
     """
     ★ DB 벡터 기반 전종목 매칭 — 네이버 API 호출 없음, 수초 완료
+    [v5] 사전 정규화 + early exit 최적화
     """
     if progress_callback:
         progress_callback(80, f"DB에서 {len(pattern_rows)}개 종목 벡터 비교 중...")
+
+    # ★ v5: 클러스터 벡터 사전 정규화 (루프 밖 1회)
+    for cluster in valid_clusters:
+        ret_flow = cluster.get("avg_return_flow", [])
+        vol_flow = cluster.get("avg_volume_flow", [])
+        if ret_flow and "_norm_returns" not in cluster:
+            cluster["_norm_returns"] = _z_normalize_cached(ret_flow)
+        if vol_flow and "_norm_volumes" not in cluster:
+            cluster["_norm_volumes"] = _z_normalize_cached(vol_flow)
 
     recommendations = []
     total = len(pattern_rows)
@@ -283,14 +299,21 @@ def _match_from_db_vectors(
         except Exception:
             continue
 
-        # 각 클러스터와 DTW 유사도 비교
+        # ★ v5: 사전 정규화 + early exit DTW 비교
         best_sim = 0
         best_cluster_id = 0
+        norm_ret = _z_normalize_cached(current_returns)
+        norm_vol = _z_normalize_cached(current_volumes)
 
         for cluster in valid_clusters:
             try:
-                sim_r = dtw_similarity(current_returns, cluster["avg_return_flow"])
-                sim_v = dtw_similarity(current_volumes, cluster["avg_volume_flow"])
+                c_ret = cluster.get("_norm_returns", cluster.get("avg_return_flow", []))
+                sim_r = dtw_similarity(norm_ret, c_ret, normalize=False)
+                # early exit: 등락률 유사도가 낮으면 거래량 계산 스킵
+                if sim_r * 0.6 + 100 * 0.4 < best_sim:
+                    continue
+                c_vol = cluster.get("_norm_volumes", cluster.get("avg_volume_flow", []))
+                sim_v = dtw_similarity(norm_vol, c_vol, normalize=False)
                 sim = sim_r * 0.6 + sim_v * 0.4
 
                 if sim > best_sim:
@@ -389,6 +412,15 @@ async def _match_realtime_fallback(
 
         candidates = sampled
 
+    # ── ★ v5: 클러스터 벡터 사전 정규화 (루프 밖에서 1회) ──
+    for cluster in valid_clusters:
+        ret_flow = cluster.get("avg_return_flow", [])
+        vol_flow = cluster.get("avg_volume_flow", [])
+        if ret_flow:
+            cluster["_norm_returns"] = _z_normalize_cached(ret_flow)
+        if vol_flow:
+            cluster["_norm_volumes"] = _z_normalize_cached(vol_flow)
+
     # ── 캔들 수집 + 벡터 계산 + DTW 비교 ──
     if progress_callback:
         progress_callback(80, f"후보 {len(candidates)}개 캔들 수집 중 (fallback)...")
@@ -417,16 +449,25 @@ async def _match_realtime_fallback(
         except Exception:
             continue
 
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.1)  # ★ v5: 0.15→0.1초 (총 33% 시간 단축)
 
-        # DTW 비교
+        # DTW 비교 — ★ v5: 사전 정규화 + early exit
         best_sim = 0
         best_cluster_id = 0
 
+        # 사전 정규화 (클러스터 루프 밖에서 1회만)
+        norm_returns = _z_normalize_cached(current_returns) if current_returns else current_returns
+        norm_volumes = _z_normalize_cached(current_volumes) if current_volumes else current_volumes
+
         for cluster in valid_clusters:
             try:
-                sim_r = dtw_similarity(current_returns, cluster["avg_return_flow"])
-                sim_v = dtw_similarity(current_volumes, cluster["avg_volume_flow"])
+                # ★ 등락률 먼저 계산 → 낮으면 거래량 스킵 (early exit)
+                c_ret = cluster.get("_norm_returns") or cluster.get("avg_return_flow", [])
+                sim_r = dtw_similarity(norm_returns, c_ret, normalize=False)
+                if sim_r * 0.6 + 100 * 0.4 < best_sim:
+                    continue  # 거래량 100%여도 현재 best 못 이김
+                c_vol = cluster.get("_norm_volumes") or cluster.get("avg_volume_flow", [])
+                sim_v = dtw_similarity(norm_volumes, c_vol, normalize=False)
                 sim = sim_r * 0.6 + sim_v * 0.4
                 if sim > best_sim:
                     best_sim = sim

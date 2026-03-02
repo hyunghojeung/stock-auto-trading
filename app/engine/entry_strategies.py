@@ -490,12 +490,19 @@ def evaluate_entry(
     )
 
     # ── 전략 3: 부분 DTW 매칭 ──
-    partial_dtw_result = detect_partial_dtw(
-        candles,
-        clusters,
-        match_pct=config.get("partial_match_pct", 40),
-        min_similarity=config.get("partial_min_similarity", 50),
-    )
+    # ★ v5: skip_dtw 옵션 또는 clusters가 비어있으면 스킵 (불필요한 계산 제거)
+    if config.get("skip_dtw") or not clusters:
+        partial_dtw_result = {
+            "signal": False, "score": 0, "similarity": 0,
+            "best_cluster_id": -1, "detail": "DTW 스킵 (클러스터 없음)"
+        }
+    else:
+        partial_dtw_result = detect_partial_dtw(
+            candles,
+            clusters,
+            match_pct=config.get("partial_match_pct", 40),
+            min_similarity=config.get("partial_min_similarity", 50),
+        )
 
     # ── 가중 합산 ──
     w_obv = weights.get("obv", 0.35)

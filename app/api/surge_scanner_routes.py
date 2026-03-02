@@ -5,7 +5,7 @@ All-Stock Surge Scanner — API Routes (v2 with DB persistence)
 파일경로: app/api/surge_scanner_routes.py
 
 스캔 결과를 Supabase에 저장하여 재접속 시 자동 로드합니다.
-네이버 차단 방지: batch_size=3, delay=1.5초, 재시도 3회, 차단감지 60초대기
+네이버 차단 방지: batch_size=5, delay=1.0초, 재시도 3회, 차단감지 60초대기
 
 POST /api/scanner/start      — 스캔 시작 (비동기)
 GET  /api/scanner/progress    — 진행률 확인
@@ -58,7 +58,7 @@ class ScanRequest(BaseModel):
     rise_pct: float = 30.0
     rise_window: int = 5
     min_volume_ratio: float = 2.0
-    batch_size: int = 3          # ← 최안전 설정 (동시 3개씩)
+    batch_size: int = 5          # ★ v5: 3→5 (안전+속도 균형, 총 40% 시간 단축)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -650,8 +650,8 @@ async def _run_scan_task(
                 + (f", {deactivated_total}개 비활성화" if deactivated_total else "")
             )
 
-            # ── 안전 딜레이: 1.5초 (네이버 차단 방지) ──
-            await asyncio.sleep(1.5)
+            # ── ★ v5: 안전 딜레이 1.0초 (batch_size 5에 맞게 조정) ──
+            await asyncio.sleep(1.0)
 
         # ── 결과 정리 ──
         all_results.sort(key=lambda r: r.get("top_manip_score", 0), reverse=True)
@@ -779,7 +779,7 @@ async def _scan_single_stock(
         current_price = candles[-1].close
         last_date = candles[-1].date
 
-        # ★ 진입 전략 평가 (OBV + VCP + 부분 DTW)
+        # ★ v5: 진입 전략 평가 (OBV + VCP만, DTW는 clusters=[]이므로 스킵 설정)
         entry_result = None
         try:
             candle_dicts = [
@@ -787,7 +787,8 @@ async def _scan_single_stock(
                  "low": c.low, "close": c.close, "volume": c.volume}
                 for c in candles
             ]
-            entry_result = evaluate_entry(candle_dicts, clusters=[], strategy_config=None)
+            # clusters=[] → 부분 DTW 자동 스킵됨 (OBV + VCP만 평가)
+            entry_result = evaluate_entry(candle_dicts, clusters=[], strategy_config={"skip_dtw": True})
         except Exception as ee:
             logger.debug(f"[{code}] 진입전략 평가 실패: {ee}")
 
