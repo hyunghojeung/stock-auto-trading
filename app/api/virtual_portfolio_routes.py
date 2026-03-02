@@ -849,6 +849,31 @@ async def delete_portfolio(portfolio_id: int):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 7-2. 포트폴리오 일괄 삭제
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.post("/batch-delete")
+async def batch_delete_portfolios(body: dict):
+    """여러 포트폴리오 일괄 삭제"""
+    ids = body.get("ids", [])
+    if not ids:
+        raise HTTPException(400, "삭제할 포트폴리오 ID가 없습니다")
+    try:
+        deleted = []
+        errors = []
+        for pid in ids:
+            try:
+                db.table("virtual_portfolios").delete().eq("id", pid).execute()
+                deleted.append(pid)
+            except Exception as e:
+                errors.append(f"ID {pid}: {str(e)}")
+        return {"success": True, "deleted": deleted, "errors": errors,
+                "message": f"{len(deleted)}개 삭제 완료"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 8. 종목 캔들 데이터 조회 (차트용)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
