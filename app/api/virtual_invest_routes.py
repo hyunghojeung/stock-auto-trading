@@ -48,7 +48,12 @@ class StockInput(BaseModel):
     code: str
     name: str = ""
     buy_price: float = 0
+    current_price: float = 0
     signal_date: str = ""
+    similarity: float = 0
+    signal: str = ""
+    pattern_id: Optional[str] = None
+    pattern_name: Optional[str] = None
 
 
 class CustomParams(BaseModel):
