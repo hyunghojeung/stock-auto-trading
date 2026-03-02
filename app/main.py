@@ -33,9 +33,9 @@ async def lifespan(app: FastAPI):
         pattern_scheduler = BackgroundScheduler(timezone=pytz.timezone("Asia/Seoul"))
         pattern_scheduler.add_job(
             run_pattern_collection,
-            CronTrigger(hour=18, minute=30, timezone=pytz.timezone("Asia/Seoul")),
+            CronTrigger(hour=18, minute=30, day_of_week="mon-fri", timezone=pytz.timezone("Asia/Seoul")),
             id="pattern_vector_collection",
-            name="전종목 패턴 벡터 수집",
+            name="전종목 패턴 벡터 수집 (평일만)",
             replace_existing=True,
         )
         pattern_scheduler.start()
@@ -53,9 +53,9 @@ async def lifespan(app: FastAPI):
         pf_scheduler = BackgroundScheduler(timezone=pytz.timezone("Asia/Seoul"))
         pf_scheduler.add_job(
             update_all_active_portfolios,
-            CronTrigger(hour=18, minute=35, timezone=pytz.timezone("Asia/Seoul")),
+            CronTrigger(hour=18, minute=35, day_of_week="mon-fri", timezone=pytz.timezone("Asia/Seoul")),
             id="virtual_portfolio_update",
-            name="가상포트 일괄 가격 갱신",
+            name="가상포트 일괄 가격 갱신 (평일만)",
             replace_existing=True,
         )
         pf_scheduler.start()

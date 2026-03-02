@@ -21,6 +21,7 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
 from app.core.database import db
+from app.utils.kr_holiday import is_market_open_day, get_market_status
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,12 @@ async def register_portfolio(req: RegisterRequest):
     """매수추천 종목으로 가상투자 포트폴리오 등록"""
     if not req.stocks or len(req.stocks) == 0:
         raise HTTPException(400, "종목을 선택해주세요")
+
+    # ★ 장 운영일 체크 — 주말/공휴일에는 포트폴리오 등록 불가
+    today = datetime.now().date()
+    if not is_market_open_day(today):
+        status = get_market_status()
+        raise HTTPException(400, f"현재 {status} — 장 운영일에만 포트폴리오를 등록할 수 있습니다")
 
     now = datetime.now().isoformat()
     name = req.name or f"포트폴리오 {now[:10]}"
@@ -559,6 +566,12 @@ def update_all_active_portfolios():
     """매일 18:35 스케줄러에서 호출 — 모든 활성 포트폴리오 가격 갱신"""
     import requests
     import time
+
+    # ★ 장 운영일이 아니면 스킵
+    today = datetime.now().date()
+    if not is_market_open_day(today):
+        logger.info(f"[가상포트] 장 운영일이 아님 ({get_market_status()}) — 일괄 갱신 스킵")
+        return
 
     try:
         resp = db.table("virtual_portfolios") \
