@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from app.core.database import db
 from app.utils.kr_holiday import is_market_open_day, get_market_status
+from app.services.naver_stock import get_daily_candles_naver
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +133,18 @@ async def register_portfolio(req: RegisterRequest):
         positions = []
 
         for stock in req.stocks:
-            buy_price = stock.get("current_price", 0)
+            code = stock["code"]
+
+            # ★ 서버에서 네이버 종가를 직접 조회하여 buy_price 결정
+            try:
+                candles = get_daily_candles_naver(code, count=3)
+                if candles and len(candles) > 0:
+                    buy_price = candles[-1].get("close", 0)
+                else:
+                    buy_price = stock.get("current_price", 0)
+            except Exception:
+                buy_price = stock.get("current_price", 0)
+
             if buy_price <= 0:
                 continue
 
@@ -1006,7 +1018,17 @@ async def create_compound_group(req: CompoundCreateRequest):
             per_stock = req.seed_money / len(req.stocks)
             positions = []
             for stock in req.stocks:
-                buy_price = stock.get("current_price", stock.get("buy_price", 0))
+                code = stock["code"]
+                # ★ 서버에서 네이버 종가 직접 조회
+                try:
+                    candles = get_daily_candles_naver(code, count=3)
+                    if candles and len(candles) > 0:
+                        buy_price = candles[-1].get("close", 0)
+                    else:
+                        buy_price = stock.get("current_price", stock.get("buy_price", 0))
+                except Exception:
+                    buy_price = stock.get("current_price", stock.get("buy_price", 0))
+
                 if buy_price <= 0:
                     continue
                 commission = per_stock * COMMISSION_RATE
@@ -1015,8 +1037,8 @@ async def create_compound_group(req: CompoundCreateRequest):
 
                 positions.append({
                     "portfolio_id": portfolio_id,
-                    "code": stock["code"],
-                    "name": stock.get("name", stock["code"]),
+                    "code": code,
+                    "name": stock.get("name", code),
                     "buy_price": buy_price,
                     "current_price": buy_price,
                     "quantity": round(quantity, 4),
@@ -1172,7 +1194,17 @@ async def start_next_round(group_id: int, req: CompoundNextRoundRequest):
         per_stock = capital / len(req.stocks)
         positions = []
         for stock in req.stocks:
-            buy_price = stock.get("current_price", stock.get("buy_price", 0))
+            code = stock["code"]
+            # ★ 서버에서 네이버 종가 직접 조회
+            try:
+                candles = get_daily_candles_naver(code, count=3)
+                if candles and len(candles) > 0:
+                    buy_price = candles[-1].get("close", 0)
+                else:
+                    buy_price = stock.get("current_price", stock.get("buy_price", 0))
+            except Exception:
+                buy_price = stock.get("current_price", stock.get("buy_price", 0))
+
             if buy_price <= 0:
                 continue
             commission = per_stock * COMMISSION_RATE
@@ -1181,8 +1213,8 @@ async def start_next_round(group_id: int, req: CompoundNextRoundRequest):
 
             positions.append({
                 "portfolio_id": portfolio_id,
-                "code": stock["code"],
-                "name": stock.get("name", stock["code"]),
+                "code": code,
+                "name": stock.get("name", code),
                 "buy_price": buy_price,
                 "current_price": buy_price,
                 "quantity": round(quantity, 4),
