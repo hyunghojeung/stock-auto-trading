@@ -568,7 +568,7 @@ async def update_prices(portfolio_id: int):
         # ── 포트폴리오 합산 업데이트 ──
         # 미보유 포지션(이미 청산됨)의 수익도 합산
         all_pos_resp = db.table("virtual_positions") \
-            .select("status, profit_won, invest_amount, quantity, current_price") \
+            .select("code, status, profit_won, invest_amount, quantity, current_price, sell_reason") \
             .eq("portfolio_id", portfolio_id) \
             .execute()
 
@@ -594,9 +594,25 @@ async def update_prices(portfolio_id: int):
         pf_return_won = round(pf_total_value - capital)
         pf_return_pct = round((pf_return_won / capital) * 100, 2) if capital > 0 else 0
 
-        # 모든 포지션 청산 시 포트폴리오 종료
+        # 모든 포지션 청산 시 → 자동 재투자 시도
         holding_count = sum(1 for p in all_positions if p["status"] == "holding")
-        pf_status = "active" if holding_count > 0 else "closed"
+
+        if closed_count > 0 and holding_count == 0:
+            # ★ 전부 청산됨 → 회수금으로 새 종목 자동 매수
+            all_codes = {p["code"] for p in all_positions}
+            recovered = sum(
+                (p.get("invest_amount") or 0) + (p.get("profit_won") or 0)
+                for p in all_positions if p["status"] != "holding"
+            )
+            reinvested = _auto_reinvest(portfolio_id, recovered, all_codes, strategy)
+            if reinvested > 0:
+                pf_status = "active"
+                logger.info(f"[가상포트] #{portfolio_id} 자동 재투자 {reinvested}종목 → active 유지")
+            else:
+                pf_status = "closed"
+                _check_compound_reinvest(portfolio_id)
+        else:
+            pf_status = "active" if holding_count > 0 else "closed"
 
         db.table("virtual_portfolios").update({
             "current_value": round(pf_total_value),
@@ -797,9 +813,26 @@ def _sync_update_prices(portfolio_id: int):
                 l += 1
 
     holding_count = sum(1 for p in all_pos if p["status"] == "holding")
-    pf_status = "active" if holding_count > 0 else "closed"
+    closed_in_this = sum(1 for p in all_pos if p["status"] != "holding")
     pf_return_won = round(total_value - capital)
     pf_return_pct = round((pf_return_won / capital) * 100, 2) if capital else 0
+
+    # ★ 모든 종목 청산 시 → 자동 재투자 시도
+    if holding_count == 0 and closed_in_this > 0:
+        all_codes = {p["code"] for p in all_pos}
+        recovered = sum(
+            (p.get("invest_amount") or 0) + (p.get("profit_won") or 0)
+            for p in all_pos if p["status"] != "holding"
+        )
+        reinvested = _auto_reinvest(portfolio_id, recovered, all_codes, strategy)
+        if reinvested > 0:
+            pf_status = "active"
+            logger.info(f"[가상포트] #{portfolio_id} (동기) 자동 재투자 {reinvested}종목")
+        else:
+            pf_status = "closed"
+            _check_compound_reinvest(portfolio_id)
+    else:
+        pf_status = "active" if holding_count > 0 else "closed"
 
     db.table("virtual_portfolios").update({
         "current_value": round(total_value),
@@ -1093,6 +1126,171 @@ def _calc_goal_progress(seed: float, current: float, goal: float) -> float:
         return round(min(max(progress, 0), 100), 2)
     except (ValueError, ZeroDivisionError):
         return 0.0
+
+
+def _auto_reinvest(portfolio_id: int, recovered_capital: float,
+                   existing_codes: set, strategy: str) -> int:
+    """
+    ★ 자동 재투자: 청산 자금으로 DB 스캔 결과에서 새 종목 자동 매수
+    Returns: 새로 매수한 종목 수 (0이면 재투자 실패/스킵)
+    """
+    from app.services.naver_stock import get_daily_candles_naver
+
+    try:
+        # ── 안전장치 1: 최소 자금 체크 ──
+        if recovered_capital < 100000:  # 10만원 미만이면 스킵
+            logger.info(f"[자동재투자] #{portfolio_id} 회수금 {recovered_capital:,.0f}원 — 최소 기준 미달, 스킵")
+            return 0
+
+        # ── 안전장치 2: 3연속 손절 체크 ──
+        recent_pos = db.table("virtual_positions") \
+            .select("status, sell_reason") \
+            .eq("portfolio_id", portfolio_id) \
+            .order("updated_at", desc=True) \
+            .limit(3) \
+            .execute()
+        if recent_pos.data and len(recent_pos.data) >= 3:
+            if all(p.get("sell_reason") == "loss" for p in recent_pos.data):
+                logger.info(f"[자동재투자] #{portfolio_id} 3연속 손절 감지 — 재투자 중단")
+                return 0
+
+        # ── 최근 스캔 결과 조회 ──
+        session_resp = db.table("surge_scan_sessions") \
+            .select("id, scan_date") \
+            .eq("status", "done") \
+            .order("scan_date", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if not session_resp.data:
+            logger.info(f"[자동재투자] #{portfolio_id} 스캔 결과 없음 — 스킵")
+            return 0
+
+        session = session_resp.data[0]
+        session_id = session["id"]
+
+        # ── 안전장치 3: 스캔 결과 신선도 체크 (7일 이내) ──
+        try:
+            scan_date = datetime.fromisoformat(str(session["scan_date"]).replace("Z", "+00:00"))
+            days_old = (datetime.now(scan_date.tzinfo) - scan_date).days if scan_date.tzinfo else (datetime.now() - scan_date).days
+            if days_old > 7:
+                logger.info(f"[자동재투자] #{portfolio_id} 스캔 결과 {days_old}일 경과 — 스킵")
+                return 0
+        except Exception:
+            pass  # 날짜 파싱 실패 시 무시하고 진행
+
+        # ── 후보 종목 조회 (DB 필터링) ──
+        stocks_resp = db.table("surge_scan_stocks") \
+            .select("code, name, market, current_price, top_manip_score, "
+                    "latest_from_peak, latest_rise_pct, surge_count") \
+            .eq("session_id", session_id) \
+            .lt("top_manip_score", 70) \
+            .gte("surge_count", 2) \
+            .execute()
+
+        if not stocks_resp.data:
+            logger.info(f"[자동재투자] #{portfolio_id} 적합한 후보 없음 — 스킵")
+            return 0
+
+        # ── 메모리에서 추가 필터링 ──
+        candidates = []
+        for s in stocks_resp.data:
+            code = s["code"]
+            from_peak = s.get("latest_from_peak", 0)
+
+            # 기존 포트폴리오 종목 제외
+            if code in existing_codes:
+                continue
+
+            # 눌림목 구간: 고점 대비 -15% ~ -50%
+            if not (-50 <= from_peak <= -15):
+                continue
+
+            candidates.append(s)
+
+        if len(candidates) < 2:
+            logger.info(f"[자동재투자] #{portfolio_id} 후보 {len(candidates)}개 — 최소 2개 필요, 스킵")
+            return 0
+
+        # ── 종목 선택: 눌림목 깊은 순 (반등 여지 큰 종목) ──
+        candidates.sort(key=lambda x: x.get("latest_from_peak", 0))
+        selected = candidates[:5]  # 최대 5종목
+
+        # ── 자금 배분: 회수금의 80%만 투자 ──
+        invest_capital = recovered_capital * 0.8
+        per_stock = invest_capital / len(selected)
+
+        now = datetime.now().isoformat()
+        today = now[:10]
+        new_count = 0
+
+        for stock in selected:
+            code = stock["code"]
+            try:
+                # 매수가 결정 (일봉 시가/종가)
+                candles = get_daily_candles_naver(code, count=3)
+                if candles and len(candles) > 0:
+                    buy_price = candles[-1].get("open", 0) or candles[-1].get("close", 0)
+                else:
+                    buy_price = stock.get("current_price", 0)
+
+                if buy_price <= 0:
+                    continue
+
+                # 수수료 차감 후 수량 계산
+                commission = per_stock * COMMISSION_RATE
+                actual_invest = per_stock - commission
+                quantity = actual_invest / buy_price
+
+                if quantity <= 0:
+                    continue
+
+                pos_data = {
+                    "portfolio_id": portfolio_id,
+                    "code": code,
+                    "name": stock.get("name", code),
+                    "buy_price": buy_price,
+                    "current_price": buy_price,
+                    "quantity": round(quantity, 4),
+                    "invest_amount": round(per_stock),
+                    "status": "holding",
+                    "peak_price": buy_price,
+                    "price_history": json.dumps([{"date": today, "close": buy_price}]),
+                    "buy_date": now,
+                    "updated_at": now,
+                }
+
+                db.table("virtual_positions").insert(pos_data).execute()
+                new_count += 1
+
+                logger.info(f"[자동재투자] #{portfolio_id} 매수: {stock['name']}({code}) "
+                           f"@{buy_price:,.0f}원 × {quantity:.2f}주 = {per_stock:,.0f}원")
+
+            except Exception as e:
+                logger.warning(f"[자동재투자] {code} 매수 실패: {e}")
+
+        if new_count > 0:
+            # 포트폴리오 자본금을 재투자 금액으로 갱신
+            db.table("virtual_portfolios").update({
+                "capital": round(invest_capital),
+                "current_value": round(invest_capital),
+                "total_return_pct": 0,
+                "total_return_won": 0,
+                "win_count": 0,
+                "loss_count": 0,
+                "status": "active",
+                "updated_at": now,
+            }).eq("id", portfolio_id).execute()
+
+            logger.info(f"[자동재투자] ★ #{portfolio_id} 재투자 완료: "
+                       f"{new_count}종목, 투자금 {invest_capital:,.0f}원 "
+                       f"(회수금 {recovered_capital:,.0f}원의 80%)")
+
+        return new_count
+
+    except Exception as e:
+        logger.error(f"[자동재투자] #{portfolio_id} 실패: {e}")
+        return 0
 
 
 def _check_compound_reinvest(portfolio_id: int):
