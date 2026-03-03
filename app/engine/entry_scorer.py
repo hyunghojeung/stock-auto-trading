@@ -549,10 +549,3 @@ def summarize_entry_scores(recommendations: List[Dict]) -> Dict:
         "avg_composite_score": round(avg_score, 1),
         "filter_thresholds": ENTRY_THRESHOLDS,
     }
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 하위 호환 별칭 (surge_scanner_routes.py 등에서 import)
-# Backward-compatible aliases
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-evaluate_entry = calculate_entry_score
