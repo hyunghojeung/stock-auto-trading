@@ -1238,7 +1238,7 @@ def compute_early_entry_score(
         avg_prev = sum(prev_3) / len(prev_3) if prev_3 else 1
         result["volume_declining"] = avg_recent < avg_prev * 0.85  # 최근 거래량 15% 이상 감소
 
-    # ── 4) 조기 진입 종합 점수 계산 ── 
+    # ── 4) 조기 진입 종합 점수 계산 ──
     score = 0
     reasons = []
 
