@@ -346,10 +346,16 @@ async def realtime_sessions():
             # ── 수익 계산 ──
             capital = pf.get("capital", 1000000)
             total_invest = sum(p.get("invest_amount", 0) for p in positions)
-            total_current = sum(
-                (p.get("current_price", 0) * p.get("quantity", 0))
-                for p in positions if p.get("status") == "holding"
-            )
+            # 현재가 0원이면 매수가로 대체 (수익률 0% 처리)
+            total_current = 0
+            for p in positions:
+                if p.get("status") != "holding":
+                    continue
+                cp = p.get("current_price", 0)
+                bp = p.get("buy_price", 0)
+                qty = p.get("quantity", 0)
+                price = cp if cp > 0 else bp
+                total_current += price * qty
             # 매도 완료 종목 손익
             realized = sum(p.get("profit_won", 0) for p in positions if p.get("status") != "holding")
             cash = capital - total_invest + realized

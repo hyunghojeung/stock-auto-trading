@@ -16,8 +16,11 @@ import math
 import logging
 import asyncio
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
+
+# 한국 시간대 (KST = UTC+9)
+KST = timezone(timedelta(hours=9))
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
@@ -360,8 +363,22 @@ async def update_prices(portfolio_id: int):
                 high_price = latest.get("high", current_price)
                 low_price = latest.get("low", current_price)
 
+                # 장외시간 판별 (한국시간 09:00~15:30 외)
+                now_kst = datetime.now(KST)
+                market_open = (
+                    now_kst.hour >= 9
+                    and (now_kst.hour < 15 or (now_kst.hour == 15 and now_kst.minute <= 30))
+                    and now_kst.weekday() < 5  # 주말 제외
+                )
+
                 if current_price <= 0:
-                    continue
+                    if not market_open:
+                        # 장외시간이면 buy_price 유지 (수익률 0% 처리)
+                        current_price = pos["buy_price"]
+                        high_price = current_price
+                        low_price = current_price
+                    else:
+                        continue
 
                 buy_price = pos["buy_price"]
                 peak_price = max(pos.get("peak_price", buy_price), current_price)
