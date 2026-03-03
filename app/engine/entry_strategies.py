@@ -1,642 +1,551 @@
 """
-진입 전략 엔진 — 조기 매수 시점 감지
-Entry Strategy Engine — Early Buy Signal Detection
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-파일경로: app/engine/entry_strategies.py
+entry_scorer.py — 매수 진입 품질 점수 산출기
+Entry Quality Scorer for Pattern Analysis & Virtual Portfolio
 
-기존 DTW 매칭은 급등 직전 10일 패턴을 사용하여
-매수 시점이 이미 상승 시작 후가 됨.
+배치 경로: app/engine/entry_scorer.py
 
-이 모듈은 3가지 진입 전략으로 2~4주 더 일찍 매수 시점을 감지:
-  1) OBV 다이버전스 — 주가 횡보/하락 중 거래량 축적 감지
-  2) VCP 볼린저 스퀴즈 — 변동성 수축 후 폭발 전 감지
-  3) 부분 DTW 매칭 — 패턴 초기(앞 30~50%)만으로 조기 매칭
+[방법 C] 2단계(패턴분석) + 3단계(가상투자 진입) 모두에서 사용
+- 2단계: DTW 유사도 + 진입품질점수 → 종합점수로 시그널 판정
+- 3단계: 종합점수 기준 자동매수/감시/보류 분류
 
-조합: 진입 전략(언제 사나) + 기존 매도 전략(언제 파나)
+v1.0 — 2026-03-03
 """
 
-import numpy as np
-import logging
+import math
 from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass, field, asdict
-
-from app.utils.indicators import z_normalize, sma, rsi, rsi_series
-
-logger = logging.getLogger(__name__)
+from dataclasses import dataclass, field
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 데이터 구조
+# 설정 / Configuration
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# 진입 품질 점수 배점 (총 100점)
+ENTRY_SCORE_WEIGHTS = {
+    "ma_arrangement":    15,   # MA 정배열 (MA5 > MA20)
+    "ma5_slope":         10,   # MA5 기울기 (3일 연속 상승)
+    "volume_increase":   15,   # 거래량 증가 (5일평균 > 20일평균 × 1.3)
+    "bullish_volume":    10,   # 양봉 거래량 우위
+    "price_position":    10,   # 가격 위치 (20일 저점 대비)
+    "rsi_zone":          10,   # RSI 적정 구간 (40~60)
+    "no_new_low":        10,   # 최근 5일 저점 미갱신
+    "ma20_slope":        10,   # MA20 기울기 (상승 추세)
+    "candle_strength":   10,   # 최근 캔들 강도 (양봉 비율)
+}
+
+# 종합점수 산출 비율 (DTW 유사도 vs 진입품질)
+COMPOSITE_RATIO = {
+    "dtw_similarity": 0.6,    # 기존 DTW 유사도 비중
+    "entry_quality":  0.4,    # 진입 품질 점수 비중
+}
+
+# 가상투자 진입 기준 (3단계)
+ENTRY_THRESHOLDS = {
+    "auto_buy":   75,   # 자동 매수 (종합 75점 이상)
+    "watch":      60,   # 감시 등록 (종합 60~74점)
+    "hold":        0,   # 보류 (60점 미만)
+}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 데이터 클래스 / Data Classes
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @dataclass
-class EntrySignal:
-    """진입 시그널 결과"""
-    should_buy: bool
-    entry_score: float           # 0~100 종합 점수
-    signals: Dict                # 개별 전략 결과
-    timing_estimate: str         # "급등 2~3주 전" 등
-    detail: str                  # 요약 설명
+class EntryScoreResult:
+    """진입 품질 점수 결과 / Entry Quality Score Result"""
+    total_score: float = 0.0            # 진입 품질 총점 (0~100)
+    composite_score: float = 0.0        # 종합점수 (DTW + 진입품질)
+    entry_grade: str = "hold"           # auto_buy / watch / hold
+    entry_label: str = "⬜ 보류"        # 표시 라벨
+
+    # 세부 항목별 점수
+    details: Dict[str, float] = field(default_factory=dict)
+
+    # 세부 항목별 판정 사유
+    reasons: List[str] = field(default_factory=list)
+
+    # 원본 DTW 유사도 (참조용)
+    dtw_similarity: float = 0.0
+
+
+@dataclass
+class CandleData:
+    """캔들 데이터 (dict → 객체 변환용)"""
+    date: str = ""
+    open: float = 0.0
+    high: float = 0.0
+    low: float = 0.0
+    close: float = 0.0
+    volume: float = 0.0
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 전략 1: OBV 다이버전스
+# 유틸 함수 / Utility Functions
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _compute_obv(candles: List[Dict]) -> List[float]:
-    """OBV(On Balance Volume) 계산"""
-    if not candles:
-        return []
+def _to_candle(c) -> CandleData:
+    """dict 또는 객체를 CandleData로 변환"""
+    if isinstance(c, dict):
+        return CandleData(
+            date=c.get("date", ""),
+            open=float(c.get("open", 0)),
+            high=float(c.get("high", 0)),
+            low=float(c.get("low", 0)),
+            close=float(c.get("close", 0)),
+            volume=float(c.get("volume", 0)),
+        )
+    # 이미 객체인 경우 (CandleDay 등)
+    return CandleData(
+        date=getattr(c, "date", ""),
+        open=float(getattr(c, "open", 0)),
+        high=float(getattr(c, "high", 0)),
+        low=float(getattr(c, "low", 0)),
+        close=float(getattr(c, "close", 0)),
+        volume=float(getattr(c, "volume", 0)),
+    )
 
-    obv = [0.0]
+
+def _calc_ma(candles: List[CandleData], period: int) -> List[Optional[float]]:
+    """이동평균 계산 / Calculate Moving Average"""
+    result = []
+    for i in range(len(candles)):
+        if i < period - 1:
+            result.append(None)
+        else:
+            avg = sum(c.close for c in candles[i - period + 1: i + 1]) / period
+            result.append(avg)
+    return result
+
+
+def _calc_rsi(candles: List[CandleData], period: int = 14) -> List[Optional[float]]:
+    """RSI 계산 / Calculate RSI"""
+    if len(candles) < period + 1:
+        return [None] * len(candles)
+
+    result = [None] * period
+    gains = []
+    losses = []
+
     for i in range(1, len(candles)):
-        close_now = candles[i].get("close", 0)
-        close_prev = candles[i - 1].get("close", 0)
-        vol = candles[i].get("volume", 0)
+        change = candles[i].close - candles[i - 1].close
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
 
-        if close_now > close_prev:
-            obv.append(obv[-1] + vol)
-        elif close_now < close_prev:
-            obv.append(obv[-1] - vol)
-        else:
-            obv.append(obv[-1])
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
-    return obv
-
-
-def _linear_regression_slope(values: List[float]) -> float:
-    """최소자승법으로 기울기 계산 (정규화된 기울기)"""
-    n = len(values)
-    if n < 2:
-        return 0.0
-
-    x_mean = (n - 1) / 2.0
-    y_mean = sum(values) / n
-
-    numerator = sum((i - x_mean) * (values[i] - y_mean) for i in range(n))
-    denominator = sum((i - x_mean) ** 2 for i in range(n))
-
-    if denominator < 1e-10:
-        return 0.0
-
-    slope = numerator / denominator
-
-    # 값 범위 대비 정규화 (기울기를 평균값 대비 비율로)
-    if abs(y_mean) > 1e-10:
-        return slope / abs(y_mean)
-    return slope
-
-
-def detect_obv_divergence(
-    candles: List[Dict],
-    lookback: int = 20,
-    price_slope_threshold: float = 0.005,
-    obv_slope_threshold: float = 0.005,
-) -> Dict:
-    """
-    OBV 다이버전스 감지: 주가 횡보/하락 + OBV 상승
-    세력의 사전 물량 축적 시그널
-
-    Args:
-        candles: 일봉 리스트 [{date, open, high, low, close, volume}, ...]
-        lookback: 분석 기간 (거래일)
-        price_slope_threshold: 주가 횡보 판정 기울기 임계값
-        obv_slope_threshold: OBV 상승 판정 기울기 임계값
-
-    Returns:
-        {signal: bool, score: 0-100, price_slope: float, obv_slope: float, detail: str}
-    """
-    if len(candles) < lookback + 5:
-        return {
-            "signal": False, "score": 0, "price_slope": 0,
-            "obv_slope": 0, "detail": f"데이터 부족 ({len(candles)}일 < {lookback + 5}일)"
-        }
-
-    recent = candles[-lookback:]
-    closes = [c.get("close", 0) for c in recent]
-    obv_full = _compute_obv(candles)
-    obv_recent = obv_full[-lookback:]
-
-    # 주가 기울기 (정규화)
-    price_slope = _linear_regression_slope(closes)
-
-    # OBV 기울기 (정규화)
-    obv_slope = _linear_regression_slope(obv_recent)
-
-    # 다이버전스 판정: 주가 횡보/하락(-threshold ~ +threshold) + OBV 상승
-    price_flat_or_down = price_slope < price_slope_threshold
-    obv_rising = obv_slope > obv_slope_threshold
-
-    signal = price_flat_or_down and obv_rising
-
-    # 스코어 계산 (0~100)
-    # OBV 기울기가 클수록 + 주가가 하락할수록 다이버전스 강도 큼
-    score = 0
-    if signal:
-        # OBV 상승 강도 (0~60)
-        obv_strength = min(60, max(0, obv_slope / 0.05 * 60))
-
-        # 주가 약세 강도 (0~40) — 더 약할수록 다이버전스 강함
-        price_weakness = 0
-        if price_slope < 0:
-            price_weakness = min(40, max(0, abs(price_slope) / 0.03 * 40))
-        elif price_slope < price_slope_threshold:
-            price_weakness = 15  # 횡보는 기본 15점
-
-        score = round(obv_strength + price_weakness)
-
-    detail_parts = []
-    if price_flat_or_down:
-        if price_slope < 0:
-            detail_parts.append(f"주가 하락세(기울기={price_slope:.4f})")
-        else:
-            detail_parts.append(f"주가 횡보(기울기={price_slope:.4f})")
+    if avg_loss == 0:
+        result.append(100.0)
     else:
-        detail_parts.append(f"주가 상승세(기울기={price_slope:.4f})")
+        rs = avg_gain / avg_loss
+        result.append(100 - (100 / (1 + rs)))
 
-    if obv_rising:
-        detail_parts.append(f"OBV 상승(기울기={obv_slope:.4f})")
-    else:
-        detail_parts.append(f"OBV 정체/하락(기울기={obv_slope:.4f})")
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
 
-    return {
-        "signal": signal,
-        "score": min(100, score),
-        "price_slope": round(price_slope, 6),
-        "obv_slope": round(obv_slope, 6),
-        "detail": " + ".join(detail_parts),
-    }
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 전략 2: VCP 볼린저 스퀴즈
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _bollinger_bandwidth(closes: List[float], period: int = 20) -> List[Optional[float]]:
-    """
-    볼린저 밴드 폭(%) 시계열 계산
-    bandwidth = (upper - lower) / middle * 100
-    """
-    result = [None] * len(closes)
-
-    for i in range(period - 1, len(closes)):
-        window = closes[i - period + 1: i + 1]
-        middle = sum(window) / period
-        if middle < 1e-10:
-            continue
-
-        std = (sum((x - middle) ** 2 for x in window) / period) ** 0.5
-        upper = middle + 2 * std
-        lower = middle - 2 * std
-
-        result[i] = round((upper - lower) / middle * 100, 4)
+        if avg_loss == 0:
+            result.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            result.append(100 - (100 / (1 + rs)))
 
     return result
 
 
-def detect_vcp_squeeze(
-    candles: List[Dict],
-    lookback: int = 120,
-    squeeze_threshold: float = 0.4,
-    bb_period: int = 20,
-) -> Dict:
-    """
-    VCP 볼린저 스퀴즈 감지: 변동성이 N개월 최저로 수축
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 핵심: 진입 품질 점수 산출 / Entry Quality Scoring
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    Args:
-        candles: 일봉 리스트
-        lookback: 볼린저 밴드폭 최저 판정 기간 (거래일, 기본 120 ≈ 6개월)
-        squeeze_threshold: 현재 밴드폭이 lookback 최저값 대비 이 비율 이하면 스퀴즈
-        bb_period: 볼린저 밴드 기간
+def calculate_entry_score(
+    candles,
+    dtw_similarity: float = 0.0,
+    lookback: int = 60,
+) -> EntryScoreResult:
+    """
+    매수 진입 품질 점수 산출 (9개 항목, 총 100점)
+
+    Parameters:
+        candles: 최근 캔들 데이터 (최소 60개 권장, dict 또는 객체)
+        dtw_similarity: 기존 DTW 유사도 점수 (0~100)
+        lookback: 분석에 사용할 최근 캔들 수
 
     Returns:
-        {signal: bool, score: 0-100, band_width: float, min_width: float, percentile: float, detail: str}
+        EntryScoreResult: 진입 품질 점수 + 종합점수 + 등급
     """
-    min_required = max(lookback, bb_period + 10)
-    if len(candles) < min_required:
-        return {
-            "signal": False, "score": 0, "band_width": 0,
-            "min_width": 0, "percentile": 100,
-            "detail": f"데이터 부족 ({len(candles)}일 < {min_required}일)"
-        }
+    result = EntryScoreResult(dtw_similarity=dtw_similarity)
 
-    closes = [c.get("close", 0) for c in candles]
-    bw = _bollinger_bandwidth(closes, bb_period)
+    # 캔들 변환 및 최소 데이터 확인
+    clist = [_to_candle(c) for c in candles]
+    if len(clist) < 25:
+        result.reasons.append("❌ 캔들 데이터 부족 (최소 25개 필요)")
+        result.entry_label = "⬜ 데이터부족"
+        return result
 
-    # 유효한 밴드폭만 추출
-    valid_bw = [(i, v) for i, v in enumerate(bw) if v is not None]
-    if len(valid_bw) < lookback // 2:
-        return {
-            "signal": False, "score": 0, "band_width": 0,
-            "min_width": 0, "percentile": 100,
-            "detail": "유효 밴드폭 데이터 부족"
-        }
+    # 최근 lookback개만 사용
+    recent = clist[-lookback:] if len(clist) > lookback else clist
 
-    # 최근 밴드폭
-    current_bw = valid_bw[-1][1]
+    # MA 계산
+    ma5 = _calc_ma(recent, 5)
+    ma20 = _calc_ma(recent, 20)
 
-    # lookback 기간 내 밴드폭 통계
-    recent_valid = [v for _, v in valid_bw[-lookback:]]
-    min_bw = min(recent_valid)
-    max_bw = max(recent_valid)
+    # RSI 계산
+    rsi_list = _calc_rsi(recent, 14)
 
-    # 백분위 계산 (낮을수록 수축)
-    sorted_bw = sorted(recent_valid)
-    rank = sum(1 for v in sorted_bw if v < current_bw)
-    percentile = round(rank / len(sorted_bw) * 100, 1)
+    details = {}
+    reasons = []
 
-    # 스퀴즈 판정: 현재 밴드폭이 하위 squeeze_threshold * 100 % 이내
-    signal = percentile <= squeeze_threshold * 100
-
-    # 연속 수축일 계산
-    consecutive_squeeze = 0
-    threshold_value = sorted_bw[int(len(sorted_bw) * squeeze_threshold)] if len(sorted_bw) > 1 else current_bw
-    for i in range(len(valid_bw) - 1, -1, -1):
-        if valid_bw[i][1] <= threshold_value:
-            consecutive_squeeze += 1
+    # ─── 1. MA 정배열 (15점) ───
+    score_ma_arr = 0
+    if ma5[-1] is not None and ma20[-1] is not None:
+        if ma5[-1] > ma20[-1]:
+            score_ma_arr = ENTRY_SCORE_WEIGHTS["ma_arrangement"]
+            reasons.append("✅ MA정배열: MA5({:,.0f}) > MA20({:,.0f})".format(ma5[-1], ma20[-1]))
         else:
+            gap_pct = ((ma5[-1] - ma20[-1]) / ma20[-1]) * 100
+            if gap_pct > -1.0:
+                # 거의 수렴 중 → 부분 점수
+                score_ma_arr = ENTRY_SCORE_WEIGHTS["ma_arrangement"] * 0.5
+                reasons.append("🟡 MA수렴 중: 이격 {:.1f}% (부분점수)".format(gap_pct))
+            else:
+                reasons.append("❌ MA역배열: MA5 < MA20 (이격 {:.1f}%)".format(gap_pct))
+    details["ma_arrangement"] = round(score_ma_arr, 1)
+
+    # ─── 2. MA5 기울기 (10점) ───
+    score_ma5_slope = 0
+    valid_ma5 = [v for v in ma5[-5:] if v is not None]
+    if len(valid_ma5) >= 3:
+        rising_count = sum(1 for i in range(1, len(valid_ma5)) if valid_ma5[i] > valid_ma5[i - 1])
+        if rising_count >= len(valid_ma5) - 1:
+            # 3일+ 연속 상승
+            score_ma5_slope = ENTRY_SCORE_WEIGHTS["ma5_slope"]
+            reasons.append("✅ MA5 상승세: {}일 연속 상승".format(rising_count))
+        elif rising_count >= 2:
+            score_ma5_slope = ENTRY_SCORE_WEIGHTS["ma5_slope"] * 0.6
+            reasons.append("🟡 MA5 약상승: {}일/{}일 상승".format(rising_count, len(valid_ma5) - 1))
+        else:
+            reasons.append("❌ MA5 하락세: 상승일 {}일뿐".format(rising_count))
+    details["ma5_slope"] = round(score_ma5_slope, 1)
+
+    # ─── 3. 거래량 증가 (15점) ───
+    score_vol = 0
+    if len(recent) >= 20:
+        vol_5d = sum(c.volume for c in recent[-5:]) / 5
+        vol_20d = sum(c.volume for c in recent[-20:]) / 20
+
+        if vol_20d > 0:
+            vol_ratio = vol_5d / vol_20d
+            if vol_ratio >= 1.5:
+                score_vol = ENTRY_SCORE_WEIGHTS["volume_increase"]
+                reasons.append("✅ 거래량 급증: 5일평균 = 20일평균 × {:.1f}배".format(vol_ratio))
+            elif vol_ratio >= 1.3:
+                score_vol = ENTRY_SCORE_WEIGHTS["volume_increase"] * 0.7
+                reasons.append("🟡 거래량 증가: 5일평균 = 20일평균 × {:.1f}배".format(vol_ratio))
+            elif vol_ratio >= 1.0:
+                score_vol = ENTRY_SCORE_WEIGHTS["volume_increase"] * 0.3
+                reasons.append("🟡 거래량 보합: 5일/20일 비율 {:.1f}".format(vol_ratio))
+            else:
+                reasons.append("❌ 거래량 감소: 5일/20일 비율 {:.1f}".format(vol_ratio))
+    details["volume_increase"] = round(score_vol, 1)
+
+    # ─── 4. 양봉 거래량 우위 (10점) ───
+    score_bull_vol = 0
+    recent_10 = recent[-10:] if len(recent) >= 10 else recent[-5:]
+    bull_vol = sum(c.volume for c in recent_10 if c.close >= c.open)
+    bear_vol = sum(c.volume for c in recent_10 if c.close < c.open)
+    total_vol = bull_vol + bear_vol
+
+    if total_vol > 0:
+        bull_ratio = bull_vol / total_vol
+        if bull_ratio >= 0.6:
+            score_bull_vol = ENTRY_SCORE_WEIGHTS["bullish_volume"]
+            reasons.append("✅ 양봉거래량 우위: {:.0f}%".format(bull_ratio * 100))
+        elif bull_ratio >= 0.5:
+            score_bull_vol = ENTRY_SCORE_WEIGHTS["bullish_volume"] * 0.5
+            reasons.append("🟡 양봉/음봉 균형: {:.0f}%".format(bull_ratio * 100))
+        else:
+            reasons.append("❌ 음봉거래량 우위: 양봉비율 {:.0f}%".format(bull_ratio * 100))
+    details["bullish_volume"] = round(score_bull_vol, 1)
+
+    # ─── 5. 가격 위치 (10점) ───
+    score_price_pos = 0
+    if len(recent) >= 20:
+        high_20d = max(c.high for c in recent[-20:])
+        low_20d = min(c.low for c in recent[-20:])
+        price_range = high_20d - low_20d
+
+        if price_range > 0:
+            current_price = recent[-1].close
+            position = (current_price - low_20d) / price_range  # 0=저점, 1=고점
+
+            if 0.15 <= position <= 0.55:
+                # 바닥 탈출 구간 (저점에서 15~55% 위치) → 최적
+                score_price_pos = ENTRY_SCORE_WEIGHTS["price_position"]
+                reasons.append("✅ 가격위치 최적: 20일 범위 {:.0f}% (바닥 탈출 구간)".format(position * 100))
+            elif 0.55 < position <= 0.75:
+                # 중간 구간
+                score_price_pos = ENTRY_SCORE_WEIGHTS["price_position"] * 0.5
+                reasons.append("🟡 가격위치 중간: 20일 범위 {:.0f}%".format(position * 100))
+            elif position > 0.75:
+                # 고점 추격 구간
+                reasons.append("❌ 고점 추격 위험: 20일 범위 {:.0f}% (고점 근처)".format(position * 100))
+            else:
+                # 너무 바닥 (하락 지속 가능)
+                score_price_pos = ENTRY_SCORE_WEIGHTS["price_position"] * 0.3
+                reasons.append("🟡 바닥 구간: 20일 범위 {:.0f}% (반등 미확인)".format(position * 100))
+    details["price_position"] = round(score_price_pos, 1)
+
+    # ─── 6. RSI 적정 구간 (10점) ───
+    score_rsi = 0
+    current_rsi = None
+    for v in reversed(rsi_list):
+        if v is not None:
+            current_rsi = v
             break
 
-    # 스코어 계산
-    score = 0
-    if signal:
-        # 백분위가 낮을수록 높은 점수 (0~60)
-        pct_score = max(0, (squeeze_threshold * 100 - percentile) / (squeeze_threshold * 100) * 60)
-
-        # 연속 수축일 보너스 (0~40)
-        consec_score = min(40, consecutive_squeeze * 8)
-
-        score = round(pct_score + consec_score)
-
-    detail_parts = [
-        f"밴드폭={current_bw:.2f}%",
-        f"백분위={percentile:.1f}%",
-        f"최저={min_bw:.2f}%",
-    ]
-    if consecutive_squeeze > 0:
-        detail_parts.append(f"연속수축={consecutive_squeeze}일")
-
-    return {
-        "signal": signal,
-        "score": min(100, score),
-        "band_width": round(current_bw, 4),
-        "min_width": round(min_bw, 4),
-        "percentile": percentile,
-        "consecutive_squeeze": consecutive_squeeze,
-        "detail": ", ".join(detail_parts),
-    }
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 전략 3: 부분 DTW 매칭
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def detect_partial_dtw(
-    candles: List[Dict],
-    clusters: List[Dict],
-    match_pct: int = 40,
-    min_similarity: float = 50.0,
-    pre_days: int = 10,
-) -> Dict:
-    """
-    부분 DTW 매칭: 패턴 초기 30~50%만으로 조기 매칭
-
-    기존 DTW: 최근 10일 vs 클러스터 10일 → 100% 매칭 필요
-    부분 DTW: 최근 3~5일 vs 클러스터 앞 3~5일 → 40% 매칭으로 조기 감지
-
-    Args:
-        candles: 일봉 리스트
-        clusters: 클러스터 리스트 [{avg_return_flow, avg_volume_flow, avg_rsi_flow, ...}]
-        match_pct: 매칭할 패턴 비율 (%) — 40이면 10일 중 앞 4일만 비교
-        min_similarity: 최소 유사도 임계값 (%)
-        pre_days: 기본 패턴 일수
-
-    Returns:
-        {signal: bool, score: 0-100, similarity: float, best_cluster: int, detail: str}
-    """
-    from app.engine.pattern_analyzer import dtw_similarity
-
-    if not clusters:
-        return {
-            "signal": False, "score": 0, "similarity": 0,
-            "best_cluster_id": -1, "detail": "클러스터 없음"
-        }
-
-    # 부분 매칭 일수 계산
-    partial_days = max(3, int(pre_days * match_pct / 100))
-
-    if len(candles) < partial_days + 20:  # RSI/MA 계산을 위한 여유 데이터
-        return {
-            "signal": False, "score": 0, "similarity": 0,
-            "best_cluster_id": -1,
-            "detail": f"데이터 부족 ({len(candles)}일 < {partial_days + 20}일)"
-        }
-
-    # 현재 종목의 최근 partial_days일 등락률
-    recent_closes = [c.get("close", 0) for c in candles[-(partial_days + 1):]]
-    current_returns = []
-    for i in range(1, len(recent_closes)):
-        prev = recent_closes[i - 1]
-        if prev > 0:
-            current_returns.append(round((recent_closes[i] - prev) / prev * 100, 4))
+    if current_rsi is not None:
+        if 40 <= current_rsi <= 60:
+            # 상승 초기 구간 → 최적
+            score_rsi = ENTRY_SCORE_WEIGHTS["rsi_zone"]
+            reasons.append("✅ RSI 적정: {:.1f} (상승 초기 구간)".format(current_rsi))
+        elif 30 <= current_rsi < 40:
+            # 과매도 근접 → 반등 가능
+            score_rsi = ENTRY_SCORE_WEIGHTS["rsi_zone"] * 0.7
+            reasons.append("🟡 RSI 과매도 근접: {:.1f} (반등 기대)".format(current_rsi))
+        elif 60 < current_rsi <= 70:
+            # 약간 과열
+            score_rsi = ENTRY_SCORE_WEIGHTS["rsi_zone"] * 0.4
+            reasons.append("🟡 RSI 약과열: {:.1f}".format(current_rsi))
+        elif current_rsi > 70:
+            # 과매수 → 진입 위험
+            reasons.append("❌ RSI 과매수: {:.1f} (진입 위험)".format(current_rsi))
         else:
-            current_returns.append(0.0)
+            # RSI < 30 과매도
+            score_rsi = ENTRY_SCORE_WEIGHTS["rsi_zone"] * 0.5
+            reasons.append("🟡 RSI 과매도: {:.1f} (급반등 or 추가하락)".format(current_rsi))
+    details["rsi_zone"] = round(score_rsi, 1)
 
-    # 현재 거래량 비율 (20일 평균 대비)
-    volumes = [c.get("volume", 0) for c in candles]
-    current_vol_ratios = []
-    for i in range(len(candles) - partial_days, len(candles)):
-        avg_20 = sum(volumes[max(0, i - 20):i]) / min(20, max(1, i))
-        if avg_20 > 0:
-            current_vol_ratios.append(round(volumes[i] / avg_20, 4))
+    # ─── 7. 최근 5일 저점 미갱신 (10점) ───
+    score_no_low = 0
+    if len(recent) >= 10:
+        low_10d = min(c.low for c in recent[-10:-5]) if len(recent) >= 10 else min(c.low for c in recent[:-5])
+        low_5d = min(c.low for c in recent[-5:])
+
+        if low_5d >= low_10d:
+            score_no_low = ENTRY_SCORE_WEIGHTS["no_new_low"]
+            reasons.append("✅ 저점 미갱신: 최근5일 저점({:,.0f}) ≥ 이전 저점({:,.0f})".format(low_5d, low_10d))
         else:
-            current_vol_ratios.append(1.0)
+            drop_pct = ((low_5d - low_10d) / low_10d) * 100
+            if drop_pct > -2.0:
+                score_no_low = ENTRY_SCORE_WEIGHTS["no_new_low"] * 0.4
+                reasons.append("🟡 소폭 신저가: {:.1f}% (경미)".format(drop_pct))
+            else:
+                reasons.append("❌ 신저가 갱신: {:.1f}% 하락".format(drop_pct))
+    details["no_new_low"] = round(score_no_low, 1)
 
-    # 각 클러스터의 앞 partial_days일과 비교
-    best_sim = 0.0
-    best_cluster_id = -1
-    match_details = []
+    # ─── 8. MA20 기울기 (10점) ───
+    score_ma20_slope = 0
+    valid_ma20 = [v for v in ma20[-5:] if v is not None]
+    if len(valid_ma20) >= 3:
+        ma20_rising = sum(1 for i in range(1, len(valid_ma20)) if valid_ma20[i] > valid_ma20[i - 1])
+        if ma20_rising >= len(valid_ma20) - 1:
+            score_ma20_slope = ENTRY_SCORE_WEIGHTS["ma20_slope"]
+            reasons.append("✅ MA20 상승: 중기 추세 양호")
+        elif ma20_rising >= 2:
+            score_ma20_slope = ENTRY_SCORE_WEIGHTS["ma20_slope"] * 0.5
+            reasons.append("🟡 MA20 횡보: 추세 전환 가능")
+        else:
+            reasons.append("❌ MA20 하락: 중기 하락 추세")
+    details["ma20_slope"] = round(score_ma20_slope, 1)
 
-    for cluster in clusters:
-        cid = cluster.get("cluster_id", 0)
-        avg_returns = cluster.get("avg_return_flow", [])
-        avg_volume = cluster.get("avg_volume_flow", [])
+    # ─── 9. 최근 캔들 강도 (10점) ───
+    score_candle = 0
+    recent_5 = recent[-5:]
+    bull_count = sum(1 for c in recent_5 if c.close >= c.open)
 
-        if not avg_returns or len(avg_returns) < partial_days:
-            continue
-
-        # 클러스터 패턴의 앞 partial_days일만 추출
-        cluster_partial_returns = avg_returns[:partial_days]
-        cluster_partial_volume = avg_volume[:partial_days] if avg_volume else []
-
-        # 등락률 DTW 유사도 (가중치 0.6)
-        sim_returns = dtw_similarity(current_returns, cluster_partial_returns, normalize=True)
-
-        # 거래량 DTW 유사도 (가중치 0.4)
-        sim_volume = 0.0
-        if current_vol_ratios and cluster_partial_volume and len(cluster_partial_volume) >= partial_days:
-            sim_volume = dtw_similarity(
-                current_vol_ratios, cluster_partial_volume[:partial_days], normalize=True
-            )
-
-        # 가중 평균 유사도
-        combined = sim_returns * 0.6 + sim_volume * 0.4
-
-        match_details.append({
-            "cluster_id": cid,
-            "returns_sim": round(sim_returns, 2),
-            "volume_sim": round(sim_volume, 2),
-            "combined_sim": round(combined, 2),
-        })
-
-        if combined > best_sim:
-            best_sim = combined
-            best_cluster_id = cid
-
-    signal = best_sim >= min_similarity
-
-    # 스코어: 유사도 그대로 사용 (이미 0~100 범위)
-    score = round(best_sim) if signal else round(best_sim * 0.5)
-
-    detail = f"부분매칭({partial_days}일/{pre_days}일), 최고유사도={best_sim:.1f}%"
-    if best_cluster_id >= 0:
-        detail += f", 클러스터#{best_cluster_id}"
-
-    return {
-        "signal": signal,
-        "score": min(100, score),
-        "similarity": round(best_sim, 2),
-        "best_cluster_id": best_cluster_id,
-        "partial_days": partial_days,
-        "match_details": match_details[:5],  # 상위 5개만
-        "detail": detail,
-    }
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 결합 진입 판정
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# 기본 가중치
-DEFAULT_ENTRY_WEIGHTS = {
-    "obv": 0.35,       # OBV 다이버전스 — 거래량 축적이 가장 중요
-    "vcp": 0.30,       # VCP 볼린저 스퀴즈 — 변동성 수축
-    "partial_dtw": 0.35,  # 부분 DTW — 패턴 초기 매칭
-}
-
-# 진입 점수 임계값
-ENTRY_THRESHOLDS = {
-    "aggressive": 30,   # 공격적: 1개 전략만 통과해도 매수
-    "balanced": 45,     # 균형: 2개 이상 전략 통과 시 매수
-    "conservative": 60, # 보수적: 3개 전략 모두 통과 시 매수
-}
-
-
-def evaluate_entry(
-    candles: List[Dict],
-    clusters: List[Dict],
-    strategy_config: Optional[Dict] = None,
-) -> Dict:
-    """
-    3개 전략을 결합하여 최종 진입 판정
-
-    Args:
-        candles: 일봉 데이터 (최소 120일 이상 권장)
-        clusters: DTW 클러스터 리스트
-        strategy_config: {
-            "weights": {"obv": 0.35, "vcp": 0.30, "partial_dtw": 0.35},
-            "threshold_mode": "balanced",  # aggressive / balanced / conservative
-            "custom_threshold": None,      # 직접 지정 시 사용 (0~100)
-            "obv_lookback": 20,
-            "vcp_lookback": 120,
-            "vcp_squeeze_threshold": 0.4,
-            "partial_match_pct": 40,
-            "partial_min_similarity": 50,
-        }
-
-    Returns:
-        {
-            should_buy: bool,
-            entry_score: 0~100,
-            signals: {obv: {...}, vcp: {...}, partial_dtw: {...}},
-            active_signals: int,        # 통과한 전략 수
-            timing_estimate: str,       # 예상 매수 타이밍
-            threshold_used: float,
-            detail: str,
-        }
-    """
-    config = strategy_config or {}
-    weights = config.get("weights", DEFAULT_ENTRY_WEIGHTS)
-    threshold_mode = config.get("threshold_mode", "balanced")
-    custom_threshold = config.get("custom_threshold")
-
-    # 임계값 결정
-    if custom_threshold is not None:
-        threshold = custom_threshold
+    if bull_count >= 4:
+        score_candle = ENTRY_SCORE_WEIGHTS["candle_strength"]
+        reasons.append("✅ 캔들 강세: 최근 5일 중 양봉 {}개".format(bull_count))
+    elif bull_count >= 3:
+        score_candle = ENTRY_SCORE_WEIGHTS["candle_strength"] * 0.6
+        reasons.append("🟡 캔들 보통: 최근 5일 중 양봉 {}개".format(bull_count))
     else:
-        threshold = ENTRY_THRESHOLDS.get(threshold_mode, 45)
+        reasons.append("❌ 캔들 약세: 최근 5일 중 양봉 {}개뿐".format(bull_count))
+    details["candle_strength"] = round(score_candle, 1)
 
-    # ── 전략 1: OBV 다이버전스 ──
-    obv_result = detect_obv_divergence(
-        candles,
-        lookback=config.get("obv_lookback", 20),
+    # ━━━ 총점 계산 ━━━
+    total_entry = sum(details.values())
+    result.total_score = round(total_entry, 1)
+    result.details = details
+    result.reasons = reasons
+
+    # ━━━ 종합점수 계산 (DTW × 0.6 + 진입품질 × 0.4) ━━━
+    composite = (
+        dtw_similarity * COMPOSITE_RATIO["dtw_similarity"]
+        + total_entry * COMPOSITE_RATIO["entry_quality"]
     )
+    result.composite_score = round(composite, 1)
 
-    # ── 전략 2: VCP 볼린저 스퀴즈 ──
-    vcp_result = detect_vcp_squeeze(
-        candles,
-        lookback=config.get("vcp_lookback", 120),
-        squeeze_threshold=config.get("vcp_squeeze_threshold", 0.4),
-    )
-
-    # ── 전략 3: 부분 DTW 매칭 ──
-    # ★ v5: skip_dtw 옵션 또는 clusters가 비어있으면 스킵 (불필요한 계산 제거)
-    if config.get("skip_dtw") or not clusters:
-        partial_dtw_result = {
-            "signal": False, "score": 0, "similarity": 0,
-            "best_cluster_id": -1, "detail": "DTW 스킵 (클러스터 없음)"
-        }
+    # ━━━ 등급 판정 ━━━
+    if composite >= ENTRY_THRESHOLDS["auto_buy"]:
+        result.entry_grade = "auto_buy"
+        result.entry_label = "🟢 자동매수"
+    elif composite >= ENTRY_THRESHOLDS["watch"]:
+        result.entry_grade = "watch"
+        result.entry_label = "🟡 감시"
     else:
-        partial_dtw_result = detect_partial_dtw(
-            candles,
-            clusters,
-            match_pct=config.get("partial_match_pct", 40),
-            min_similarity=config.get("partial_min_similarity", 50),
-        )
+        result.entry_grade = "hold"
+        result.entry_label = "⬜ 보류"
 
-    # ── 가중 합산 ──
-    w_obv = weights.get("obv", 0.35)
-    w_vcp = weights.get("vcp", 0.30)
-    w_dtw = weights.get("partial_dtw", 0.35)
-
-    # 가중치 정규화
-    total_w = w_obv + w_vcp + w_dtw
-    if total_w > 0:
-        w_obv /= total_w
-        w_vcp /= total_w
-        w_dtw /= total_w
-
-    entry_score = round(
-        obv_result["score"] * w_obv +
-        vcp_result["score"] * w_vcp +
-        partial_dtw_result["score"] * w_dtw,
-        1
-    )
-
-    # 통과 전략 수
-    active_signals = sum([
-        obv_result["signal"],
-        vcp_result["signal"],
-        partial_dtw_result["signal"],
-    ])
-
-    should_buy = entry_score >= threshold
-
-    # 타이밍 추정
-    timing = _estimate_timing(obv_result, vcp_result, partial_dtw_result)
-
-    # 상세 설명
-    signal_names = []
-    if obv_result["signal"]:
-        signal_names.append("OBV축적")
-    if vcp_result["signal"]:
-        signal_names.append("밴드스퀴즈")
-    if partial_dtw_result["signal"]:
-        signal_names.append(f"DTW{partial_dtw_result.get('similarity', 0):.0f}%")
-
-    if signal_names:
-        detail = f"{' + '.join(signal_names)} → 점수 {entry_score:.0f}/{threshold}"
-    else:
-        detail = f"시그널 없음 (점수 {entry_score:.0f}/{threshold})"
-
-    logger.info(
-        f"[진입판정] score={entry_score:.1f}, threshold={threshold}, "
-        f"buy={should_buy}, signals={active_signals}/3 "
-        f"(OBV={obv_result['signal']}, VCP={vcp_result['signal']}, "
-        f"DTW={partial_dtw_result['signal']})"
-    )
-
-    return {
-        "should_buy": should_buy,
-        "entry_score": entry_score,
-        "signals": {
-            "obv": obv_result,
-            "vcp": vcp_result,
-            "partial_dtw": partial_dtw_result,
-        },
-        "active_signals": active_signals,
-        "timing_estimate": timing,
-        "threshold_used": threshold,
-        "threshold_mode": threshold_mode,
-        "detail": detail,
-    }
-
-
-def _estimate_timing(obv: Dict, vcp: Dict, dtw: Dict) -> str:
-    """통과한 전략 조합에 따라 예상 매수 타이밍 추정"""
-    active = []
-    if obv["signal"]:
-        active.append("obv")
-    if vcp["signal"]:
-        active.append("vcp")
-    if dtw["signal"]:
-        active.append("dtw")
-
-    if len(active) == 3:
-        return "급등 2~4주 전 (강한 시그널)"
-    elif len(active) == 2:
-        if "obv" in active and "vcp" in active:
-            return "급등 2~3주 전 (축적+수축)"
-        elif "obv" in active and "dtw" in active:
-            return "급등 1~3주 전 (축적+패턴초기)"
-        elif "vcp" in active and "dtw" in active:
-            return "급등 1~2주 전 (수축+패턴초기)"
-    elif len(active) == 1:
-        if "obv" in active:
-            return "급등 3~4주 전 (축적 단독)"
-        elif "vcp" in active:
-            return "급등 2~3주 전 (수축 단독)"
-        elif "dtw" in active:
-            return "급등 1~2주 전 (패턴초기 단독)"
-
-    return "시그널 없음"
+    return result
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 배치 평가 (전종목 스캔용)
+# 배치 처리 / Batch Processing
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def batch_evaluate_entry(
-    stocks_candles: Dict[str, List[Dict]],
-    clusters: List[Dict],
-    strategy_config: Optional[Dict] = None,
+def score_recommendations(
+    recommendations: List[Dict],
+    candles_by_code: Dict,
 ) -> List[Dict]:
     """
-    여러 종목을 한번에 진입 전략 평가
+    매수 추천 목록에 진입 품질 점수를 추가
+    pattern_analyzer.py의 find_current_matches() 결과에 적용
 
-    Args:
-        stocks_candles: {종목코드: 일봉리스트} 딕셔너리
-        clusters: DTW 클러스터 리스트
-        strategy_config: 전략 설정
+    Parameters:
+        recommendations: find_current_matches() 반환값
+        candles_by_code: {종목코드: [캔들데이터]} 딕셔너리
 
     Returns:
-        진입 시그널이 있는 종목 리스트 (점수 내림차순)
-        [{code, should_buy, entry_score, active_signals, timing_estimate, signals, detail}]
+        recommendations에 entry_score 관련 필드가 추가된 리스트
     """
-    results = []
+    for rec in recommendations:
+        code = rec.get("code", "")
+        candles = candles_by_code.get(code, [])
+        dtw_sim = rec.get("similarity", 0)
 
-    for code, candles in stocks_candles.items():
-        try:
-            result = evaluate_entry(candles, clusters, strategy_config)
-            results.append({
-                "code": code,
-                **result,
-            })
-        except Exception as e:
-            logger.warning(f"[진입평가 실패] {code}: {e}")
-            continue
+        if candles:
+            score_result = calculate_entry_score(
+                candles=candles,
+                dtw_similarity=dtw_sim,
+            )
 
-    # 점수 내림차순 정렬
-    results.sort(key=lambda x: x["entry_score"], reverse=True)
+            # 추천 항목에 진입 품질 정보 추가
+            rec["entry_score"] = score_result.total_score
+            rec["composite_score"] = score_result.composite_score
+            rec["entry_grade"] = score_result.entry_grade
+            rec["entry_label"] = score_result.entry_label
+            rec["entry_details"] = score_result.details
+            rec["entry_reasons"] = score_result.reasons
 
-    return results
+            # ★ 종합점수 기반으로 시그널 재판정 (기존 DTW만 → DTW + 진입품질)
+            composite = score_result.composite_score
+            if composite >= 75:
+                rec["signal"] = "🟢 강력 매수"
+                rec["signal_code"] = "strong_buy"
+            elif composite >= 60:
+                rec["signal"] = "🟡 관심"
+                rec["signal_code"] = "watch"
+            elif composite >= 45:
+                rec["signal"] = "⚠️ 대기"
+                rec["signal_code"] = "wait"
+            else:
+                rec["signal"] = "⬜ 미해당"
+                rec["signal_code"] = "none"
+
+            # 기존 similarity 필드를 종합점수로 업데이트 (UI 호환)
+            rec["similarity_original"] = dtw_sim          # 원본 DTW 보존
+            rec["similarity"] = score_result.composite_score  # 종합점수로 교체
+
+        else:
+            rec["entry_score"] = 0
+            rec["composite_score"] = 0
+            rec["entry_grade"] = "hold"
+            rec["entry_label"] = "⬜ 데이터없음"
+            rec["entry_details"] = {}
+            rec["entry_reasons"] = ["❌ 캔들 데이터 없음"]
+
+    # 종합점수 높은 순 재정렬
+    recommendations.sort(key=lambda r: r.get("composite_score", 0), reverse=True)
+
+    return recommendations
+
+
+def filter_for_virtual_invest(
+    recommendations: List[Dict],
+    mode: str = "auto",
+    min_score: Optional[float] = None,
+) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    """
+    가상투자 진입 필터링 (3단계 적용)
+
+    Parameters:
+        recommendations: score_recommendations() 결과
+        mode: "auto" (자동분류) / "all" (전체 등록) / "strict" (75점↑만)
+        min_score: 커스텀 최소 점수 (mode="auto"일 때 무시)
+
+    Returns:
+        (auto_buy_list, watch_list, hold_list) 3개 리스트 튜플
+    """
+    auto_buy = []
+    watch = []
+    hold = []
+
+    for rec in recommendations:
+        grade = rec.get("entry_grade", "hold")
+        composite = rec.get("composite_score", 0)
+
+        if mode == "all":
+            # 전체 등록 모드 (기존 방식 호환)
+            auto_buy.append(rec)
+        elif mode == "strict":
+            # 엄격 모드 (75점 이상만)
+            if composite >= 75:
+                auto_buy.append(rec)
+            else:
+                hold.append(rec)
+        elif min_score is not None:
+            # 커스텀 점수 기준
+            if composite >= min_score:
+                auto_buy.append(rec)
+            elif composite >= min_score - 15:
+                watch.append(rec)
+            else:
+                hold.append(rec)
+        else:
+            # 자동 분류 (기본)
+            if grade == "auto_buy":
+                auto_buy.append(rec)
+            elif grade == "watch":
+                watch.append(rec)
+            else:
+                hold.append(rec)
+
+    return auto_buy, watch, hold
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# API 응답용 요약 / Summary for API Response
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def summarize_entry_scores(recommendations: List[Dict]) -> Dict:
+    """
+    진입 품질 점수 전체 요약 (API 응답에 포함)
+    """
+    if not recommendations:
+        return {"total": 0, "auto_buy": 0, "watch": 0, "hold": 0, "avg_score": 0}
+
+    auto_buy = sum(1 for r in recommendations if r.get("entry_grade") == "auto_buy")
+    watch = sum(1 for r in recommendations if r.get("entry_grade") == "watch")
+    hold = sum(1 for r in recommendations if r.get("entry_grade") == "hold")
+    avg_score = sum(r.get("composite_score", 0) for r in recommendations) / len(recommendations)
+
+    return {
+        "total": len(recommendations),
+        "auto_buy": auto_buy,
+        "watch": watch,
+        "hold": hold,
+        "avg_composite_score": round(avg_score, 1),
+        "filter_thresholds": ENTRY_THRESHOLDS,
+    }
