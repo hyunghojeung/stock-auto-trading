@@ -359,9 +359,9 @@ async def update_prices(portfolio_id: int):
                     continue
 
                 latest = candles[-1]
-                current_price = latest.get("close", 0)
-                high_price = latest.get("high", current_price)
-                low_price = latest.get("low", current_price)
+                api_price = latest.get("close", 0)
+                high_price = latest.get("high", api_price)
+                low_price = latest.get("low", api_price)
 
                 # 장외시간 판별 (한국시간 09:00~15:30 외)
                 now_kst = datetime.now(KST)
@@ -371,14 +371,16 @@ async def update_prices(portfolio_id: int):
                     and now_kst.weekday() < 5  # 주말 제외
                 )
 
-                if current_price <= 0:
-                    if not market_open:
-                        # 장외시간이면 buy_price 유지 (수익률 0% 처리)
-                        current_price = pos["buy_price"]
-                        high_price = current_price
-                        low_price = current_price
-                    else:
-                        continue
+                if not market_open:
+                    # 장외시간: 기존 저장된 현재가 유지 (없으면 매수가)
+                    existing_price = pos.get("current_price", 0)
+                    current_price = existing_price if existing_price > 0 else pos["buy_price"]
+                    high_price = current_price
+                    low_price = current_price
+                elif api_price <= 0:
+                    continue
+                else:
+                    current_price = api_price
 
                 buy_price = pos["buy_price"]
                 peak_price = max(pos.get("peak_price", buy_price), current_price)
