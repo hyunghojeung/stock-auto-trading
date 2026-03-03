@@ -954,13 +954,34 @@ async def start_realtime(
     }
 
 
+def _is_market_open() -> bool:
+    """한국 주식시장 운영시간 체크 (KST 기준) / Check Korean market hours"""
+    from datetime import timezone, timedelta as td
+    kst = datetime.now(timezone(td(hours=9)))
+    h, m = kst.hour, kst.minute
+    mins = h * 60 + m
+    day = kst.weekday()  # 0=Mon, 6=Sun
+    # 평일 09:00 ~ 15:30 KST
+    return day <= 4 and 540 <= mins <= 930
+
+
 async def update_realtime(session_id: str, supabase=None) -> Dict:
     """
-    실시간 모의투자 현재가 업데이트 (장 마감 후 호출)
-    Update realtime positions with current prices
+    실시간 모의투자 현재가 업데이트 (장중에만 허용)
+    Update realtime positions with current prices (market hours only)
     """
     if not supabase:
         return {"error": "DB 연결 없음"}
+
+    # ★ 장 운영시간 체크 — 장 마감 후에는 가격 갱신 차단
+    if not _is_market_open():
+        logger.info(f"[실시간모의] 장 마감 상태 — 가격 갱신 스킵 (session={session_id})")
+        return {
+            "session_id": session_id,
+            "updated": 0,
+            "market_closed": True,
+            "message": "장 마감 후에는 가격이 갱신되지 않습니다 (평일 09:00~15:30)"
+        }
 
     try:
         # 활성 포지션 조회
