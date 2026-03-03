@@ -975,6 +975,36 @@ async def batch_delete_portfolios(body: dict):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 7-3. 포트폴리오 일괄 가격 갱신
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.post("/batch-update-prices")
+async def batch_update_prices(body: dict):
+    """선택한 포트폴리오들의 가격을 일괄 갱신"""
+    ids = body.get("ids", [])
+    if not ids:
+        raise HTTPException(400, "갱신할 포트폴리오 ID가 없습니다")
+
+    results = []
+    errors = []
+
+    for pid in ids:
+        try:
+            result = await update_prices(pid)
+            results.append({"id": pid, "result": result})
+        except Exception as e:
+            errors.append({"id": pid, "error": str(e)})
+
+    return {
+        "success": True,
+        "updated": len(results),
+        "errors": errors,
+        "results": results,
+        "message": f"{len(results)}개 포트폴리오 가격 갱신 완료"
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 8. 종목 캔들 데이터 조회 (차트용)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
