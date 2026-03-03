@@ -312,22 +312,32 @@ def _save_scan_to_db(scan_params: Dict, stocks: List[Dict], stats: Dict) -> Opti
 
 
 def _load_latest_scan_from_db() -> Optional[Dict]:
-    """DB에서 가장 최근 스캔 결과 로드"""
+    """
+    ★ v6: DB에서 가장 최근 스캔 결과 로드 — status='done' 우선, 없으면 'running'도 시도
+    Load latest scan from DB — try 'done' first, fallback to 'running'
+    """
     try:
         from app.core.database import db
 
-        # 최근 세션 조회
-        resp = db.table("surge_scan_sessions") \
-            .select("*") \
-            .eq("status", "done") \
-            .order("scan_date", desc=True) \
-            .limit(1) \
-            .execute()
+        # ★ v6: done 우선, 없으면 running도 시도 (finalize 실패 대비)
+        session = None
+        for status in ["done", "running"]:
+            resp = db.table("surge_scan_sessions") \
+                .select("*") \
+                .eq("status", status) \
+                .order("scan_date", desc=True) \
+                .limit(1) \
+                .execute()
+            if resp.data:
+                session = resp.data[0]
+                if status == "running":
+                    logger.info(f"★ done 세션 없음 → running 세션 {session['id']} 사용 (finalize 실패 추정)")
+                break
 
-        if not resp.data:
+        if not session:
+            logger.warning("DB에 스캔 세션이 없습니다")
             return None
 
-        session = resp.data[0]
         session_id = session["id"]
 
         # 해당 세션의 종목 결과 로드 (페이지네이션)
@@ -348,12 +358,16 @@ def _load_latest_scan_from_db() -> Optional[Dict]:
                 break
             offset += page_size
 
+        if not all_stock_rows:
+            logger.warning(f"세션 {session_id}에 종목 데이터가 없습니다")
+            return None
+
         stocks = []
         for row in all_stock_rows:
             surges = []
             try:
                 surges = json.loads(row.get("surges_json", "[]"))
-            except:
+            except Exception:
                 pass
 
             stocks.append({
@@ -372,6 +386,8 @@ def _load_latest_scan_from_db() -> Optional[Dict]:
                 "surges": surges,
             })
 
+        logger.info(f"DB에서 스캔 결과 로드 성공: session_id={session_id}, {len(stocks)}개 종목")
+
         return {
             "stocks": stocks,
             "stats": {
@@ -380,6 +396,7 @@ def _load_latest_scan_from_db() -> Optional[Dict]:
                 "total_surges": session.get("total_surges", 0),
                 "high_manip_count": session.get("high_manip_count", 0),
                 "medium_manip_count": session.get("medium_manip_count", 0),
+                "entry_signal_count": 0,  # ★ v6: DB에는 entry_signals 미저장
                 "scan_params": {
                     "period_days": session.get("period_days", 365),
                     "rise_pct": session.get("rise_pct", 30.0),
@@ -392,7 +409,7 @@ def _load_latest_scan_from_db() -> Optional[Dict]:
         }
 
     except Exception as e:
-        logger.error(f"DB 로드 실패: {e}")
+        logger.error(f"DB 로드 실패: {e}\n{traceback.format_exc()}")
         return None
 
 
@@ -858,8 +875,9 @@ async def get_scan_result():
 @router.get("/latest")
 async def get_latest_scan():
     """
-    DB에 저장된 가장 최근 스캔 결과를 로드합니다.
+    ★ v6: DB에 저장된 가장 최근 스캔 결과를 로드합니다.
     재접속 시 자동으로 호출하여 이전 스캔 결과를 복원합니다.
+    메모리 → DB(done) → DB(running) 순서로 시도
     """
     # 1) 먼저 메모리에 있으면 메모리 결과 반환
     if _scanner_state["result"] is not None:
@@ -869,7 +887,7 @@ async def get_latest_scan():
             **_scanner_state["result"],
         }
 
-    # 2) 메모리에 없으면 DB에서 로드
+    # 2) 메모리에 없으면 DB에서 로드 (done + running 모두 시도)
     data = _load_latest_scan_from_db()
     if data is None:
         return {
