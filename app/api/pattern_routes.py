@@ -30,12 +30,15 @@ from app.engine.pattern_analyzer import (
     run_pattern_analysis,
 )
 
-# dtw_similarity + z_normalize 캐시 함수
+# dtw_similarity + z_normalize 캐시 함수 + ★ v8: 조기진입 감지
 try:
-    from app.engine.pattern_analyzer import dtw_similarity, _z_normalize_cached
+    from app.engine.pattern_analyzer import dtw_similarity, _z_normalize_cached, compute_early_entry_score
 except ImportError:
     def _z_normalize_cached(s):
         return s
+    def compute_early_entry_score(*args, **kwargs):
+        return {"early_entry": False, "early_score": 0, "pattern_progress": 1.0,
+                "best_partial_sim": 0, "ma20_proximity": False, "volume_declining": False, "entry_reason": ""}
 
 try:
     from app.engine.pattern_analyzer import dtw_similarity
@@ -302,6 +305,8 @@ def _match_from_db_vectors(
         # ★ v5: 사전 정규화 + early exit DTW 비교
         best_sim = 0
         best_cluster_id = 0
+        best_cluster_ret = []
+        best_cluster_vol = []
         norm_ret = _z_normalize_cached(current_returns)
         norm_vol = _z_normalize_cached(current_volumes)
 
@@ -319,8 +324,26 @@ def _match_from_db_vectors(
                 if sim > best_sim:
                     best_sim = sim
                     best_cluster_id = cluster.get("cluster_id", 0)
+                    best_cluster_ret = cluster.get("avg_return_flow", [])
+                    best_cluster_vol = cluster.get("avg_volume_flow", [])
             except Exception:
                 continue
+
+        # ★ v8: 조기 진입 점수 계산 (부분 패턴 매칭)
+        early_info = {"early_entry": False, "early_score": 0, "pattern_progress": 1.0,
+                      "best_partial_sim": 0, "ma20_proximity": False, "volume_declining": False, "entry_reason": ""}
+        try:
+            if best_sim >= 35 and best_cluster_ret:
+                early_info = compute_early_entry_score(
+                    current_returns=current_returns,
+                    current_volumes=current_volumes,
+                    cluster_returns=best_cluster_ret,
+                    cluster_volumes=best_cluster_vol,
+                    candles=None,  # DB 벡터 모드에서는 candles 없음
+                    pre_days=pre_days,
+                )
+        except Exception:
+            pass
 
         # 시그널 판단
         if best_sim >= 65:
@@ -349,6 +372,11 @@ def _match_from_db_vectors(
                 "current_volumes": current_volumes[-5:],
                 "last_date": row.get("last_date", ""),
                 "signal_date": row.get("last_date", ""),
+                # ★ v8: 조기 진입 정보
+                "early_entry": early_info.get("early_entry", False),
+                "early_score": early_info.get("early_score", 0),
+                "pattern_progress": early_info.get("pattern_progress", 1.0),
+                "early_reason": early_info.get("entry_reason", ""),
             })
 
         # 진행률 업데이트 (500개마다)
