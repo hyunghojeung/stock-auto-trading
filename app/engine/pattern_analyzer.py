@@ -16,8 +16,6 @@ Pattern Surge Detector — DTW-based Analysis Engine
      3) 유사도 공식 → 선형 정규화 (변별력 향상)
      4) 클러스터 신뢰도 → 멤버수+유사도 기반 점수
      5) 3단계 급상승 탐지 → S/A/B급
-[v5] 진입 품질 점수 산출기 통합 — 9항목(MA/거래량/RSI/가격위치 등) 점수화
-     DTW유사도 60% + 진입품질 40% = 종합점수 → 자동매수/감시/보류 분류
 """
 
 import numpy as np
@@ -27,12 +25,19 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
-# ★ v5: 진입 품질 점수 산출기
+
+# v5+v6 imports
 try:
     from app.engine.entry_scorer import score_recommendations, summarize_entry_scores
     ENTRY_SCORER_AVAILABLE = True
 except ImportError:
     ENTRY_SCORER_AVAILABLE = False
+
+try:
+    from app.engine.rec_backtest import backtest_recommended_stocks
+    REC_BACKTEST_AVAILABLE = True
+except ImportError:
+    REC_BACKTEST_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +163,8 @@ class AnalysisResult:
     summary: Dict               # 공통 패턴 요약
     raw_surges: List[Dict]      # 급상승 구간 목록
     dip_matches: Dict = field(default_factory=dict)  # ★ v3: 눌림목 패턴 매칭 결과
-    entry_summary: Dict = field(default_factory=dict)  # ★ v5: 진입 품질 점수 요약
+    entry_summary: Dict = field(default_factory=dict)  # v5
+    rec_backtest_result: Dict = field(default_factory=dict)  # v6
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -977,12 +983,11 @@ def run_pattern_analysis(
         dip_results=dip_results  # ★ v3: 패턴 라이브러리 결과 전달
     )
 
-    # ── Step 3.5: 진입 품질 점수 산출 ★ v5 ──
+    # ── v5: Step 3.5 entry scoring ──
     entry_summary = {}
+    candles_dict_by_code = {}
     if ENTRY_SCORER_AVAILABLE and recommendations:
         try:
-            # candles_by_code의 CandleDay 객체를 dict로 변환
-            candles_dict_by_code = {}
             for code, candles_list in candles_by_code.items():
                 candles_dict_by_code[code] = [
                     {"date": c.date, "open": c.open, "high": c.high,
@@ -994,16 +999,36 @@ def run_pattern_analysis(
                 candles_by_code=candles_dict_by_code,
             )
             entry_summary = summarize_entry_scores(recommendations)
-            logger.info(
-                f"[v5] 진입 품질 점수 산출 완료: "
-                f"{entry_summary.get('auto_buy', 0)}건 자동매수 / "
-                f"{entry_summary.get('watch', 0)}건 감시 / "
-                f"{entry_summary.get('hold', 0)}건 보류"
-            )
+            logger.info("[v5] entry scoring done")
             if progress_callback:
-                progress_callback(85, f"진입 품질 평가: 자동매수 {entry_summary.get('auto_buy', 0)}건")
+                progress_callback(85, "entry scoring done")
         except Exception as e:
-            logger.warning(f"[v5] 진입 품질 점수 산출 실패 (무시): {e}")
+            logger.warning(f"[v5] entry scoring failed: {e}")
+
+    # ── v6: Step 3.7 rec backtest ──
+    rec_backtest_result = {}
+    if REC_BACKTEST_AVAILABLE and recommendations and clusters:
+        try:
+            if not candles_dict_by_code:
+                for code, candles_list in candles_by_code.items():
+                    candles_dict_by_code[code] = [
+                        {"date": c.date, "open": c.open, "high": c.high,
+                         "low": c.low, "close": c.close, "volume": c.volume}
+                        for c in candles_list
+                    ]
+            if progress_callback:
+                progress_callback(87, "rec backtest running...")
+            rec_backtest_result = backtest_recommended_stocks(
+                recommendations=recommendations,
+                candles_by_code=candles_dict_by_code,
+                clusters=clusters,
+                pre_days=pre_days,
+            )
+            logger.info("[v6] rec backtest done")
+            if progress_callback:
+                progress_callback(89, "rec backtest done")
+        except Exception as e:
+            logger.warning(f"[v6] rec backtest failed: {e}")
 
     # ── Step 4: 요약 생성 ──
     if progress_callback:
@@ -1043,7 +1068,8 @@ def run_pattern_analysis(
         summary=summary,
         raw_surges=surges_dict,
         dip_matches=dip_results,  # ★ v3
-        entry_summary=entry_summary,  # ★ v5
+        entry_summary=entry_summary,  # v5
+        rec_backtest_result=rec_backtest_result,  # v6
     )
 
 
