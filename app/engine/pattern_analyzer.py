@@ -798,6 +798,7 @@ def find_current_matches(
         best_sim = 0
         best_cluster_id = 0
         best_confidence = 0
+        best_cluster_obj = None  # ★ v8: 조기진입 계산용
 
         for cluster in clusters:
             if not cluster.avg_return_flow:
@@ -828,6 +829,23 @@ def find_current_matches(
                 best_sim = sim
                 best_cluster_id = cluster.cluster_id
                 best_confidence = cluster.confidence
+                best_cluster_obj = cluster  # ★ v8
+
+        # ★ v8: 조기 진입 점수 계산
+        early_info = {"early_entry": False, "early_score": 0, "pattern_progress": 1.0,
+                      "best_partial_sim": 0, "entry_reason": ""}
+        if best_cluster_obj and best_sim >= 35:
+            try:
+                early_info = compute_early_entry_score(
+                    current_returns=current_returns,
+                    current_volumes=current_volumes,
+                    cluster_returns=best_cluster_obj.avg_return_flow,
+                    cluster_volumes=best_cluster_obj.avg_volume_flow or [],
+                    candles=candles,
+                    pre_days=pre_days,
+                )
+            except Exception:
+                pass
 
         # ★ v3: 패턴 라이브러리 가산점
         dip_info = dip_results.get(code)
@@ -900,6 +918,11 @@ def find_current_matches(
             # ★ v7: MA 필터
             'ma5_declining': ma5_declining,
             'ma5_above_ma20': ma5_above_ma20,
+            # ★ v8: 조기 진입 정보
+            'early_entry': early_info.get("early_entry", False),
+            'early_score': early_info.get("early_score", 0),
+            'pattern_progress': early_info.get("pattern_progress", 1.0),
+            'early_reason': early_info.get("entry_reason", ""),
         })
 
     # 유사도 높은 순 정렬
@@ -1113,3 +1136,133 @@ def _generate_summary(surges, patterns, clusters) -> Dict:
         'total_clusters': len(clusters),
         'common_features': features,
     }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ v8: 조기 진입 감지 (Partial Pattern Matching)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def compute_early_entry_score(
+    current_returns: List[float],
+    current_volumes: List[float],
+    cluster_returns: List[float],
+    cluster_volumes: List[float],
+    candles: List = None,
+    pre_days: int = 10,
+) -> Dict:
+    """
+    ★ v8: 부분 패턴 매칭으로 조기 진입 점수 계산
+    Partial DTW matching for early entry detection
+
+    핵심 원리:
+      - 클러스터 패턴의 앞쪽 60~80%만 비교
+      - 현재 종목의 최근 며칠이 패턴 초반부와 일치하면 → 아직 급상승 전
+      - MA20 근접 + 거래량 감소 = 최적 진입 시점
+
+    Returns:
+        {
+            "early_entry": True/False,
+            "early_score": 0~100,
+            "pattern_progress": 0.6~1.0,  # 패턴 진행률
+            "best_partial_sim": 62.5,     # 부분 매칭 유사도
+            "ma20_proximity": True/False,
+            "volume_declining": True/False,
+            "entry_reason": "패턴 70% 형성 + MA20 근접 + 거래량 감소"
+        }
+    """
+    result = {
+        "early_entry": False,
+        "early_score": 0,
+        "pattern_progress": 1.0,
+        "best_partial_sim": 0,
+        "ma20_proximity": False,
+        "volume_declining": False,
+        "entry_reason": "",
+    }
+
+    if not cluster_returns or not current_returns:
+        return result
+
+    cluster_len = len(cluster_returns)
+    if cluster_len < 5:
+        return result
+
+    # ── 1) 부분 패턴 매칭 (60%, 70%, 80%) ──
+    best_partial_sim = 0
+    best_ratio = 1.0
+
+    for ratio in [0.6, 0.7, 0.8]:
+        partial_len = max(4, int(cluster_len * ratio))
+
+        # 클러스터 패턴의 앞부분 (급상승 전 초반 구간)
+        cluster_partial_ret = cluster_returns[:partial_len]
+        cluster_partial_vol = cluster_volumes[:partial_len] if cluster_volumes else []
+
+        # 현재 종목의 최근 partial_len일
+        if len(current_returns) < partial_len:
+            continue
+        stock_partial_ret = current_returns[-partial_len:]
+        stock_partial_vol = current_volumes[-partial_len:] if current_volumes else []
+
+        # DTW 유사도 계산
+        sim_r = dtw_similarity(stock_partial_ret, cluster_partial_ret)
+        sim_v = dtw_similarity(stock_partial_vol, cluster_partial_vol) if stock_partial_vol and cluster_partial_vol else 0
+        partial_sim = sim_r * 0.6 + sim_v * 0.4
+
+        if partial_sim > best_partial_sim:
+            best_partial_sim = partial_sim
+            best_ratio = ratio
+
+    result["best_partial_sim"] = round(best_partial_sim, 1)
+    result["pattern_progress"] = best_ratio
+
+    # ── 2) MA20 근접도 체크 ──
+    if candles and len(candles) >= 25:
+        try:
+            last_close = candles[-1].close if hasattr(candles[-1], 'close') else candles[-1].get('close', 0)
+            ma20 = sum(
+                (c.close if hasattr(c, 'close') else c.get('close', 0))
+                for c in candles[-20:]
+            ) / 20
+            if ma20 > 0:
+                ma20_dist = abs(last_close - ma20) / ma20 * 100
+                result["ma20_proximity"] = ma20_dist <= 3.0  # MA20에서 3% 이내
+        except Exception:
+            pass
+
+    # ── 3) 거래량 감소 추세 체크 ──
+    if current_volumes and len(current_volumes) >= 5:
+        recent_3 = current_volumes[-3:]
+        prev_3 = current_volumes[-6:-3] if len(current_volumes) >= 6 else current_volumes[:3]
+        avg_recent = sum(recent_3) / len(recent_3)
+        avg_prev = sum(prev_3) / len(prev_3) if prev_3 else 1
+        result["volume_declining"] = avg_recent < avg_prev * 0.85  # 최근 거래량 15% 이상 감소
+
+    # ── 4) 조기 진입 종합 점수 계산 ──
+    score = 0
+    reasons = []
+
+    # 부분 매칭 점수 (최대 50점)
+    if best_partial_sim >= 45 and best_ratio < 0.85:
+        partial_score = min(50, (best_partial_sim - 30) * 1.5)
+        score += partial_score
+        progress_pct = int(best_ratio * 100)
+        reasons.append(f"패턴 {progress_pct}% 형성 (유사도 {best_partial_sim:.0f}%)")
+
+    # MA20 근접 보너스 (최대 25점)
+    if result["ma20_proximity"]:
+        score += 25
+        reasons.append("MA20 근접 (3% 이내)")
+
+    # 거래량 감소 보너스 (최대 25점)
+    if result["volume_declining"]:
+        score += 25
+        reasons.append("거래량 감소 추세")
+
+    result["early_score"] = round(min(100, score))
+    result["entry_reason"] = " + ".join(reasons) if reasons else "조건 미충족"
+
+    # 조기 진입 판정: 점수 40 이상 + 패턴 진행률 85% 미만
+    result["early_entry"] = result["early_score"] >= 40 and best_ratio < 0.85
+
+    return result
