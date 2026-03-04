@@ -258,7 +258,7 @@ async def realtime_start(req: RealtimeStartRequest):
 
         # ★ v9: KST 시간 사용
         now_kst = datetime.now(KST)
-        now_str = now_kst.strftime("%Y-%m-%dT%H:%M:%S")
+        now_str = now_kst.isoformat()
         market_open = is_market_open_now()
 
         logger.info(f"[가상투자] 등록 시작 — KST={now_kst.strftime('%H:%M:%S')}, 장중={market_open}, 종목수={len(stocks_list)}")
