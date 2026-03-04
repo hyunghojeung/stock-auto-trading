@@ -29,6 +29,27 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/virtual-portfolio", tags=["virtual-portfolio"])
 
+
+# ★ v9: 서버 시간 & 장 상태 확인 (디버깅용)
+@router.get("/debug/time")
+async def debug_time():
+    """서버 시간 & 장 상태 확인"""
+    from datetime import datetime, timezone, timedelta
+    utc_now = datetime.now(timezone.utc)
+    kst_now = datetime.now(KST)
+    market_open = is_market_open_now()
+    market_status = get_market_status()
+    return {
+        "utc": utc_now.strftime("%Y-%m-%d %H:%M:%S"),
+        "kst": kst_now.strftime("%Y-%m-%d %H:%M:%S"),
+        "kst_isoformat": kst_now.isoformat(),
+        "kst_strftime": kst_now.strftime("%Y-%m-%dT%H:%M:%S"),
+        "is_market_open": market_open,
+        "market_status": market_status,
+        "today_kst": kst_now.date().isoformat(),
+    }
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 요청/응답 모델
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -138,12 +159,17 @@ async def register_portfolio(req: RegisterRequest):
 
             # ★ v9: 매수가 결정 — 장중이면 실시간 체결가, 장외면 직전 종가
             try:
-                if is_market_open_now():
+                market_now = is_market_open_now()
+                logger.info(f"[{code}] 매수가 결정 시작 — 장중={market_now}, KST={datetime.now(KST).strftime('%H:%M:%S')}")
+
+                if market_now:
                     # 장중: 실시간 체결가
                     rt = get_realtime_price_naver(code)
                     buy_price = rt["price"] if rt and rt.get("price", 0) > 0 else 0
+                    logger.info(f"[{code}] 실시간 가격 조회: {buy_price}")
                 else:
                     buy_price = 0
+                    logger.info(f"[{code}] 장외 시간 → 실시간 조회 건너뜀")
 
                 # 실시간 가격 없으면 → 네이버 일봉에서 직전 종가(close) 사용
                 if buy_price <= 0:
@@ -164,7 +190,10 @@ async def register_portfolio(req: RegisterRequest):
                 buy_price = stock.get("current_price", 0)
 
             if buy_price <= 0:
+                logger.warning(f"[{code}] 매수가 0원 → 종목 제외")
                 continue
+
+            logger.info(f"[{code}] ★ 최종 매수가: {buy_price}원")
 
             # 수수료 차감
             commission = per_stock * COMMISSION_RATE
