@@ -16,13 +16,13 @@ import math
 import logging
 import asyncio
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
 from app.core.database import db
-from app.utils.kr_holiday import is_market_open_day, get_market_status, is_market_open_now
+from app.utils.kr_holiday import is_market_open_day, get_market_status, is_market_open_now, KST
 from app.services.naver_stock import get_daily_candles_naver, get_realtime_price_naver
 
 logger = logging.getLogger(__name__)
@@ -105,12 +105,12 @@ async def register_portfolio(req: RegisterRequest):
         raise HTTPException(400, "종목을 선택해주세요")
 
     # ★ 장 운영일 체크 — 주말/공휴일에는 포트폴리오 등록 불가
-    today = datetime.now().date()
+    today = datetime.now(KST).date()
     if not is_market_open_day(today):
         status = get_market_status()
         raise HTTPException(400, f"현재 {status} — 장 운영일에만 포트폴리오를 등록할 수 있습니다")
 
-    now = datetime.now().isoformat()
+    now = datetime.now(KST).isoformat()
     name = req.name or f"포트폴리오 {now[:10]}"
 
     try:
@@ -136,21 +136,30 @@ async def register_portfolio(req: RegisterRequest):
         for stock in req.stocks:
             code = stock["code"]
 
-            # ★ 매수가 결정: 장중이면 실시간 현재가, 아니면 당일 시가
+            # ★ v9: 매수가 결정 — 장중이면 실시간 체결가, 장외면 직전 종가
             try:
                 if is_market_open_now():
+                    # 장중: 실시간 체결가
                     rt = get_realtime_price_naver(code)
                     buy_price = rt["price"] if rt and rt.get("price", 0) > 0 else 0
                 else:
                     buy_price = 0
 
-                # 실시간 조회 실패 시 → 일봉 시가 폴백
+                # 실시간 가격 없으면 → 네이버 일봉에서 직전 종가(close) 사용
                 if buy_price <= 0:
                     candles = get_daily_candles_naver(code, count=3)
                     if candles and len(candles) > 0:
-                        buy_price = candles[-1].get("open", 0) or candles[-1].get("close", 0)
+                        # ★ v9: open이 아닌 close(직전 종가)를 매수가로 사용
+                        buy_price = candles[-1].get("close", 0) or candles[-1].get("open", 0)
                     else:
-                        buy_price = stock.get("current_price", 0)
+                        buy_price = 0
+
+                # 일봉도 실패 시 → 프론트 전달 가격 사용 (최후 수단)
+                if buy_price <= 0:
+                    buy_price = stock.get("current_price", 0)
+                    if buy_price > 0:
+                        logger.warning(f"[{code}] 네이버 조회 실패 → 프론트 전달 가격 사용: {buy_price}")
+
             except Exception:
                 buy_price = stock.get("current_price", 0)
 
@@ -357,7 +366,7 @@ async def update_prices(portfolio_id: int):
                 if rt and rt.get("price", 0) > 0:
                     realtime_map[code] = rt
 
-        now = datetime.now().isoformat()
+        now = datetime.now(KST).isoformat()
         today = now[:10]
         updated_count = 0
         closed_count = 0
@@ -395,7 +404,7 @@ async def update_prices(portfolio_id: int):
                 # 보유일 계산
                 try:
                     bd = datetime.fromisoformat(str(buy_date).replace("Z", "+00:00"))
-                    hold_days = (datetime.now(bd.tzinfo) - bd).days if bd.tzinfo else (datetime.now() - bd).days
+                    hold_days = (datetime.now(KST) - bd.replace(tzinfo=KST)).days if not bd.tzinfo else (datetime.now(KST) - bd).days
                 except Exception:
                     hold_days = pos.get("hold_days", 0) + 1
 
@@ -678,7 +687,7 @@ def update_all_active_portfolios():
     import time
 
     # ★ 장 운영일이 아니면 스킵
-    today = datetime.now().date()
+    today = datetime.now(KST).date()
     if not is_market_open_day(today):
         logger.info(f"[가상포트] 장 운영일이 아님 ({get_market_status()}) — 일괄 갱신 스킵")
         return
@@ -718,7 +727,7 @@ def _sync_update_prices(portfolio_id: int):
     portfolio = pf_resp.data[0]
     strategy = portfolio.get("strategy", "smart")
     params = STRATEGY_PARAMS.get(strategy, STRATEGY_PARAMS["smart"])
-    now = datetime.now().isoformat()
+    now = datetime.now(KST).isoformat()
     today = now[:10]
 
     pos_resp = db.table("virtual_positions") \
@@ -746,7 +755,7 @@ def _sync_update_prices(portfolio_id: int):
 
             try:
                 bd = datetime.fromisoformat(str(pos["buy_date"]).replace("Z", "+00:00"))
-                hold_days = (datetime.now(bd.tzinfo) - bd).days if bd.tzinfo else (datetime.now() - bd).days
+                hold_days = (datetime.now(KST) - bd.replace(tzinfo=KST)).days if not bd.tzinfo else (datetime.now(KST) - bd).days
             except Exception:
                 hold_days = pos.get("hold_days", 0) + 1
 
@@ -878,7 +887,7 @@ def _sync_update_prices(portfolio_id: int):
 @router.post("/close/{portfolio_id}")
 async def close_portfolio(portfolio_id: int):
     """포트폴리오 전체 수동 청산"""
-    now = datetime.now().isoformat()
+    now = datetime.now(KST).isoformat()
 
     try:
         # 보유 중인 포지션 현재가 기준 청산
@@ -928,7 +937,7 @@ async def rename_portfolio(portfolio_id: int, req: dict):
 
         db.table("virtual_portfolios").update({
             "name": new_name,
-            "updated_at": datetime.now().isoformat(),
+            "updated_at": datetime.now(KST).isoformat(),
         }).eq("id", portfolio_id).execute()
 
         logger.info(f"[가상포트] #{portfolio_id} 제목 변경: {new_name}")
@@ -1085,7 +1094,7 @@ async def fix_buy_prices():
                     "quantity": new_quantity,
                     "profit_pct": 0,
                     "profit_won": 0,
-                    "updated_at": datetime.now().isoformat(),
+                    "updated_at": datetime.now(KST).isoformat(),
                 }).eq("id", pos["id"]).execute()
 
                 fixed.append({
@@ -1121,7 +1130,7 @@ async def fix_buy_prices():
                 "current_value": round(total_value),
                 "total_return_won": round(total_profit),
                 "total_return_pct": 0,
-                "updated_at": datetime.now().isoformat(),
+                "updated_at": datetime.now(KST).isoformat(),
             }).eq("id", pf_id).execute()
 
         logger.info(f"[가상포트] buy_price 교정 완료: {len(fixed)}건 수정, {len(errors)}건 오류")
@@ -1197,7 +1206,7 @@ def _auto_reinvest(portfolio_id: int, recovered_capital: float,
         # ── 안전장치 3: 스캔 결과 신선도 체크 (7일 이내) ──
         try:
             scan_date = datetime.fromisoformat(str(session["scan_date"]).replace("Z", "+00:00"))
-            days_old = (datetime.now(scan_date.tzinfo) - scan_date).days if scan_date.tzinfo else (datetime.now() - scan_date).days
+            days_old = (datetime.now(scan_date.tzinfo) - scan_date).days if scan_date.tzinfo else (datetime.now(KST) - scan_date).days
             if days_old > 7:
                 logger.info(f"[자동재투자] #{portfolio_id} 스캔 결과 {days_old}일 경과 — 스킵")
                 return 0
@@ -1245,7 +1254,7 @@ def _auto_reinvest(portfolio_id: int, recovered_capital: float,
         invest_capital = recovered_capital * 0.8
         per_stock = invest_capital / len(selected)
 
-        now = datetime.now().isoformat()
+        now = datetime.now(KST).isoformat()
         today = now[:10]
         new_count = 0
 
@@ -1345,7 +1354,7 @@ def _check_compound_reinvest(portfolio_id: int):
         group = grp.data[0]
         seed = group["seed_money"]
         goal = group["goal_amount"]
-        now = datetime.now().isoformat()
+        now = datetime.now(KST).isoformat()
 
         # 누적 통계
         total_rounds = group.get("total_rounds", 0) + 1
@@ -1386,7 +1395,7 @@ def _check_compound_reinvest(portfolio_id: int):
 @router.post("/compound/create")
 async def create_compound_group(req: CompoundCreateRequest):
     """복리 그룹 생성 + 1회차 포트폴리오 (종목 있으면 즉시 등록)"""
-    now = datetime.now().isoformat()
+    now = datetime.now(KST).isoformat()
 
     try:
         grp_resp = db.table("compound_groups").insert({
@@ -1564,7 +1573,7 @@ async def get_compound_detail(group_id: int):
 @router.post("/compound/{group_id}/next-round")
 async def start_next_round(group_id: int, req: CompoundNextRoundRequest):
     """다음 회차 포트폴리오 생성 (종목 선택 후 호출)"""
-    now = datetime.now().isoformat()
+    now = datetime.now(KST).isoformat()
 
     try:
         grp = db.table("compound_groups").select("*").eq("id", group_id).execute()
@@ -1676,7 +1685,7 @@ async def start_next_round(group_id: int, req: CompoundNextRoundRequest):
 async def stop_compound_group(group_id: int):
     """복리 그룹 중단"""
     try:
-        now = datetime.now().isoformat()
+        now = datetime.now(KST).isoformat()
         db.table("compound_groups").update({
             "status": "stopped",
             "updated_at": now,
@@ -1695,7 +1704,7 @@ async def edit_compound_group(group_id: int, req: dict):
         if not grp.data:
             raise HTTPException(404, f"복리 그룹 #{group_id}를 찾을 수 없습니다")
 
-        update_data = {"updated_at": datetime.now().isoformat()}
+        update_data = {"updated_at": datetime.now(KST).isoformat()}
 
         if "name" in req and req["name"]:
             update_data["name"] = req["name"]
@@ -1738,7 +1747,7 @@ async def delete_compound_group(group_id: int):
         # 연결된 포트폴리오의 compound_group_id 해제 (포트폴리오 자체는 보존)
         db.table("virtual_portfolios").update({
             "compound_group_id": None,
-            "updated_at": datetime.now().isoformat(),
+            "updated_at": datetime.now(KST).isoformat(),
         }).eq("compound_group_id", group_id).execute()
 
         # 그룹 삭제
