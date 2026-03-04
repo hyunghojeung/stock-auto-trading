@@ -30,15 +30,17 @@ from app.engine.pattern_analyzer import (
     run_pattern_analysis,
 )
 
-# dtw_similarity + z_normalize 캐시 함수 + ★ v8: 조기진입 감지
+# dtw_similarity + z_normalize 캐시 함수 + ★ v8: 조기진입 감지 + ★ v9: 골든크로스
 try:
-    from app.engine.pattern_analyzer import dtw_similarity, _z_normalize_cached, compute_early_entry_score
+    from app.engine.pattern_analyzer import dtw_similarity, _z_normalize_cached, compute_early_entry_score, _days_since_golden_cross
 except ImportError:
     def _z_normalize_cached(s):
         return s
     def compute_early_entry_score(*args, **kwargs):
         return {"early_entry": False, "early_score": 0, "pattern_progress": 1.0,
-                "best_partial_sim": 0, "ma20_proximity": False, "volume_declining": False, "entry_reason": ""}
+                "best_partial_sim": 0, "ma20_proximity": False, "volume_declining": False, "entry_reason": "", "gc_days": -1}
+    def _days_since_golden_cross(candles, ma_short=5, ma_long=20):
+        return -1
 
 try:
     from app.engine.pattern_analyzer import dtw_similarity
@@ -377,6 +379,9 @@ def _match_from_db_vectors(
                 "early_score": early_info.get("early_score", 0),
                 "pattern_progress": early_info.get("pattern_progress", 1.0),
                 "early_reason": early_info.get("entry_reason", ""),
+                # ★ v9: 골든크로스 경과일 (DB벡터 모드: candles 없으므로 -1)
+                "gc_days": early_info.get("gc_days", -1),
+                "gc_filtered": False,
             })
 
         # 진행률 업데이트 (500개마다)
