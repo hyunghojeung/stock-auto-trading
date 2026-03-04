@@ -874,6 +874,7 @@ def find_current_matches(
         # ★ v7: MA5 하향 여부 + MA5>MA20 판정
         ma5_declining = False
         ma5_above_ma20 = True
+        gc_days = -1  # ★ v9: 골든크로스 경과일
         if len(candles) >= 25:
             ma5_vals = []
             for d in range(4):  # 최근 4일의 MA5 계산 (오늘, 어제, 2일전, 3일전)
@@ -888,6 +889,12 @@ def find_current_matches(
             ma5_today = sum(candles[k].close for k in range(len(candles)-5, len(candles))) / 5
             ma20_today = sum(candles[k].close for k in range(len(candles)-20, len(candles))) / 20
             ma5_above_ma20 = ma5_today > ma20_today
+
+            # ★ v9: 골든크로스 경과일 계산
+            try:
+                gc_days = _days_since_golden_cross(candles)
+            except Exception:
+                gc_days = -1
         elif len(candles) >= 10:
             ma5_vals = []
             for d in range(4):
@@ -898,6 +905,14 @@ def find_current_matches(
                     ma5_vals.append(ma5)
             if len(ma5_vals) >= 3:
                 ma5_declining = ma5_vals[0] < ma5_vals[1] < ma5_vals[2]
+
+        # ★ v9: MA5>MA20 골든크로스 5일 경과 → 시그널 다운그레이드
+        gc_filtered = False
+        if gc_days >= 5:
+            gc_filtered = True
+            if signal_code in ("strong_buy", "watch"):
+                signal = f"⏰ GC+{gc_days}일 경과"
+                signal_code = "gc_expired"
 
         recommendations.append({
             'code': code,
@@ -918,6 +933,9 @@ def find_current_matches(
             # ★ v7: MA 필터
             'ma5_declining': ma5_declining,
             'ma5_above_ma20': ma5_above_ma20,
+            # ★ v9: 골든크로스 경과일 필터
+            'gc_days': gc_days,
+            'gc_filtered': gc_filtered,
             # ★ v8: 조기 진입 정보
             'early_entry': early_info.get("early_entry", False),
             'early_score': early_info.get("early_score", 0),
@@ -1139,6 +1157,47 @@ def _generate_summary(surges, patterns, clusters) -> Dict:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ v9: MA5>MA20 골든크로스 경과일 계산
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _days_since_golden_cross(candles, ma_short: int = 5, ma_long: int = 20) -> int:
+    """
+    MA5가 MA20을 상향 돌파(골든크로스)한 후 경과일 수 계산
+    Calculate days since MA5 crossed above MA20 (golden cross)
+
+    Returns:
+        -1: MA5 < MA20 (아직 크로스 전) or 데이터 부족
+         0: 오늘 크로스 발생
+         N: N일 전 크로스 발생 후 계속 유지 중
+    """
+    n = len(candles)
+    if n < ma_long + 10:
+        return -1
+
+    # 최근 30일간 MA5, MA20 계산 (넉넉히)
+    check_days = min(30, n - ma_long)
+
+    for d in range(check_days):
+        idx = n - 1 - d  # 오늘부터 과거로
+        s_start = idx - ma_short + 1
+        l_start = idx - ma_long + 1
+        if s_start < 0 or l_start < 0:
+            return -1
+
+        ma5 = sum(candles[k].close for k in range(s_start, idx + 1)) / ma_short
+        ma20 = sum(candles[k].close for k in range(l_start, idx + 1)) / ma_long
+
+        if ma5 <= ma20:
+            # d일 전에 MA5 < MA20 → 크로스는 (d-1)일 전 발생
+            if d == 0:
+                return -1  # 오늘 이미 MA5 < MA20
+            return d - 1  # 크로스 후 경과일
+
+    # 30일 내내 MA5 > MA20 → 최소 30일 이상 경과
+    return check_days
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ★ v8: 조기 진입 감지 (Partial Pattern Matching)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1261,6 +1320,21 @@ def compute_early_entry_score(
 
     result["early_score"] = round(min(100, score))
     result["entry_reason"] = " + ".join(reasons) if reasons else "조건 미충족"
+
+    # ★ v9: MA5>MA20 골든크로스 5일 경과 체크 — 이미 상승 진행 중이면 제외
+    gc_days = -1
+    if candles:
+        try:
+            gc_days = _days_since_golden_cross(candles)
+        except Exception:
+            pass
+    result["gc_days"] = gc_days
+
+    if gc_days >= 5:
+        result["early_entry"] = False
+        result["early_score"] = 0
+        result["entry_reason"] = f"⛔ MA5>MA20 골든크로스 {gc_days}일 경과 — 진입 시기 초과"
+        return result
 
     # 조기 진입 판정: 점수 40 이상 + 패턴 진행률 85% 미만
     result["early_entry"] = result["early_score"] >= 40 and best_ratio < 0.85
