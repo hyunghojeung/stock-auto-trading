@@ -37,20 +37,15 @@ except Exception:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 KNOWN_TABLES = [
     "stock_list",
-    "stock_candles",
-    "pattern_vectors",
     "pattern_definitions",
     "saved_patterns",
     "virtual_portfolios",
     "virtual_positions",
     "virtual_compare_result",
     "compound_groups",
-    "compound_rounds",
     "surge_scan_sessions",
     "surge_scan_stocks",
-    "market_status_daily",
     "watchlist",
-    "trade_history",
 ]
 
 
