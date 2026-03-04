@@ -21,7 +21,10 @@ import asyncio
 import logging
 import traceback
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# ★ v9: 한국 표준시
+KST = timezone(timedelta(hours=9))
 
 from app.engine.pattern_analyzer import CandleDay, detect_surges
 from app.engine.entry_strategies import evaluate_entry
@@ -649,7 +652,7 @@ async def _run_scan_task(
                         "medium_manip_count": sum(1 for r in all_results if r.get("top_manip_level") == "medium"),
                         "scan_params": scan_params,
                     },
-                    "scan_date": datetime.now().isoformat(),
+                    "scan_date": datetime.now(KST).isoformat(),
                     "market": market,
                     "partial": True,  # 아직 진행 중 표시
                 }
@@ -711,7 +714,7 @@ async def _run_scan_task(
         _scanner_state["result"] = {
             "stocks": all_results,
             "stats": stats,
-            "scan_date": datetime.now().isoformat(),
+            "scan_date": datetime.now(KST).isoformat(),
             "market": market,
         }
         _scanner_state["progress"] = 100
