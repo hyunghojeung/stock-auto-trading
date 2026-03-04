@@ -1,249 +1,276 @@
-"""백테스트 API 라우트 / Backtest API Routes"""
-from fastapi import APIRouter, HTTPException
-from datetime import datetime, date, timedelta
-from app.core.database import db
+"""
+DB 백업 API 라우트 / Database Backup API Routes
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+파일경로: app/api/backup_routes.py
 
-router = APIRouter(prefix="/api/backtest", tags=["백테스트"])
+엔드포인트:
+  GET  /api/backup/tables          — 전체 테이블 목록 + 행 수
+  GET  /api/backup/table/{name}    — 특정 테이블 데이터 (JSON)
+  GET  /api/backup/csv/{name}      — 특정 테이블 CSV 다운로드
+  POST /api/backup/full            — 전체 DB 백업 (ZIP)
+"""
+
+from fastapi import APIRouter, Response
+from fastapi.responses import StreamingResponse
+from datetime import datetime, timedelta, timezone
+import logging
+import json
+import csv
+import io
+import zipfile
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/backup", tags=["backup"])
+
+KST = timezone(timedelta(hours=9))
+
+try:
+    from app.core.database import db
+    logger.info("[백업] DB 연결 성공")
+except Exception:
+    db = None
+    logger.warning("[백업] DB 연결 실패")
 
 
-# ============================================================
-# 프리셋 백테스트 실행 / Run preset backtest
-# ============================================================
-@router.api_route("/quick/{preset}", methods=["GET", "POST"])
-async def quick_backtest(preset: str):
-    """프리셋 백테스트 실행 (conservative, balanced, aggressive)"""
-    presets = {
-        "standard": {
-            "name": "기본형",
-            "atr_multiplier": 2.0,
-            "stop_loss_pct": -3.0,
-            "min_signals": 3,
-            "description": "ATR×2.0, 손절-3%, 최소신호 3개",
-        },
-        "gap": {
-            "name": "갭상승",
-            "atr_multiplier": 1.5,
-            "stop_loss_pct": -2.5,
-            "min_signals": 2,
-            "description": "ATR×1.5, 손절-2.5%, 갭상승전략",
-        },
-        "gap_standard": {
-            "name": "갭상승",
-            "strategy": "gap",
-            "atr_multiplier": 1.5,
-            "stop_loss_pct": 2.5,
-            "max_holdings": 5,
-            "per_trade_pct": 20.0,
-            "description": "ATR×1.5, 손절-2.5%, 갭상승전략",
-        },
-        "combined": {
-            "name": "혼합",
-            "atr_multiplier": 2.0,
-            "stop_loss_pct": -3.0,
-            "min_signals": 3,
-            "description": "눌림목+갭상승 혼합전략",
-        },
-        "conservative": {
-            "name": "보수적",
-            "atr_multiplier": 1.5,
-            "stop_loss_pct": -2.0,
-            "min_signals": 4,
-            "description": "ATR×1.5, 손절-2%, 최소신호 4개",
-        },
-        "balanced": {
-            "name": "균형형",
-            "atr_multiplier": 2.0,
-            "stop_loss_pct": -3.0,
-            "min_signals": 3,
-            "description": "ATR×2.0, 손절-3%, 최소신호 3개",
-        },
-        "aggressive": {
-            "name": "공격적",
-            "atr_multiplier": 2.5,
-            "stop_loss_pct": -4.0,
-            "min_signals": 2,
-            "description": "ATR×2.5, 손절-4%, 최소신호 2개",
-        },
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 테이블 목록 (수동 정의 — Supabase REST API 제한 우회)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KNOWN_TABLES = [
+    "stock_list",
+    "stock_candles",
+    "pattern_vectors",
+    "pattern_definitions",
+    "saved_patterns",
+    "virtual_portfolios",
+    "virtual_positions",
+    "virtual_compare_result",
+    "compound_groups",
+    "compound_rounds",
+    "surge_scan_sessions",
+    "surge_scan_stocks",
+    "market_status_daily",
+    "watchlist",
+    "trade_history",
+]
+
+
+@router.get("/tables")
+async def list_tables():
+    """
+    전체 테이블 목록 + 행 수 조회
+    List all tables with row counts
+    """
+    if not db:
+        return {"error": "DB 미연결", "tables": []}
+
+    results = []
+    for table_name in KNOWN_TABLES:
+        try:
+            # 행 수 조회 (헤더만 가져와서 count)
+            res = db.table(table_name).select("*", count="exact").limit(0).execute()
+            row_count = res.count if res.count is not None else 0
+
+            results.append({
+                "name": table_name,
+                "rows": row_count,
+                "status": "ok",
+            })
+        except Exception as e:
+            err_str = str(e)
+            if "does not exist" in err_str or "404" in err_str or "relation" in err_str:
+                results.append({
+                    "name": table_name,
+                    "rows": 0,
+                    "status": "not_found",
+                })
+            else:
+                results.append({
+                    "name": table_name,
+                    "rows": 0,
+                    "status": f"error: {err_str[:80]}",
+                })
+
+    total_rows = sum(t["rows"] for t in results if t["status"] == "ok")
+    ok_count = sum(1 for t in results if t["status"] == "ok")
+
+    return {
+        "tables": results,
+        "total_tables": ok_count,
+        "total_rows": total_rows,
+        "timestamp": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
     }
 
-    if preset not in presets:
-        raise HTTPException(400, f"알 수 없는 프리셋: {preset}. 사용 가능: {list(presets.keys())}")
 
-    p = presets[preset]
+@router.get("/table/{name}")
+async def get_table_data(name: str, limit: int = 10000, offset: int = 0):
+    """
+    특정 테이블 데이터 JSON 조회
+    Get table data as JSON
+    """
+    if not db:
+        return {"error": "DB 미연결"}
 
-    # 실제 매매 데이터 기반 시뮬레이션 결과 생성
+    if name not in KNOWN_TABLES:
+        return {"error": f"허용되지 않은 테이블: {name}"}
+
     try:
-        trades_data = db.table("trades").select("*").eq("trade_type", "sell").order("traded_at", desc=True).limit(100).execute()
-        trades_list = trades_data.data or []
-
-        total_trades = len(trades_list)
-        wins = [t for t in trades_list if (t.get("net_profit") or 0) > 0]
-        losses = [t for t in trades_list if (t.get("net_profit") or 0) <= 0]
-        win_count = len(wins)
-        loss_count = len(losses)
-
-        total_profit = sum(t.get("net_profit", 0) for t in trades_list)
-        avg_win = round(sum(t.get("net_profit", 0) for t in wins) / win_count) if win_count > 0 else 0
-        avg_loss = round(sum(t.get("net_profit", 0) for t in losses) / loss_count) if loss_count > 0 else 0
-        win_rate = round(win_count / total_trades * 100, 1) if total_trades > 0 else 0
-
-        # 자산 추이 데이터
-        asset_data = db.table("asset_history").select("record_date,total_asset,daily_profit").order("record_date").execute()
-        daily_assets = asset_data.data or []
-
-        # MDD 계산
-        max_asset = 1000000
-        max_drawdown = 0
-        for da in daily_assets:
-            ta = da.get("total_asset", 1000000)
-            if ta > max_asset:
-                max_asset = ta
-            dd = (max_asset - ta) / max_asset * 100 if max_asset > 0 else 0
-            if dd > max_drawdown:
-                max_drawdown = dd
-
-        initial_capital = 1000000
-        final_asset = daily_assets[-1]["total_asset"] if daily_assets else initial_capital
-        total_return = round((final_asset - initial_capital) / initial_capital * 100, 2) if initial_capital > 0 else 0
-        profit_loss_ratio = round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0
-
+        res = db.table(name).select("*", count="exact").range(offset, offset + limit - 1).execute()
         return {
-            "summary": {
-                "preset": preset,
-                "preset_name": p["name"],
-                "description": p["description"],
-                "initial_capital": initial_capital,
-                "final_asset": final_asset,
-                "total_return_pct": total_return,
-                "total_profit": total_profit,
-                "total_trades": total_trades,
-                "win_count": win_count,
-                "loss_count": loss_count,
-                "win_rate": win_rate,
-                "avg_win": avg_win,
-                "avg_loss": avg_loss,
-                "max_drawdown_pct": round(max_drawdown, 2),
-                "profit_loss_ratio": profit_loss_ratio,
-                "test_days": len(daily_assets),
-                "atr_multiplier": p["atr_multiplier"],
-                "stop_loss_pct": p["stop_loss_pct"],
-            },
-            "trades": [{
-                "stock_name": t.get("stock_name", ""),
-                "stock_code": t.get("stock_code", ""),
-                "buy_price": t.get("buy_price", 0),
-                "sell_price": t.get("sell_price", 0),
-                "quantity": t.get("quantity", 0),
-                "net_profit": t.get("net_profit", 0),
-                "traded_at": t.get("traded_at", ""),
-                "sell_reason": t.get("sell_reason", ""),
-            } for t in trades_list[:50]],
-            "daily_assets": [{
-                "date": da.get("record_date", ""),
-                "total_asset": da.get("total_asset", initial_capital),
-                "daily_profit": da.get("daily_profit", 0),
-            } for da in daily_assets],
-        }
-
-    except Exception as e:
-        # DB에 데이터가 없는 경우 빈 결과 반환
-        return {
-            "summary": {
-                "preset": preset,
-                "preset_name": p["name"],
-                "description": p["description"],
-                "initial_capital": 1000000,
-                "final_asset": 1000000,
-                "total_return_pct": 0,
-                "total_profit": 0,
-                "total_trades": 0,
-                "win_count": 0,
-                "loss_count": 0,
-                "win_rate": 0,
-                "avg_win": 0,
-                "avg_loss": 0,
-                "max_drawdown_pct": 0,
-                "profit_loss_ratio": 0,
-                "test_days": 0,
-                "atr_multiplier": p["atr_multiplier"],
-                "stop_loss_pct": p["stop_loss_pct"],
-            },
-            "trades": [],
-            "daily_assets": [],
-            "note": f"매매 데이터가 아직 없습니다. 장 운영 후 데이터가 쌓이면 결과가 표시됩니다. ({str(e)})",
-        }
-
-
-# ============================================================
-# 백테스트 이력 조회 / Get backtest history
-# ============================================================
-@router.api_route("/history", methods=["GET", "POST"])
-async def backtest_history():
-    """저장된 백테스트 결과 이력 조회"""
-    try:
-        results = db.table("backtest_results").select("*").order("created_at", desc=True).limit(20).execute()
-        return results.data or []
-    except Exception:
-        # backtest_results 테이블이 없는 경우 빈 배열 반환
-        return []
-
-
-# ============================================================
-# 커스텀 백테스트 실행 / Run custom backtest
-# ============================================================
-@router.api_route("/custom", methods=["GET", "POST"])
-async def custom_backtest(
-    strategy: str = "dip",
-    atr_multiplier: float = 2.0,
-    stop_loss_pct: float = -3.0,
-    min_signals: int = 3,
-    initial_capital: int = 1000000,
-):
-    """커스텀 파라미터로 백테스트 실행"""
-    try:
-        trades_data = db.table("trades").select("*").eq("trade_type", "sell").order("traded_at", desc=True).limit(100).execute()
-        trades_list = trades_data.data or []
-
-        total_trades = len(trades_list)
-        wins = [t for t in trades_list if (t.get("net_profit") or 0) > 0]
-        losses = [t for t in trades_list if (t.get("net_profit") or 0) <= 0]
-
-        total_profit = sum(t.get("net_profit", 0) for t in trades_list)
-        win_rate = round(len(wins) / total_trades * 100, 1) if total_trades > 0 else 0
-
-        return {
-            "summary": {
-                "strategy": strategy,
-                "initial_capital": initial_capital,
-                "final_asset": initial_capital + total_profit,
-                "total_return_pct": round(total_profit / initial_capital * 100, 2) if initial_capital > 0 else 0,
-                "total_profit": total_profit,
-                "total_trades": total_trades,
-                "win_count": len(wins),
-                "loss_count": len(losses),
-                "win_rate": win_rate,
-                "atr_multiplier": atr_multiplier,
-                "stop_loss_pct": stop_loss_pct,
-            },
-            "trades": [],
-            "daily_assets": [],
+            "table": name,
+            "rows": res.data or [],
+            "count": res.count or len(res.data or []),
+            "offset": offset,
+            "limit": limit,
         }
     except Exception as e:
-        return {
-            "summary": {
-                "strategy": strategy,
-                "initial_capital": initial_capital,
-                "final_asset": initial_capital,
-                "total_return_pct": 0,
-                "total_profit": 0,
-                "total_trades": 0,
-                "win_count": 0,
-                "loss_count": 0,
-                "win_rate": 0,
-                "atr_multiplier": atr_multiplier,
-                "stop_loss_pct": stop_loss_pct,
-            },
-            "trades": [],
-            "daily_assets": [],
-            "note": f"데이터 없음: {str(e)}",
+        return {"error": str(e), "table": name}
+
+
+@router.get("/csv/{name}")
+async def download_csv(name: str):
+    """
+    특정 테이블 CSV 다운로드
+    Download table as CSV file
+    """
+    if not db:
+        return Response(content="DB 미연결", status_code=500)
+
+    if name not in KNOWN_TABLES:
+        return Response(content=f"허용되지 않은 테이블: {name}", status_code=400)
+
+    try:
+        # 전체 데이터 조회 (최대 50000행)
+        all_data = []
+        offset = 0
+        batch = 1000
+        while True:
+            res = db.table(name).select("*").range(offset, offset + batch - 1).execute()
+            rows = res.data or []
+            if not rows:
+                break
+            all_data.extend(rows)
+            offset += batch
+            if len(rows) < batch or offset >= 50000:
+                break
+
+        if not all_data:
+            return Response(content="데이터 없음", status_code=404)
+
+        # CSV 생성
+        output = io.StringIO()
+        columns = list(all_data[0].keys())
+        writer = csv.DictWriter(output, fieldnames=columns)
+        writer.writeheader()
+
+        for row in all_data:
+            # JSON 필드 문자열 변환
+            clean = {}
+            for k, v in row.items():
+                if isinstance(v, (dict, list)):
+                    clean[k] = json.dumps(v, ensure_ascii=False)
+                else:
+                    clean[k] = v
+            writer.writerow(clean)
+
+        csv_content = output.getvalue().encode('utf-8-sig')  # BOM 포함 (엑셀 한글 호환)
+        today = datetime.now(KST).strftime("%Y%m%d_%H%M")
+        filename = f"{name}_{today}.csv"
+
+        return Response(
+            content=csv_content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    except Exception as e:
+        logger.error(f"[백업] CSV 다운로드 실패 ({name}): {e}")
+        return Response(content=str(e), status_code=500)
+
+
+@router.post("/full")
+async def full_backup():
+    """
+    전체 DB 백업 (ZIP 파일 — 각 테이블 CSV)
+    Full database backup as ZIP file containing CSVs
+    """
+    if not db:
+        return Response(content="DB 미연결", status_code=500)
+
+    try:
+        zip_buffer = io.BytesIO()
+        today = datetime.now(KST).strftime("%Y%m%d_%H%M")
+        backup_info = {
+            "backup_date": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
+            "tables": [],
         }
+
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for table_name in KNOWN_TABLES:
+                try:
+                    # 데이터 조회
+                    all_data = []
+                    offset = 0
+                    batch = 1000
+                    while True:
+                        res = db.table(table_name).select("*").range(offset, offset + batch - 1).execute()
+                        rows = res.data or []
+                        if not rows:
+                            break
+                        all_data.extend(rows)
+                        offset += batch
+                        if len(rows) < batch or offset >= 50000:
+                            break
+
+                    if not all_data:
+                        backup_info["tables"].append({
+                            "name": table_name, "rows": 0, "status": "empty"
+                        })
+                        continue
+
+                    # CSV 생성
+                    output = io.StringIO()
+                    columns = list(all_data[0].keys())
+                    writer = csv.DictWriter(output, fieldnames=columns)
+                    writer.writeheader()
+                    for row in all_data:
+                        clean = {}
+                        for k, v in row.items():
+                            if isinstance(v, (dict, list)):
+                                clean[k] = json.dumps(v, ensure_ascii=False)
+                            else:
+                                clean[k] = v
+                        writer.writerow(clean)
+
+                    csv_bytes = output.getvalue().encode('utf-8-sig')
+                    zf.writestr(f"{table_name}.csv", csv_bytes)
+
+                    backup_info["tables"].append({
+                        "name": table_name,
+                        "rows": len(all_data),
+                        "size_kb": round(len(csv_bytes) / 1024, 1),
+                        "status": "ok",
+                    })
+                    logger.info(f"[백업] {table_name}: {len(all_data)}행 백업 완료")
+
+                except Exception as e:
+                    backup_info["tables"].append({
+                        "name": table_name, "rows": 0,
+                        "status": f"error: {str(e)[:60]}"
+                    })
+                    logger.warning(f"[백업] {table_name} 실패: {e}")
+
+            # 백업 정보 파일 추가
+            zf.writestr("_backup_info.json", json.dumps(backup_info, ensure_ascii=False, indent=2))
+
+        zip_buffer.seek(0)
+        filename = f"db_backup_{today}.zip"
+
+        return Response(
+            content=zip_buffer.read(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    except Exception as e:
+        logger.error(f"[백업] 전체 백업 실패: {e}")
+        return Response(content=str(e), status_code=500)
