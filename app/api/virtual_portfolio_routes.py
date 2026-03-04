@@ -131,7 +131,7 @@ async def register_portfolio(req: RegisterRequest):
         status = get_market_status()
         raise HTTPException(400, f"현재 {status} — 장 운영일에만 포트폴리오를 등록할 수 있습니다")
 
-    now = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")
+    now = datetime.now(KST).isoformat()
     name = req.name or f"포트폴리오 {now[:10]}"
 
     try:
@@ -395,7 +395,7 @@ async def update_prices(portfolio_id: int):
                 if rt and rt.get("price", 0) > 0:
                     realtime_map[code] = rt
 
-        now = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")
+        now = datetime.now(KST).isoformat()
         today = now[:10]
         updated_count = 0
         closed_count = 0
@@ -756,7 +756,7 @@ def _sync_update_prices(portfolio_id: int):
     portfolio = pf_resp.data[0]
     strategy = portfolio.get("strategy", "smart")
     params = STRATEGY_PARAMS.get(strategy, STRATEGY_PARAMS["smart"])
-    now = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")
+    now = datetime.now(KST).isoformat()
     today = now[:10]
 
     pos_resp = db.table("virtual_positions") \
@@ -916,7 +916,7 @@ def _sync_update_prices(portfolio_id: int):
 @router.post("/close/{portfolio_id}")
 async def close_portfolio(portfolio_id: int):
     """포트폴리오 전체 수동 청산"""
-    now = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")
+    now = datetime.now(KST).isoformat()
 
     try:
         # 보유 중인 포지션 현재가 기준 청산
@@ -966,7 +966,7 @@ async def rename_portfolio(portfolio_id: int, req: dict):
 
         db.table("virtual_portfolios").update({
             "name": new_name,
-            "updated_at": datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "updated_at": datetime.now(KST).isoformat(),
         }).eq("id", portfolio_id).execute()
 
         logger.info(f"[가상포트] #{portfolio_id} 제목 변경: {new_name}")
@@ -1123,7 +1123,7 @@ async def fix_buy_prices():
                     "quantity": new_quantity,
                     "profit_pct": 0,
                     "profit_won": 0,
-                    "updated_at": datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S"),
+                    "updated_at": datetime.now(KST).isoformat(),
                 }).eq("id", pos["id"]).execute()
 
                 fixed.append({
@@ -1159,7 +1159,7 @@ async def fix_buy_prices():
                 "current_value": round(total_value),
                 "total_return_won": round(total_profit),
                 "total_return_pct": 0,
-                "updated_at": datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S"),
+                "updated_at": datetime.now(KST).isoformat(),
             }).eq("id", pf_id).execute()
 
         logger.info(f"[가상포트] buy_price 교정 완료: {len(fixed)}건 수정, {len(errors)}건 오류")
@@ -1283,7 +1283,7 @@ def _auto_reinvest(portfolio_id: int, recovered_capital: float,
         invest_capital = recovered_capital * 0.8
         per_stock = invest_capital / len(selected)
 
-        now = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")
+        now = datetime.now(KST).isoformat()
         today = now[:10]
         new_count = 0
 
@@ -1383,7 +1383,7 @@ def _check_compound_reinvest(portfolio_id: int):
         group = grp.data[0]
         seed = group["seed_money"]
         goal = group["goal_amount"]
-        now = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")
+        now = datetime.now(KST).isoformat()
 
         # 누적 통계
         total_rounds = group.get("total_rounds", 0) + 1
@@ -1424,7 +1424,7 @@ def _check_compound_reinvest(portfolio_id: int):
 @router.post("/compound/create")
 async def create_compound_group(req: CompoundCreateRequest):
     """복리 그룹 생성 + 1회차 포트폴리오 (종목 있으면 즉시 등록)"""
-    now = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")
+    now = datetime.now(KST).isoformat()
 
     try:
         grp_resp = db.table("compound_groups").insert({
@@ -1602,7 +1602,7 @@ async def get_compound_detail(group_id: int):
 @router.post("/compound/{group_id}/next-round")
 async def start_next_round(group_id: int, req: CompoundNextRoundRequest):
     """다음 회차 포트폴리오 생성 (종목 선택 후 호출)"""
-    now = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")
+    now = datetime.now(KST).isoformat()
 
     try:
         grp = db.table("compound_groups").select("*").eq("id", group_id).execute()
@@ -1714,7 +1714,7 @@ async def start_next_round(group_id: int, req: CompoundNextRoundRequest):
 async def stop_compound_group(group_id: int):
     """복리 그룹 중단"""
     try:
-        now = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")
+        now = datetime.now(KST).isoformat()
         db.table("compound_groups").update({
             "status": "stopped",
             "updated_at": now,
@@ -1733,7 +1733,7 @@ async def edit_compound_group(group_id: int, req: dict):
         if not grp.data:
             raise HTTPException(404, f"복리 그룹 #{group_id}를 찾을 수 없습니다")
 
-        update_data = {"updated_at": datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")}
+        update_data = {"updated_at": datetime.now(KST).isoformat()}
 
         if "name" in req and req["name"]:
             update_data["name"] = req["name"]
@@ -1776,7 +1776,7 @@ async def delete_compound_group(group_id: int):
         # 연결된 포트폴리오의 compound_group_id 해제 (포트폴리오 자체는 보존)
         db.table("virtual_portfolios").update({
             "compound_group_id": None,
-            "updated_at": datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S"),
+            "updated_at": datetime.now(KST).isoformat(),
         }).eq("compound_group_id", group_id).execute()
 
         # 그룹 삭제
