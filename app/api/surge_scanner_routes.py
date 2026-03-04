@@ -652,7 +652,7 @@ async def _run_scan_task(
                         "medium_manip_count": sum(1 for r in all_results if r.get("top_manip_level") == "medium"),
                         "scan_params": scan_params,
                     },
-                    "scan_date": datetime.now(KST).isoformat(),
+                    "scan_date": datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S"),
                     "market": market,
                     "partial": True,  # 아직 진행 중 표시
                 }
@@ -714,7 +714,7 @@ async def _run_scan_task(
         _scanner_state["result"] = {
             "stocks": all_results,
             "stats": stats,
-            "scan_date": datetime.now(KST).isoformat(),
+            "scan_date": datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S"),
             "market": market,
         }
         _scanner_state["progress"] = 100
