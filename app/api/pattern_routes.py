@@ -193,6 +193,107 @@ def _compute_pattern_vectors(candles: List[CandleDay], pre_days: int):
     return returns, volumes
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ v9: DB벡터 매칭 후 MA/GC 보강
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def _enrich_ma_filter(recs: list, progress_callback=None) -> list:
+    """
+    ★ v9: DB벡터 매칭 결과에 MA5/MA20/GC 정보를 보강
+    상위 추천 종목(30개)만 네이버 25일 캔들 조회 → MA 계산
+    Enrich DB-vector matched recommendations with MA5/MA20/GC data
+    """
+    if not recs:
+        return recs
+
+    if progress_callback:
+        progress_callback(98, f"MA 필터 보강 중... ({len(recs)}개 종목)")
+
+    from app.services.naver_stock import get_daily_candles_naver
+    from app.engine.pattern_analyzer import CandleDay
+
+    codes = [r["code"] for r in recs]
+
+    # 병렬로 25일 캔들 조회
+    async def _fetch(code):
+        try:
+            return await asyncio.to_thread(get_daily_candles_naver, code, 30)
+        except Exception:
+            return None
+
+    candles_results = await asyncio.gather(*[_fetch(c) for c in codes])
+
+    for rec, raw_candles in zip(recs, candles_results):
+        ma5_declining = False
+        ma5_above_ma20 = True
+        gc_days = -1
+        gc_filtered = False
+
+        if raw_candles and len(raw_candles) >= 25:
+            try:
+                closes = [c.get("close", 0) for c in raw_candles]
+                n = len(closes)
+
+                # MA5 하향 체크 (최근 3일)
+                ma5_vals = []
+                for d in range(4):
+                    ei = n - d
+                    si = ei - 5
+                    if si >= 0:
+                        ma5_vals.append(sum(closes[si:ei]) / 5)
+                if len(ma5_vals) >= 3:
+                    ma5_declining = ma5_vals[0] < ma5_vals[1] < ma5_vals[2]
+
+                # MA5 vs MA20
+                ma5_today = sum(closes[-5:]) / 5
+                ma20_today = sum(closes[-20:]) / 20
+                ma5_above_ma20 = ma5_today > ma20_today
+
+                # 골든크로스 경과일
+                candle_objs = [
+                    CandleDay(date=c.get("date", ""), open=c.get("open", 0),
+                              high=c.get("high", 0), low=c.get("low", 0),
+                              close=c.get("close", 0), volume=c.get("volume", 0))
+                    for c in raw_candles if c.get("close", 0) > 0
+                ]
+                if len(candle_objs) >= 25:
+                    gc_days = _days_since_golden_cross(candle_objs)
+
+                # GC 5일 경과 시 시그널 다운그레이드
+                if gc_days >= 5:
+                    gc_filtered = True
+                    if rec.get("signal_code") in ("strong_buy", "watch"):
+                        rec["signal"] = f"⏰ GC+{gc_days}일 경과"
+                        rec["signal_code"] = "gc_expired"
+            except Exception as e:
+                logger.debug(f"[{rec['code']}] MA 보강 실패: {e}")
+        elif raw_candles and len(raw_candles) >= 10:
+            try:
+                closes = [c.get("close", 0) for c in raw_candles]
+                n = len(closes)
+                ma5_vals = []
+                for d in range(4):
+                    ei = n - d
+                    si = ei - 5
+                    if si >= 0:
+                        ma5_vals.append(sum(closes[si:ei]) / 5)
+                if len(ma5_vals) >= 3:
+                    ma5_declining = ma5_vals[0] < ma5_vals[1] < ma5_vals[2]
+            except Exception:
+                pass
+
+        rec["ma5_declining"] = ma5_declining
+        rec["ma5_above_ma20"] = ma5_above_ma20
+        rec["gc_days"] = gc_days
+        rec["gc_filtered"] = gc_filtered
+
+    logger.info(f"[Phase2-MA] MA 보강 완료: {len(recs)}개 종목, "
+                f"MA5하향 {sum(1 for r in recs if r['ma5_declining'])}개, "
+                f"MA5<MA20 {sum(1 for r in recs if not r['ma5_above_ma20'])}개, "
+                f"GC5일+ {sum(1 for r in recs if r['gc_days'] >= 5)}개")
+    return recs
+
+
 async def _scan_recommendations(
     clusters_dicts: list,
     analyzed_codes: set,
@@ -238,9 +339,12 @@ async def _scan_recommendations(
     if len(pattern_rows) >= 100:
         # ━━━ DB 벡터 방식 (빠른 경로) ━━━
         logger.info(f"[Phase2] DB 벡터 방식: {len(pattern_rows)}개 로드됨")
-        return _match_from_db_vectors(
+        recs = _match_from_db_vectors(
             pattern_rows, valid_clusters, analyzed_codes, pre_days, progress_callback
         )
+        # ★ v9: 상위 추천 종목에 MA5/MA20/GC 정보 보강 (네이버 캔들 조회)
+        recs = await _enrich_ma_filter(recs, progress_callback)
+        return recs
     else:
         # ━━━ 실시간 방식 (fallback) ━━━
         logger.info(f"[Phase2] DB 벡터 부족({len(pattern_rows)}개), 실시간 fallback")
