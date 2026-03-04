@@ -1,48 +1,1312 @@
-"""보유종목 / 수익 API"""
-from fastapi import APIRouter
+"""
+급상승 패턴 탐지기 — API 라우트
+Pattern Surge Detector — API Routes
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+파일경로: app/api/pattern_routes.py
+
+POST /api/pattern/analyze  — 분석 시작 (비동기)
+GET  /api/pattern/progress  — 진행률 확인
+GET  /api/pattern/result    — 결과 조회
+POST /api/pattern/search    — 종목 검색
+
+★ v2 수정사항: 매수 추천을 전종목 DB에서 스캔하여
+  분석 대상이 아닌 "다른 종목" 중 유사 패턴 보유 종목을 추천
+"""
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional, Tuple
+import asyncio
+import logging
+import traceback
+import random
+import re
+import urllib.parse
+import urllib.request
+import json
+
+from app.engine.pattern_analyzer import (
+    CandleDay,
+    run_pattern_analysis,
+)
+
+# dtw_similarity + z_normalize 캐시 함수 + ★ v8: 조기진입 감지 + ★ v9: 골든크로스
+try:
+    from app.engine.pattern_analyzer import dtw_similarity, _z_normalize_cached, compute_early_entry_score, _days_since_golden_cross
+except ImportError:
+    def _z_normalize_cached(s):
+        return s
+    def compute_early_entry_score(*args, **kwargs):
+        return {"early_entry": False, "early_score": 0, "pattern_progress": 1.0,
+                "best_partial_sim": 0, "ma20_proximity": False, "volume_declining": False, "entry_reason": "", "gc_days": -1}
+    def _days_since_golden_cross(candles, ma_short=5, ma_long=20):
+        return -1
+
+try:
+    from app.engine.pattern_analyzer import dtw_similarity
+except ImportError:
+    import math
+
+    def _dtw_distance(s1, s2, window=None):
+        n, m = len(s1), len(s2)
+        if n == 0 or m == 0:
+            return float('inf')
+        if window is None:
+            window = max(n, m)
+        cost = [[float('inf')] * (m + 1) for _ in range(n + 1)]
+        cost[0][0] = 0
+        for i in range(1, n + 1):
+            for j in range(max(1, i - window), min(m, i + window) + 1):
+                d = (s1[i - 1] - s2[j - 1]) ** 2
+                cost[i][j] = d + min(cost[i - 1][j], cost[i][j - 1], cost[i - 1][j - 1])
+        return math.sqrt(cost[n][m]) if cost[n][m] < float('inf') else float('inf')
+
+    def dtw_similarity(s1, s2) -> float:
+        if not s1 or not s2:
+            return 0.0
+        s1_std = max(max(s1) - min(s1), 0.001)
+        s2_std = max(max(s2) - min(s2), 0.001)
+        s1_norm = [(v - sum(s1) / len(s1)) / s1_std for v in s1]
+        s2_norm = [(v - sum(s2) / len(s2)) / s2_std for v in s2]
+        dist = _dtw_distance(s1_norm, s2_norm, window=max(len(s1), len(s2)))
+        max_len = max(len(s1), len(s2))
+        similarity = max(0, 100 - (dist / max_len) * 30)
+        return round(min(similarity, 100), 1)
+from app.services.naver_stock import get_daily_candles_with_name
 from app.core.database import db
-from datetime import date
 
-router = APIRouter(prefix="/api/portfolio", tags=["포트폴리오"])
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/pattern", tags=["pattern"])
 
-@router.get("/holdings")
-async def get_holdings(strategy_id: int = None):
-    q = db.table("holdings").select("*")
-    if strategy_id: q = q.eq("strategy_id", strategy_id)
-    return q.execute().data or []
 
-@router.get("/daily-report")
-async def daily_report(strategy_id: int = None, days: int = 30):
-    q = db.table("daily_reports").select("*").order("report_date", desc=True).limit(days)
-    if strategy_id: q = q.eq("strategy_id", strategy_id)
-    return q.execute().data or []
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 전역 상태 (분석 진행률 + 결과 캐시)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@router.get("/asset-history")
-async def asset_history(strategy_id: int = None):
-    q = db.table("asset_history").select("*").order("record_date", desc=True)
-    if strategy_id: q = q.eq("strategy_id", strategy_id)
-    return q.execute().data or []
+_analysis_state = {
+    "running": False,
+    "progress": 0,
+    "message": "",
+    "result": None,
+    "error": None,
+    "has_result": False,
+}
 
-@router.get("/summary")
-async def portfolio_summary(strategy_id: int = None):
-    holdings = db.table("holdings").select("*")
-    if strategy_id: holdings = holdings.eq("strategy_id", strategy_id)
-    holdings = holdings.execute().data or []
 
-    total_invested = sum(h["buy_price"] * h["quantity"] for h in holdings)
-    total_current = sum((h.get("current_price") or h["buy_price"]) * h["quantity"] for h in holdings)
-    unrealized = total_current - total_invested
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 요청/응답 모델
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    sells = db.table("trades").select("net_profit").eq("trade_type", "sell")
-    if strategy_id: sells = sells.eq("strategy_id", strategy_id)
-    sells = sells.execute().data or []
-    realized = sum(s.get("net_profit", 0) for s in sells)
+class AnalyzeRequest(BaseModel):
+    codes: List[str]
+    names: dict = {}
+    period_days: int = 365
+    pre_rise_days: int = 10
+    rise_pct: float = 30.0
+    rise_window: int = 5
+    # 가중치 (프론트엔드 상세설정)
+    weight_returns: float = 0.4
+    weight_candle: float = 0.3
+    weight_volume: float = 0.3
 
-    return {
-        "holdings_count": len(holdings),
-        "total_invested": total_invested,
-        "total_current": total_current,
-        "unrealized_profit": unrealized,
-        "realized_profit": realized,
-        "total_profit": realized + unrealized,
+
+class SearchRequest(BaseModel):
+    keyword: str
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 네이버 캔들 → CandleDay 변환
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def fetch_candles_for_code(code: str, period_days: int) -> Tuple[List[CandleDay], str]:
+    """
+    네이버 금융에서 일봉 데이터 조회 → CandleDay 리스트 + 종목명 변환
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        raw_candles, stock_name = await loop.run_in_executor(
+            None, lambda: get_daily_candles_with_name(code, count=period_days)
+        )
+
+        if not raw_candles:
+            return [], code
+
+        candles = []
+        for item in raw_candles:
+            try:
+                candle = CandleDay(
+                    date=str(item.get("date", "")),
+                    open=float(item.get("open", 0)),
+                    high=float(item.get("high", 0)),
+                    low=float(item.get("low", 0)),
+                    close=float(item.get("close", 0)),
+                    volume=int(item.get("volume", 0)),
+                )
+                if candle.close > 0 and candle.volume >= 0:
+                    candles.append(candle)
+            except (ValueError, TypeError):
+                continue
+
+        candles.sort(key=lambda c: c.date)
+        return candles, stock_name
+
+    except Exception as e:
+        logger.error(f"[{code}] 캔들 조회 실패: {e}")
+        return [], code
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ 전종목 매수 추천 스캔 (v2 핵심 추가)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _compute_pattern_vectors(candles: List[CandleDay], pre_days: int):
+    """
+    최근 pre_days일의 등락률 + 거래량비율 벡터 계산
+    Compute return flow + volume ratio vectors for recent N days
+    """
+    if len(candles) < pre_days + 20:
+        return None, None
+
+    recent = candles[-pre_days:]
+
+    # 등락률 벡터 / Return flow vector
+    returns = []
+    for k in range(len(recent)):
+        if k == 0:
+            idx_in_full = len(candles) - pre_days
+            prev_close = candles[idx_in_full - 1].close if idx_in_full > 0 else recent[0].open
+        else:
+            prev_close = recent[k - 1].close
+        ret = ((recent[k].close - prev_close) / prev_close) * 100 if prev_close > 0 else 0
+        returns.append(round(ret, 4))
+
+    # 거래량 비율 벡터 / Volume ratio vector
+    volumes = []
+    for k in range(len(recent)):
+        abs_idx = len(candles) - pre_days + k
+        vol_start = max(0, abs_idx - 20)
+        vol_slice = candles[vol_start:abs_idx]
+        avg_vol = sum(c.volume for c in vol_slice) / len(vol_slice) if vol_slice else 1
+        ratio = round(recent[k].volume / avg_vol, 4) if avg_vol > 0 else 1.0
+        volumes.append(ratio)
+
+    return returns, volumes
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ v9: DB벡터 매칭 후 MA/GC 보강
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def _enrich_ma_filter(recs: list, progress_callback=None) -> list:
+    """
+    ★ v9: DB벡터 매칭 결과에 MA5/MA20/GC 정보를 보강
+    상위 추천 종목(30개)만 네이버 25일 캔들 조회 → MA 계산
+    Enrich DB-vector matched recommendations with MA5/MA20/GC data
+    """
+    if not recs:
+        return recs
+
+    if progress_callback:
+        progress_callback(98, f"MA 필터 보강 중... ({len(recs)}개 종목)")
+
+    from app.services.naver_stock import get_daily_candles_naver
+    from app.engine.pattern_analyzer import CandleDay
+
+    codes = [r["code"] for r in recs]
+
+    # 병렬로 25일 캔들 조회
+    async def _fetch(code):
+        try:
+            return await asyncio.to_thread(get_daily_candles_naver, code, 30)
+        except Exception:
+            return None
+
+    candles_results = await asyncio.gather(*[_fetch(c) for c in codes])
+
+    for rec, raw_candles in zip(recs, candles_results):
+        ma5_declining = False
+        ma5_above_ma20 = True
+        gc_days = -1
+        gc_filtered = False
+
+        if raw_candles and len(raw_candles) >= 25:
+            try:
+                closes = [c.get("close", 0) for c in raw_candles]
+                n = len(closes)
+
+                # MA5 하향 체크 (최근 3일)
+                ma5_vals = []
+                for d in range(4):
+                    ei = n - d
+                    si = ei - 5
+                    if si >= 0:
+                        ma5_vals.append(sum(closes[si:ei]) / 5)
+                if len(ma5_vals) >= 3:
+                    ma5_declining = ma5_vals[0] < ma5_vals[1] < ma5_vals[2]
+
+                # MA5 vs MA20
+                ma5_today = sum(closes[-5:]) / 5
+                ma20_today = sum(closes[-20:]) / 20
+                ma5_above_ma20 = ma5_today > ma20_today
+
+                # 골든크로스 경과일
+                candle_objs = [
+                    CandleDay(date=c.get("date", ""), open=c.get("open", 0),
+                              high=c.get("high", 0), low=c.get("low", 0),
+                              close=c.get("close", 0), volume=c.get("volume", 0))
+                    for c in raw_candles if c.get("close", 0) > 0
+                ]
+                if len(candle_objs) >= 25:
+                    gc_days = _days_since_golden_cross(candle_objs)
+
+                # GC 5일 경과 시 시그널 다운그레이드
+                if gc_days >= 5:
+                    gc_filtered = True
+                    if rec.get("signal_code") in ("strong_buy", "watch"):
+                        rec["signal"] = f"⏰ GC+{gc_days}일 경과"
+                        rec["signal_code"] = "gc_expired"
+            except Exception as e:
+                logger.debug(f"[{rec['code']}] MA 보강 실패: {e}")
+        elif raw_candles and len(raw_candles) >= 10:
+            try:
+                closes = [c.get("close", 0) for c in raw_candles]
+                n = len(closes)
+                ma5_vals = []
+                for d in range(4):
+                    ei = n - d
+                    si = ei - 5
+                    if si >= 0:
+                        ma5_vals.append(sum(closes[si:ei]) / 5)
+                if len(ma5_vals) >= 3:
+                    ma5_declining = ma5_vals[0] < ma5_vals[1] < ma5_vals[2]
+            except Exception:
+                pass
+
+        rec["ma5_declining"] = ma5_declining
+        rec["ma5_above_ma20"] = ma5_above_ma20
+        rec["gc_days"] = gc_days
+        rec["gc_filtered"] = gc_filtered
+
+    logger.info(f"[Phase2-MA] MA 보강 완료: {len(recs)}개 종목, "
+                f"MA5하향 {sum(1 for r in recs if r['ma5_declining'])}개, "
+                f"MA5<MA20 {sum(1 for r in recs if not r['ma5_above_ma20'])}개, "
+                f"GC5일+ {sum(1 for r in recs if r['gc_days'] >= 5)}개")
+    return recs
+
+
+async def _scan_recommendations(
+    clusters_dicts: list,
+    analyzed_codes: set,
+    pre_days: int,
+    progress_callback=None,
+    max_candidates: int = 300,
+) -> list:
+    """
+    ★ v3: stock_patterns DB에서 사전 수집된 벡터로 전종목 DTW 비교
+    DB 미구축 시 기존 실시간 방식으로 fallback
+
+    Args:
+        clusters_dicts: 분석 결과의 클러스터 (dict 형태)
+        analyzed_codes: 분석 대상 종목 코드 (제외 대상)
+        pre_days: 패턴 분석 일수
+        progress_callback: 진행률 콜백
+        max_candidates: 최대 후보 종목 수 (fallback 전용)
+    Returns:
+        매수 추천 리스트 (유사도순 정렬)
+    """
+    # ── 유효 클러스터 확인 ──
+    valid_clusters = [
+        c for c in clusters_dicts
+        if c.get("avg_return_flow") and c.get("avg_volume_flow")
+    ]
+    if not valid_clusters:
+        logger.warning("유효한 클러스터가 없습니다")
+        return []
+
+    # ── DB 벡터 방식 시도 ──
+    if progress_callback:
+        progress_callback(78, "stock_patterns DB에서 전종목 벡터 로드 중...")
+
+    try:
+        resp = db.table("stock_patterns").select(
+            "code, name, market, returns_30d, volumes_30d, last_close, last_date"
+        ).execute()
+        pattern_rows = resp.data or []
+    except Exception as e:
+        logger.warning(f"stock_patterns 조회 실패 (fallback 실행): {e}")
+        pattern_rows = []
+
+    if len(pattern_rows) >= 100:
+        # ━━━ DB 벡터 방식 (빠른 경로) ━━━
+        logger.info(f"[Phase2] DB 벡터 방식: {len(pattern_rows)}개 로드됨")
+        recs = _match_from_db_vectors(
+            pattern_rows, valid_clusters, analyzed_codes, pre_days, progress_callback
+        )
+        # ★ v9: 상위 추천 종목에 MA5/MA20/GC 정보 보강 (네이버 캔들 조회)
+        recs = await _enrich_ma_filter(recs, progress_callback)
+        return recs
+    else:
+        # ━━━ 실시간 방식 (fallback) ━━━
+        logger.info(f"[Phase2] DB 벡터 부족({len(pattern_rows)}개), 실시간 fallback")
+        return await _match_realtime_fallback(
+            valid_clusters, analyzed_codes, pre_days, progress_callback, max_candidates
+        )
+
+
+def _match_from_db_vectors(
+    pattern_rows: list,
+    valid_clusters: list,
+    analyzed_codes: set,
+    pre_days: int,
+    progress_callback=None,
+) -> list:
+    """
+    ★ DB 벡터 기반 전종목 매칭 — 네이버 API 호출 없음, 수초 완료
+    [v5] 사전 정규화 + early exit 최적화
+    """
+    if progress_callback:
+        progress_callback(80, f"DB에서 {len(pattern_rows)}개 종목 벡터 비교 중...")
+
+    # ★ v5: 클러스터 벡터 사전 정규화 (루프 밖 1회)
+    for cluster in valid_clusters:
+        ret_flow = cluster.get("avg_return_flow", [])
+        vol_flow = cluster.get("avg_volume_flow", [])
+        if ret_flow and "_norm_returns" not in cluster:
+            cluster["_norm_returns"] = _z_normalize_cached(ret_flow)
+        if vol_flow and "_norm_volumes" not in cluster:
+            cluster["_norm_volumes"] = _z_normalize_cached(vol_flow)
+
+    recommendations = []
+    total = len(pattern_rows)
+
+    for idx, row in enumerate(pattern_rows):
+        code = row.get("code", "")
+        name = row.get("name", code)
+
+        # 분석 대상 종목 제외
+        if code in analyzed_codes:
+            continue
+
+        # 벡터 파싱
+        try:
+            returns_full = row.get("returns_30d", [])
+            volumes_full = row.get("volumes_30d", [])
+
+            # JSONB가 문자열로 올 수 있음
+            if isinstance(returns_full, str):
+                returns_full = json.loads(returns_full)
+            if isinstance(volumes_full, str):
+                volumes_full = json.loads(volumes_full)
+
+            if not returns_full or not volumes_full:
+                continue
+
+            # pre_days에 맞게 슬라이스 (30일 중 최근 N일)
+            current_returns = returns_full[-pre_days:] if len(returns_full) >= pre_days else returns_full
+            current_volumes = volumes_full[-pre_days:] if len(volumes_full) >= pre_days else volumes_full
+
+        except Exception:
+            continue
+
+        # ★ v5: 사전 정규화 + early exit DTW 비교
+        best_sim = 0
+        best_cluster_id = 0
+        best_cluster_ret = []
+        best_cluster_vol = []
+        norm_ret = _z_normalize_cached(current_returns)
+        norm_vol = _z_normalize_cached(current_volumes)
+
+        for cluster in valid_clusters:
+            try:
+                c_ret = cluster.get("_norm_returns", cluster.get("avg_return_flow", []))
+                sim_r = dtw_similarity(norm_ret, c_ret, normalize=False)
+                # early exit: 등락률 유사도가 낮으면 거래량 계산 스킵
+                if sim_r * 0.6 + 100 * 0.4 < best_sim:
+                    continue
+                c_vol = cluster.get("_norm_volumes", cluster.get("avg_volume_flow", []))
+                sim_v = dtw_similarity(norm_vol, c_vol, normalize=False)
+                sim = sim_r * 0.6 + sim_v * 0.4
+
+                if sim > best_sim:
+                    best_sim = sim
+                    best_cluster_id = cluster.get("cluster_id", 0)
+                    best_cluster_ret = cluster.get("avg_return_flow", [])
+                    best_cluster_vol = cluster.get("avg_volume_flow", [])
+            except Exception:
+                continue
+
+        # ★ v8: 조기 진입 점수 계산 (부분 패턴 매칭)
+        early_info = {"early_entry": False, "early_score": 0, "pattern_progress": 1.0,
+                      "best_partial_sim": 0, "ma20_proximity": False, "volume_declining": False, "entry_reason": ""}
+        try:
+            if best_sim >= 35 and best_cluster_ret:
+                early_info = compute_early_entry_score(
+                    current_returns=current_returns,
+                    current_volumes=current_volumes,
+                    cluster_returns=best_cluster_ret,
+                    cluster_volumes=best_cluster_vol,
+                    candles=None,  # DB 벡터 모드에서는 candles 없음
+                    pre_days=pre_days,
+                )
+        except Exception:
+            pass
+
+        # 시그널 판단
+        if best_sim >= 65:
+            signal = "🟢 강력 매수"
+            signal_code = "strong_buy"
+        elif best_sim >= 50:
+            signal = "🟡 관심"
+            signal_code = "watch"
+        elif best_sim >= 40:
+            signal = "⚠️ 대기"
+            signal_code = "wait"
+        else:
+            signal = "⬜ 미해당"
+            signal_code = "none"
+
+        if best_sim >= 35:
+            recommendations.append({
+                "code": code,
+                "name": name,
+                "current_price": row.get("last_close", 0),
+                "similarity": round(best_sim, 1),
+                "best_cluster_id": best_cluster_id,
+                "signal": signal,
+                "signal_code": signal_code,
+                "current_returns": current_returns[-5:],
+                "current_volumes": current_volumes[-5:],
+                "last_date": row.get("last_date", ""),
+                "signal_date": row.get("last_date", ""),
+                # ★ v8: 조기 진입 정보
+                "early_entry": early_info.get("early_entry", False),
+                "early_score": early_info.get("early_score", 0),
+                "pattern_progress": early_info.get("pattern_progress", 1.0),
+                "early_reason": early_info.get("entry_reason", ""),
+                # ★ v9: 골든크로스 경과일 (DB벡터 모드: candles 없으므로 -1)
+                "gc_days": early_info.get("gc_days", -1),
+                "gc_filtered": False,
+            })
+
+        # 진행률 업데이트 (500개마다)
+        if progress_callback and idx % 500 == 0:
+            pct = 80 + int((idx / total) * 17)  # 80~97%
+            progress_callback(pct, f"벡터 비교: {idx}/{total}")
+
+    # 유사도 높은 순 정렬, 상위 30개
+    recommendations.sort(key=lambda r: r["similarity"], reverse=True)
+    recommendations = recommendations[:30]
+
+    if progress_callback:
+        progress_callback(98, f"전종목 {total}개 스캔 완료 → {len(recommendations)}개 추천")
+
+    logger.info(f"[Phase2-DB] 전종목 {total}개 스캔, {len(recommendations)}개 추천")
+    return recommendations
+
+
+async def _match_realtime_fallback(
+    valid_clusters: list,
+    analyzed_codes: set,
+    pre_days: int,
+    progress_callback=None,
+    max_candidates: int = 300,
+) -> list:
+    """
+    실시간 네이버 캔들 수집 방식 (fallback — DB 미구축 시)
+    """
+    # ── stock_list에서 후보 로드 ──
+    if progress_callback:
+        progress_callback(79, "stock_list에서 후보 종목 로드 중 (fallback)...")
+
+    try:
+        resp = db.table("stock_list").select("code, name, market").execute()
+        all_stocks = resp.data or []
+    except Exception as e:
+        logger.error(f"stock_list 조회 실패: {e}")
+        return []
+
+    if not all_stocks:
+        return []
+
+    # ── 비주식 종목 필터링 ──
+    from app.services.stock_pattern_collector import is_regular_stock
+    filtered = [s for s in all_stocks if is_regular_stock(s)]
+    candidates = [s for s in filtered if s["code"] not in analyzed_codes]
+
+    # ── 샘플링 ──
+    if len(candidates) > max_candidates:
+        kospi = [s for s in candidates if s.get("market", "").lower() == "kospi"]
+        kosdaq = [s for s in candidates if s.get("market", "").lower() == "kosdaq"]
+
+        kospi_n = int(max_candidates * 0.5)
+        kosdaq_n = max_candidates - kospi_n
+
+        sampled = []
+        if kospi:
+            sampled.extend(random.sample(kospi, min(kospi_n, len(kospi))))
+        if kosdaq:
+            sampled.extend(random.sample(kosdaq, min(kosdaq_n, len(kosdaq))))
+
+        candidates = sampled
+
+    # ── ★ v5: 클러스터 벡터 사전 정규화 (루프 밖에서 1회) ──
+    for cluster in valid_clusters:
+        ret_flow = cluster.get("avg_return_flow", [])
+        vol_flow = cluster.get("avg_volume_flow", [])
+        if ret_flow:
+            cluster["_norm_returns"] = _z_normalize_cached(ret_flow)
+        if vol_flow:
+            cluster["_norm_volumes"] = _z_normalize_cached(vol_flow)
+
+    # ── 캔들 수집 + 벡터 계산 + DTW 비교 ──
+    if progress_callback:
+        progress_callback(80, f"후보 {len(candidates)}개 캔들 수집 중 (fallback)...")
+
+    recommendations = []
+    total_cands = len(candidates)
+
+    for idx, stock in enumerate(candidates):
+        code = stock["code"]
+        name = stock.get("name", code)
+
+        if progress_callback and idx % 20 == 0:
+            pct = 80 + int((idx / total_cands) * 12)
+            progress_callback(pct, f"후보 캔들 수집: {name} ({idx+1}/{total_cands})")
+
+        try:
+            candles, fetched_name = await fetch_candles_for_code(code, pre_days + 30)
+            if not candles or len(candles) < pre_days + 20:
+                continue
+
+            current_returns, current_volumes = _compute_pattern_vectors(candles, pre_days)
+            if current_returns is None:
+                continue
+
+            name = fetched_name or name
+        except Exception:
+            continue
+
+        await asyncio.sleep(0.1)  # ★ v5: 0.15→0.1초 (총 33% 시간 단축)
+
+        # DTW 비교 — ★ v5: 사전 정규화 + early exit
+        best_sim = 0
+        best_cluster_id = 0
+
+        # 사전 정규화 (클러스터 루프 밖에서 1회만)
+        norm_returns = _z_normalize_cached(current_returns) if current_returns else current_returns
+        norm_volumes = _z_normalize_cached(current_volumes) if current_volumes else current_volumes
+
+        for cluster in valid_clusters:
+            try:
+                # ★ 등락률 먼저 계산 → 낮으면 거래량 스킵 (early exit)
+                c_ret = cluster.get("_norm_returns") or cluster.get("avg_return_flow", [])
+                sim_r = dtw_similarity(norm_returns, c_ret, normalize=False)
+                if sim_r * 0.6 + 100 * 0.4 < best_sim:
+                    continue  # 거래량 100%여도 현재 best 못 이김
+                c_vol = cluster.get("_norm_volumes") or cluster.get("avg_volume_flow", [])
+                sim_v = dtw_similarity(norm_volumes, c_vol, normalize=False)
+                sim = sim_r * 0.6 + sim_v * 0.4
+                if sim > best_sim:
+                    best_sim = sim
+                    best_cluster_id = cluster.get("cluster_id", 0)
+            except Exception:
+                continue
+
+        if best_sim >= 65:
+            signal, signal_code = "🟢 강력 매수", "strong_buy"
+        elif best_sim >= 50:
+            signal, signal_code = "🟡 관심", "watch"
+        elif best_sim >= 40:
+            signal, signal_code = "⚠️ 대기", "wait"
+        else:
+            signal, signal_code = "⬜ 미해당", "none"
+
+        if best_sim >= 35:
+            recommendations.append({
+                "code": code,
+                "name": name,
+                "current_price": candles[-1].close if candles else 0,
+                "similarity": round(best_sim, 1),
+                "best_cluster_id": best_cluster_id,
+                "signal": signal,
+                "signal_code": signal_code,
+                "current_returns": current_returns[-5:],
+                "current_volumes": current_volumes[-5:],
+                "last_date": candles[-1].date if candles else "",
+                "signal_date": candles[-1].date if candles else "",
+            })
+
+    recommendations.sort(key=lambda r: r["similarity"], reverse=True)
+    recommendations = recommendations[:30]
+
+    logger.info(f"[Phase2-fallback] {total_cands}개 스캔, {len(recommendations)}개 추천")
+    return recommendations
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# API 엔드포인트
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.post("/analyze")
+async def start_analysis(req: AnalyzeRequest, background_tasks: BackgroundTasks):
+    """분석 시작 (백그라운드 실행)"""
+    global _analysis_state
+
+    if _analysis_state.get("running"):
+        raise HTTPException(status_code=409, detail="이미 분석이 진행 중입니다.")
+
+    if not req.codes:
+        raise HTTPException(status_code=400, detail="종목 코드를 1개 이상 입력하세요.")
+
+    if len(req.codes) > 20:
+        raise HTTPException(status_code=400, detail="최대 20개 종목까지 분석 가능합니다.")
+
+    _analysis_state = {
+        "running": True,
+        "progress": 0,
+        "message": "분석 준비 중...",
+        "result": None,
+        "error": None,
+        "has_result": False,
+        "saved_to_db": False,
+        "codes": req.codes,
+        "names": dict(req.names),
+        "params": {
+            "period_days": req.period_days,
+            "pre_rise_days": req.pre_rise_days,
+            "rise_pct": req.rise_pct,
+            "rise_window": req.rise_window,
+            "weight_returns": req.weight_returns,
+            "weight_candle": req.weight_candle,
+            "weight_volume": req.weight_volume,
+        },
     }
+
+    background_tasks.add_task(
+        _run_analysis_task,
+        req.codes,
+        req.names,
+        req.period_days,
+        req.pre_rise_days,
+        req.rise_pct,
+        req.rise_window,
+    )
+
+    return {"status": "started", "message": f"{len(req.codes)}개 종목 분석 시작"}
+
+
+async def _run_analysis_task(
+    codes: List[str],
+    names: dict,
+    period_days: int,
+    pre_rise_days: int,
+    rise_pct: float,
+    rise_window: int,
+):
+    """
+    백그라운드 분석 태스크
+    ★ Phase 1: 패턴 분석 (기존)
+    ★ Phase 2: 전종목 매수 추천 스캔 (신규)
+    """
+    global _analysis_state
+
+    try:
+        # ══════════════════════════════════════════
+        # Phase 1: 데이터 수집 + 패턴 분석
+        # ══════════════════════════════════════════
+        candles_by_code = {}
+        total = len(codes)
+
+        for idx, code in enumerate(codes):
+            _analysis_state["progress"] = int((idx / total) * 25)
+            _analysis_state["message"] = f"데이터 수집 중: {names.get(code, code)} ({idx+1}/{total})"
+
+            candles, fetched_name = await fetch_candles_for_code(code, period_days)
+            if candles:
+                candles_by_code[code] = candles
+                # 네이버에서 가져온 종목명으로 업데이트
+                if fetched_name and fetched_name != code:
+                    names[code] = fetched_name
+            else:
+                logger.warning(f"[{code}] 데이터 없음 — 스킵")
+
+            await asyncio.sleep(0.3)
+
+        if not candles_by_code:
+            _analysis_state["running"] = False
+            _analysis_state["error"] = "조회된 종목 데이터가 없습니다."
+            _analysis_state["progress"] = 100
+            return
+
+        _analysis_state["progress"] = 28
+        _analysis_state["message"] = f"{len(candles_by_code)}개 종목 데이터 수집 완료, 패턴 분석 시작..."
+
+        # 패턴 분석 실행
+        def progress_cb_phase1(pct, msg):
+            # Phase1: 28~75% 범위
+            mapped_pct = 28 + int(pct * 0.47)
+            _analysis_state["progress"] = min(mapped_pct, 75)
+            _analysis_state["message"] = msg
+
+        result = run_pattern_analysis(
+            candles_by_code=candles_by_code,
+            names=names,
+            pre_days=pre_rise_days,
+            rise_pct=rise_pct,
+            rise_window=rise_window,
+            progress_callback=progress_cb_phase1,
+        )
+
+
+        # ══════════════════════════════════════════
+        # Phase 2: 전종목 매수 추천 스캔 (★ 핵심 수정)
+        # ══════════════════════════════════════════
+        _analysis_state["progress"] = 76
+        _analysis_state["message"] = "전종목 매수 추천 스캔 시작..."
+
+        analyzed_codes = set(codes)
+        clusters_dicts = result.clusters  # 이미 dict 리스트
+
+
+        def progress_cb_phase2(pct, msg):
+            _analysis_state["progress"] = pct
+            _analysis_state["message"] = msg
+
+        # 클러스터가 있을 때만 전종목 스캔 실행
+        if clusters_dicts:
+            new_recommendations = await _scan_recommendations(
+                clusters_dicts=clusters_dicts,
+                analyzed_codes=analyzed_codes,
+                pre_days=pre_rise_days,
+                progress_callback=progress_cb_phase2,
+                max_candidates=300,
+            )
+        else:
+            new_recommendations = []
+
+        # ══════════════════════════════════════════
+        # 결과 저장
+        # ══════════════════════════════════════════
+
+        # ★ 가상투자용 백테스트 추천 (과거 패턴 기반 — 역사적 날짜)
+        # 종목별 가장 최근 패턴 1건만 사용 (중복 제거)
+        backtest_by_code = {}
+        for p in result.all_patterns:
+            surge = p.get("surge", {})
+            code = p.get("code", "")
+            signal_date = surge.get("start_date", "")
+
+            # 같은 종목이면 가장 최근 패턴만 유지
+            if code not in backtest_by_code or signal_date > backtest_by_code[code]["signal_date"]:
+                backtest_by_code[code] = {
+                    "code": code,
+                    "name": p.get("name", ""),
+                    "signal_date": signal_date,
+                    "buy_price": surge.get("start_price", 0),
+                    "current_price": surge.get("start_price", 0),
+                    "similarity": 100.0,
+                    "signal": "📊 백테스트",
+                    "signal_code": "backtest",
+                    "surge_pct": surge.get("rise_pct", 0),
+                    "surge_days": surge.get("rise_days", 0),
+                    "candles": p.get("candles", []),
+                }
+
+        backtest_recs = list(backtest_by_code.values())
+
+        # ★ 버그 수정: recommendations의 signal_date를 과거 급상승 시작일로 보강
+        # recommendations는 "현재 패턴이 유사한 종목"이지만, 가상투자 비교에서
+        # signal_date=오늘이면 미래 데이터가 없어 시뮬레이션 불가.
+        # → backtest_by_code에 해당 종목이 있으면 역사적 signal_date/buy_price 추가
+        for rec in new_recommendations:
+            code = rec.get("code", "")
+            if code in backtest_by_code:
+                bt = backtest_by_code[code]
+                rec["backtest_signal_date"] = bt.get("signal_date", "")
+                rec["backtest_buy_price"] = bt.get("buy_price", 0)
+                rec["surge_pct"] = bt.get("surge_pct", 0)
+                rec["surge_days"] = bt.get("surge_days", 0)
+            else:
+                rec["backtest_signal_date"] = ""
+                rec["backtest_buy_price"] = 0
+
+        logger.info(f"[보강] recommendations {len(new_recommendations)}개 중 "
+                    f"{sum(1 for r in new_recommendations if r.get('backtest_signal_date'))}개에 "
+                    f"과거 signal_date 매핑 완료")
+
+        _analysis_state["result"] = {
+            "status": "done",
+            "total_stocks": result.total_stocks,
+            "total_surges": result.total_surges,
+            "total_patterns": result.total_patterns,
+            "clusters": result.clusters,
+            "all_patterns": result.all_patterns,
+            "recommendations": new_recommendations,  # ★ 전종목 스캔 결과 (매수 추천 탭)
+            "backtest_recommendations": backtest_recs,  # ★ 가상투자용 (과거 날짜)
+            "summary": result.summary,
+            "raw_surges": result.raw_surges,
+            # 추가 메타정보
+            "scanned_candidates": len(new_recommendations),
+            "analyzed_codes": list(analyzed_codes),
+        }
+        _analysis_state["progress"] = 100
+        _analysis_state["message"] = "분석 완료!"
+        _analysis_state["has_result"] = True
+        _analysis_state["running"] = False
+
+        logger.info(
+            f"분석 완료: {result.total_surges}개 급상승, "
+            f"{result.total_patterns}개 패턴, "
+            f"{len(new_recommendations)}개 매수 추천"
+        )
+
+    except Exception as e:
+        logger.error(f"분석 실패: {traceback.format_exc()}")
+        _analysis_state["running"] = False
+        _analysis_state["error"] = str(e)
+        _analysis_state["progress"] = 100
+
+
+@router.get("/progress")
+async def get_progress():
+    """진행률 조회"""
+    return {
+        "running": _analysis_state.get("running", False),
+        "progress": _analysis_state.get("progress", 0),
+        "message": _analysis_state.get("message", ""),
+        "error": _analysis_state.get("error"),
+        "has_result": _analysis_state.get("has_result", False),
+    }
+
+
+@router.get("/result")
+async def get_result():
+    """분석 결과 조회 (최초 조회 시 DB 자동 저장)"""
+    if _analysis_state.get("error"):
+        return {"status": "error", "error": _analysis_state["error"]}
+    if _analysis_state.get("result"):
+        # ━━━ DB 저장 (최초 1회만) ━━━
+        if not _analysis_state.get("saved_to_db"):
+            try:
+                result = _analysis_state["result"]
+                codes = _analysis_state.get("codes", [])
+                names = _analysis_state.get("names", {})
+                params = _analysis_state.get("params", {})
+
+                pattern_count = result.get("total_patterns", 0)
+
+                save_data = {
+                    "preset": params.get("preset", "custom"),
+                    "params": params,
+                    "stock_codes": codes,
+                    "stock_names": names,
+                    "stock_count": len(codes),
+                    "pattern_count": pattern_count,
+                    "result_summary": {
+                        "total_stocks": result.get("total_stocks", 0),
+                        "total_surges": result.get("total_surges", 0),
+                        "total_patterns": pattern_count,
+                        "clusters": len(result.get("clusters", [])),
+                        "recommendations": len(result.get("recommendations", [])),
+                    },
+                    "full_result": result,
+                }
+
+                db.table("pattern_analysis_sessions").insert(save_data).execute()
+                _analysis_state["saved_to_db"] = True
+                logger.info(f"✅ 패턴 분석 결과 DB 저장 완료 ({len(codes)}종목, {pattern_count}패턴)")
+            except Exception as e:
+                logger.error(f"⚠️ 패턴 분석 결과 DB 저장 실패: {e}")
+
+        return _analysis_state["result"]
+    return {"status": "waiting", "message": "분석 결과가 없습니다."}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 이전 분석 결과 조회 / Previous Results
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/previous")
+async def get_previous_results():
+    """이전 패턴 분석 결과 목록 (최근 10개)"""
+    try:
+        resp = (
+            db.table("pattern_analysis_sessions")
+            .select("id, created_at, preset, stock_codes, stock_names, stock_count, pattern_count, result_summary")
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+        sessions = resp.data or []
+        return {"status": "ok", "sessions": sessions, "count": len(sessions)}
+    except Exception as e:
+        logger.error(f"이전 분석 목록 조회 실패: {e}")
+        return {"status": "error", "message": str(e), "sessions": []}
+
+
+@router.get("/previous/{session_id}")
+async def get_previous_result_detail(session_id: int):
+    """특정 분석 세션의 전체 결과 조회"""
+    try:
+        resp = (
+            db.table("pattern_analysis_sessions")
+            .select("*")
+            .eq("id", session_id)
+            .single()
+            .execute()
+        )
+        if not resp.data:
+            return {"status": "not_found", "message": f"세션 {session_id}을 찾을 수 없습니다."}
+
+        session = resp.data
+        full_result = session.get("full_result", {})
+
+        return {
+            "status": "done",
+            "session_id": session["id"],
+            "created_at": session["created_at"],
+            "preset": session.get("preset"),
+            "stock_names": session.get("stock_names", {}),
+            "params": session.get("params", {}),
+            **full_result,
+        }
+    except Exception as e:
+        logger.error(f"분석 세션 {session_id} 조회 실패: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 종목 검색 (네이버 자동완성 or DB)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.post("/search")
+async def search_stock(req: SearchRequest):
+    """종목명/코드 검색 (DB 우선, 네이버 폴백)"""
+    keyword = req.keyword.strip()
+    if not keyword:
+        return {"results": []}
+
+    results = []
+
+    # 1차: DB 검색 (stock_list)
+    try:
+        if keyword.isdigit() and len(keyword) <= 6:
+            resp = db.table("stock_list").select("code, name, market").ilike("code", f"%{keyword}%").limit(20).execute()
+        else:
+            resp = db.table("stock_list").select("code, name, market").ilike("name", f"%{keyword}%").limit(20).execute()
+
+        if resp.data:
+            for row in resp.data:
+                results.append({"code": row["code"], "name": row["name"]})
+    except Exception as e:
+        logger.error(f"DB 검색 실패: {e}")
+
+    # 2차: DB에 없으면 네이버 자동완성 폴백
+    if not results:
+        try:
+            encoded = urllib.parse.quote(keyword, encoding="euc-kr")
+            url = (
+                f"https://ac.finance.naver.com/ac?"
+                f"q={encoded}&q_enc=euc-kr&t_koreng=1&st=111&r_lt=111"
+                f"&frm=stock&r_format=json&r_enc=utf-8&r_unicode=0&r_query=1"
+            )
+            req_obj = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Referer": "https://finance.naver.com/",
+            })
+            with urllib.request.urlopen(req_obj, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8"))
+
+            items = data.get("items", [[]])[0] if data.get("items") else []
+            for item in items[:20]:
+                if len(item) >= 2:
+                    name = item[0][0] if isinstance(item[0], list) else str(item[0])
+                    code = item[1][0] if isinstance(item[1], list) else str(item[1])
+                    if len(code) == 6 and code.isdigit():
+                        results.append({"code": code, "name": name})
+        except Exception as e:
+            logger.error(f"네이버 검색 실패: {e}")
+
+    # 3차: 직접 코드 입력 (6자리)
+    if not results and keyword.isdigit() and len(keyword) == 6:
+        results.append({"code": keyword, "name": f"종목코드 {keyword}"})
+
+    return {"results": results}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ 패턴 라이브러리 — 저장/조회/수정/삭제/스캔
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class SavePatternRequest(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    session_id: Optional[str] = None
+    cluster_id: Optional[int] = None
+    avg_return_flow: list
+    avg_volume_flow: Optional[list] = None
+    avg_rsi_flow: Optional[list] = None
+    avg_ma_dist_flow: Optional[list] = None
+    avg_similarity: Optional[float] = 0
+    avg_rise_pct: Optional[float] = 0
+    avg_rise_days: Optional[float] = 0
+    member_count: Optional[int] = 0
+    members: Optional[list] = []
+    confidence: Optional[float] = 0
+    tags: Optional[list] = []
+
+
+class UpdatePatternRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    tags: Optional[list] = None
+    is_active: Optional[bool] = None
+
+
+class PatternScanRequest(BaseModel):
+    pattern_ids: List[str]
+    min_similarity: float = 60
+    market: str = "ALL"
+    limit: int = 50
+
+
+class RecordTradeRequest(BaseModel):
+    profit_pct: float
+    is_win: bool
+
+
+@router.post("/library/save")
+async def save_pattern(req: SavePatternRequest):
+    """클러스터 패턴을 라이브러리에 저장"""
+    try:
+        data = {
+            "name": req.name,
+            "description": req.description or "",
+            "source_session_id": req.session_id,
+            "source_cluster_id": req.cluster_id,
+            "avg_return_flow": req.avg_return_flow,
+            "avg_volume_flow": req.avg_volume_flow,
+            "avg_rsi_flow": req.avg_rsi_flow,
+            "avg_ma_dist_flow": req.avg_ma_dist_flow,
+            "avg_similarity": req.avg_similarity or 0,
+            "avg_rise_pct": req.avg_rise_pct or 0,
+            "avg_rise_days": req.avg_rise_days or 0,
+            "member_count": req.member_count or 0,
+            "member_codes": req.members or [],
+            "confidence": req.confidence or 0,
+            "tags": req.tags or [],
+            "is_active": True,
+            "use_count": 0,
+            "total_trades": 0,
+            "win_trades": 0,
+            "total_profit_pct": 0,
+        }
+        resp = db.table("saved_patterns").insert(data).execute()
+        new_id = resp.data[0]["id"] if resp.data else None
+        logger.info(f"패턴 저장 완료: {req.name} (id={new_id})")
+        return {"success": True, "pattern_id": new_id, "message": "패턴이 저장되었습니다"}
+    except Exception as e:
+        logger.error(f"패턴 저장 실패: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@router.get("/library/list")
+async def list_saved_patterns():
+    """저장된 패턴 목록 조회 (성과 통계 포함)"""
+    try:
+        resp = (
+            db.table("saved_patterns")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
+        patterns = resp.data or []
+        return {"success": True, "patterns": patterns, "count": len(patterns)}
+    except Exception as e:
+        logger.error(f"패턴 목록 조회 실패: {e}")
+        return {"success": False, "patterns": [], "message": str(e)}
+
+
+@router.put("/library/{pattern_id}")
+async def update_saved_pattern(pattern_id: str, req: UpdatePatternRequest):
+    """저장된 패턴 수정 (이름/태그/활성상태)"""
+    try:
+        update_data = {}
+        if req.name is not None:
+            update_data["name"] = req.name
+        if req.description is not None:
+            update_data["description"] = req.description
+        if req.tags is not None:
+            update_data["tags"] = req.tags
+        if req.is_active is not None:
+            update_data["is_active"] = req.is_active
+        if not update_data:
+            return {"success": False, "message": "수정할 항목이 없습니다"}
+        update_data["updated_at"] = "now()"
+        db.table("saved_patterns").update(update_data).eq("id", pattern_id).execute()
+        logger.info(f"패턴 수정 완료: {pattern_id}")
+        return {"success": True, "message": "패턴이 수정되었습니다"}
+    except Exception as e:
+        logger.error(f"패턴 수정 실패: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@router.delete("/library/{pattern_id}")
+async def delete_saved_pattern(pattern_id: str):
+    """저장된 패턴 삭제"""
+    try:
+        db.table("saved_patterns").delete().eq("id", pattern_id).execute()
+        logger.info(f"패턴 삭제 완료: {pattern_id}")
+        return {"success": True, "message": "패턴이 삭제되었습니다"}
+    except Exception as e:
+        logger.error(f"패턴 삭제 실패: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@router.post("/library/scan")
+async def scan_with_saved_patterns(req: PatternScanRequest):
+    """저장된 패턴으로 전종목 매칭 스캔"""
+    try:
+        # 1) 요청된 패턴 로드
+        patterns_resp = (
+            db.table("saved_patterns")
+            .select("id, name, avg_return_flow, avg_volume_flow")
+            .in_("id", req.pattern_ids)
+            .execute()
+        )
+        patterns = patterns_resp.data or []
+        if not patterns:
+            return {"success": False, "message": "선택된 패턴이 없습니다", "matches": []}
+
+        # avg_return_flow 파싱
+        for p in patterns:
+            if isinstance(p.get("avg_return_flow"), str):
+                p["avg_return_flow"] = json.loads(p["avg_return_flow"])
+            if isinstance(p.get("avg_volume_flow"), str):
+                p["avg_volume_flow"] = json.loads(p["avg_volume_flow"])
+
+        # 2) 전종목 벡터 로드
+        query = db.table("stock_patterns").select(
+            "code, name, market, returns_30d, volumes_30d, last_close, last_date"
+        )
+        if req.market and req.market != "ALL":
+            query = query.ilike("market", req.market)
+        stock_resp = query.execute()
+        all_stocks = stock_resp.data or []
+
+        if not all_stocks:
+            return {"success": False, "message": "stock_patterns 데이터가 없습니다", "matches": []}
+
+        # 3) DTW 매칭
+        matches = []
+        for stock in all_stocks:
+            try:
+                returns_raw = stock.get("returns_30d", [])
+                volumes_raw = stock.get("volumes_30d", [])
+                if isinstance(returns_raw, str):
+                    returns_raw = json.loads(returns_raw)
+                if isinstance(volumes_raw, str):
+                    volumes_raw = json.loads(volumes_raw)
+                if not returns_raw:
+                    continue
+
+                best_sim = 0
+                best_pattern_id = None
+                best_pattern_name = None
+
+                for p in patterns:
+                    p_returns = p.get("avg_return_flow", [])
+                    p_volumes = p.get("avg_volume_flow", [])
+                    if not p_returns:
+                        continue
+
+                    sim_r = dtw_similarity(returns_raw[-len(p_returns):], p_returns)
+                    sim_v = 0
+                    if p_volumes and volumes_raw:
+                        sim_v = dtw_similarity(volumes_raw[-len(p_volumes):], p_volumes)
+                    sim = sim_r * 0.6 + sim_v * 0.4 if sim_v > 0 else sim_r
+
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_pattern_id = p["id"]
+                        best_pattern_name = p["name"]
+
+                if best_sim >= req.min_similarity:
+                    matches.append({
+                        "code": stock["code"],
+                        "name": stock["name"],
+                        "market": stock.get("market", ""),
+                        "current_price": stock.get("last_close", 0),
+                        "similarity": round(best_sim, 1),
+                        "matched_pattern_id": best_pattern_id,
+                        "matched_pattern_name": best_pattern_name,
+                        "returns_30d": returns_raw[-10:],
+                        "last_date": stock.get("last_date", ""),
+                    })
+            except Exception:
+                continue
+
+        # 유사도 높은 순 정렬
+        matches.sort(key=lambda x: x["similarity"], reverse=True)
+        matches = matches[:req.limit]
+
+        # use_count 증가
+        for pid in req.pattern_ids:
+            try:
+                cur = db.table("saved_patterns").select("use_count").eq("id", pid).single().execute()
+                cnt = (cur.data.get("use_count") or 0) + 1 if cur.data else 1
+                db.table("saved_patterns").update(
+                    {"use_count": cnt, "last_used_at": "now()"}
+                ).eq("id", pid).execute()
+            except Exception:
+                pass
+
+        # 패턴별 매치 통계
+        pattern_stats = {}
+        for m in matches:
+            pid = m["matched_pattern_id"]
+            if pid not in pattern_stats:
+                pattern_stats[pid] = {"id": pid, "name": m["matched_pattern_name"], "match_count": 0}
+            pattern_stats[pid]["match_count"] += 1
+
+        logger.info(f"패턴 스캔 완료: {len(all_stocks)}개 중 {len(matches)}개 매칭")
+        return {
+            "success": True,
+            "total_scanned": len(all_stocks),
+            "matches": matches,
+            "patterns_used": list(pattern_stats.values()),
+        }
+    except Exception as e:
+        logger.error(f"패턴 스캔 실패: {traceback.format_exc()}")
+        return {"success": False, "message": str(e), "matches": []}
+
+
+@router.post("/library/{pattern_id}/record-trade")
+async def record_pattern_trade(pattern_id: str, req: RecordTradeRequest):
+    """패턴 성과 기록 (포지션 종료 시 호출)"""
+    try:
+        # 현재 통계 조회
+        resp = db.table("saved_patterns").select(
+            "total_trades, win_trades, total_profit_pct"
+        ).eq("id", pattern_id).single().execute()
+
+        if not resp.data:
+            return {"success": False, "message": "패턴을 찾을 수 없습니다"}
+
+        current = resp.data
+        new_total = (current.get("total_trades") or 0) + 1
+        new_wins = (current.get("win_trades") or 0) + (1 if req.is_win else 0)
+        new_profit = (current.get("total_profit_pct") or 0) + req.profit_pct
+
+        db.table("saved_patterns").update({
+            "total_trades": new_total,
+            "win_trades": new_wins,
+            "total_profit_pct": round(new_profit, 2),
+            "updated_at": "now()",
+        }).eq("id", pattern_id).execute()
+
+        logger.info(f"패턴 {pattern_id} 성과 기록: profit={req.profit_pct}%, win={req.is_win}")
+        return {"success": True, "message": "성과가 기록되었습니다"}
+    except Exception as e:
+        logger.error(f"패턴 성과 기록 실패: {e}")
+        return {"success": False, "message": str(e)}
