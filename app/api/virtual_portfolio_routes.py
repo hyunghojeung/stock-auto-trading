@@ -638,10 +638,12 @@ async def update_prices(portfolio_id: int):
         all_positions = all_pos_resp.data or []
         capital = portfolio["capital"]
         pf_total_value = 0
+        total_invested = 0  # ★ v9: 총 투자금 추적
         pf_win = 0
         pf_loss = 0
 
         for p in all_positions:
+            total_invested += p.get("invest_amount", 0)
             if p["status"] == "holding":
                 pf_total_value += p["quantity"] * p["current_price"]
             else:
@@ -653,6 +655,10 @@ async def update_prices(portfolio_id: int):
                     pf_win += 1
                 elif pw < 0:
                     pf_loss += 1
+
+        # ★ v9: 미투자 현금 = 원금 - 총 투자금 (수수료 포함)
+        uninvested_cash = max(0, capital - total_invested)
+        pf_total_value += uninvested_cash
 
         pf_return_won = round(pf_total_value - capital)
         pf_return_pct = round((pf_return_won / capital) * 100, 2) if capital > 0 else 0
@@ -864,8 +870,10 @@ def _sync_update_prices(portfolio_id: int):
     all_pos = db.table("virtual_positions").select("*").eq("portfolio_id", portfolio_id).execute().data or []
     capital = portfolio["capital"]
     total_value = 0
+    total_invested = 0  # ★ v9: 총 투자금 추적
     w, l = 0, 0
     for p in all_pos:
+        total_invested += p.get("invest_amount", 0)
         if p["status"] == "holding":
             total_value += p["quantity"] * p["current_price"]
         else:
@@ -874,6 +882,10 @@ def _sync_update_prices(portfolio_id: int):
                 w += 1
             elif (p["profit_won"] or 0) < 0:
                 l += 1
+
+    # ★ v9: 미투자 현금 포함
+    uninvested_cash = max(0, capital - total_invested)
+    total_value += uninvested_cash
 
     holding_count = sum(1 for p in all_pos if p["status"] == "holding")
     closed_in_this = sum(1 for p in all_pos if p["status"] != "holding")
