@@ -1,5 +1,14 @@
-"""한국 공휴일/휴장일 판별 / Korean Market Holiday Checker"""
-from datetime import date, datetime, timedelta
+"""한국 공휴일/휴장일 판별 / Korean Market Holiday Checker
+★ v9: 모든 시간은 KST(UTC+9) 기준
+"""
+from datetime import date, datetime, timedelta, timezone
+
+# ★ v9: 한국 표준시 (KST = UTC+9)
+KST = timezone(timedelta(hours=9))
+
+def now_kst():
+    """현재 한국 시간 반환 / Returns current Korean Standard Time"""
+    return datetime.now(KST)
 
 # 공휴일 DB: {날짜: 공휴일명} / Holiday DB: {date: holiday_name}
 HOLIDAYS = {
@@ -43,7 +52,7 @@ def get_holiday_name(d):
 
 def get_market_status(now=None):
     """시장 상태 문자열 반환 / Returns market status string"""
-    if now is None: now = datetime.now()
+    if now is None: now = now_kst()
     d = now.date()
     
     if d.weekday() >= 5:
@@ -60,7 +69,7 @@ def get_market_status(now=None):
 
 def is_market_open_now(now=None):
     """현재 매매 가능 여부 종합 판단 / Check if trading is allowed right now"""
-    if now is None: now = datetime.now()
+    if now is None: now = now_kst()
     if not is_market_open_day(now.date()):
         return False
     t = now.strftime("%H:%M")
