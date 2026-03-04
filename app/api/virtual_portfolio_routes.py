@@ -298,9 +298,9 @@ async def get_portfolio_detail(portfolio_id: int):
 
 @router.post("/update-prices/{portfolio_id}")
 async def update_prices(portfolio_id: int):
-    """네이버에서 최신 가격 가져와 포지션 업데이트 + 자동 청산 체크"""
-    from app.services.naver_stock import get_daily_candles_naver
-
+    """네이버에서 최신 가격 가져와 포지션 업데이트 + 자동 청산 체크
+    ★ v8: 장중이면 실시간 체결가 우선 사용 (일봉 종가와의 괴리 방지)
+    """
     try:
         pf_resp = db.table("virtual_portfolios") \
             .select("*") \
@@ -324,20 +324,38 @@ async def update_prices(portfolio_id: int):
         if not positions:
             return {"message": "보유 중인 종목이 없습니다", "updated": 0}
 
+        # ★ v8: 장중 여부 확인
+        market_open = is_market_open_now()
+
         # ★ 네이버 API 병렬 호출 — 모든 종목의 가격을 한번에 조회
         codes = [pos["code"] for pos in positions]
 
-        async def _fetch_one(code):
+        # ── 일봉 데이터 (price_history용, 항상 필요) ──
+        async def _fetch_candles(code):
             try:
                 return await asyncio.to_thread(get_daily_candles_naver, code, 3)
             except Exception:
                 return None
 
-        candles_results = await asyncio.gather(*[_fetch_one(c) for c in codes])
+        candles_results = await asyncio.gather(*[_fetch_candles(c) for c in codes])
         candles_map = {}
         for code, candles in zip(codes, candles_results):
             if candles:
                 candles_map[code] = candles
+
+        # ── ★ v8: 장중이면 실시간 체결가도 조회 ──
+        realtime_map = {}
+        if market_open:
+            async def _fetch_rt(code):
+                try:
+                    return await asyncio.to_thread(get_realtime_price_naver, code)
+                except Exception:
+                    return None
+
+            rt_results = await asyncio.gather(*[_fetch_rt(c) for c in codes])
+            for code, rt in zip(codes, rt_results):
+                if rt and rt.get("price", 0) > 0:
+                    realtime_map[code] = rt
 
         now = datetime.now().isoformat()
         today = now[:10]
@@ -352,13 +370,20 @@ async def update_prices(portfolio_id: int):
             code = pos["code"]
             try:
                 candles = candles_map.get(code)
-                if not candles:
-                    continue
 
-                latest = candles[-1]
-                current_price = latest.get("close", 0)
-                high_price = latest.get("high", current_price)
-                low_price = latest.get("low", current_price)
+                # ★ v8: 실시간 체결가 우선, 없으면 일봉 종가 폴백
+                rt = realtime_map.get(code)
+                if rt and rt.get("price", 0) > 0:
+                    current_price = rt["price"]
+                    high_price = rt.get("high", current_price)
+                    low_price = rt.get("low", current_price)
+                elif candles:
+                    latest = candles[-1]
+                    current_price = latest.get("close", 0)
+                    high_price = latest.get("high", current_price)
+                    low_price = latest.get("low", current_price)
+                else:
+                    continue
 
                 if current_price <= 0:
                     continue
