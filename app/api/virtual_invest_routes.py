@@ -18,6 +18,7 @@
 from fastapi import APIRouter, BackgroundTasks
 from pydantic import BaseModel
 from typing import List, Dict, Optional
+from datetime import datetime, timedelta, timezone
 import logging
 
 from app.services.virtual_invest import (
@@ -28,9 +29,14 @@ from app.services.virtual_invest import (
     STRATEGY_PRESETS,
     DEFAULT_CAPITAL,
 )
+from app.utils.kr_holiday import is_market_open_now, KST
+from app.services.naver_stock import get_daily_candles_naver, get_realtime_price_naver
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/virtual-invest", tags=["virtual-invest"])
+
+# 수수료율 (매수 0.015% + 매도 0.015% + 세금 0.18% ≈ 0.21%)
+COMMISSION_RATE = 0.0021
 
 # Supabase 연결 — app.core.database 사용 (다른 라우트와 동일)
 try:
@@ -234,10 +240,12 @@ async def realtime_start(req: RealtimeStartRequest):
     """
     실시간 모의투자 시작 → virtual_portfolios + virtual_positions(FK) 생성
     Start realtime virtual trading → create portfolio & positions in DB
-    ※ 레거시 start_realtime() 미사용 — FK 기반 테이블 직접 INSERT
+
+    ★ v9: KST 시간 + 실시간 매수가 조회
+    - 장중: 네이버 실시간 체결가로 매수
+    - 장외: 네이버 일봉 직전 종가로 매수
     """
-    from datetime import datetime
-    import uuid
+    import asyncio
 
     stocks_list = [s.dict() for s in req.stocks]
 
@@ -248,30 +256,78 @@ async def realtime_start(req: RealtimeStartRequest):
     try:
         per_stock = req.capital / max(len(stocks_list), 1)
 
+        # ★ v9: KST 시간 사용
+        now_kst = datetime.now(KST)
+        now_str = now_kst.strftime("%Y-%m-%dT%H:%M:%S")
+        market_open = is_market_open_now()
+
+        logger.info(f"[가상투자] 등록 시작 — KST={now_kst.strftime('%H:%M:%S')}, 장중={market_open}, 종목수={len(stocks_list)}")
+
         # ── 1) virtual_portfolios INSERT ──
         pf_data = {
-            "name": req.title or datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "name": req.title or now_kst.strftime("%Y-%m-%d"),
             "capital": req.capital,
             "strategy": req.preset,
             "status": "active",
             "stock_count": len(stocks_list),
             "current_value": req.capital,
+            "created_at": now_str,
+            "updated_at": now_str,
         }
         pf_res = supabase.table("virtual_portfolios").insert(pf_data).execute()
         if pf_res.data and len(pf_res.data) > 0:
             portfolio_id = pf_res.data[0]["id"]
             logger.info(f"[가상투자] 포트폴리오 생성: id={portfolio_id}, name={pf_data['name']}")
 
-            # ── 2) virtual_positions INSERT (FK 버전) ──
+            # ── 2) 실시간 매수가 조회 + virtual_positions INSERT ──
             positions = []
             for s in stocks_list:
-                buy_price = s.get("buy_price", 0)
-                qty = int(per_stock / buy_price) if buy_price > 0 else 0
+                code = s.get("code", "")
+
+                # ★ v9: 실시간 매수가 결정 — 프론트 buy_price 대신 네이버 조회
+                buy_price = 0
+                try:
+                    if market_open:
+                        rt = get_realtime_price_naver(code)
+                        if rt and rt.get("price", 0) > 0:
+                            buy_price = rt["price"]
+                            logger.info(f"[{code}] 실시간 체결가: {buy_price}원")
+
+                    # 실시간 실패 or 장외 → 일봉 직전 종가
+                    if buy_price <= 0:
+                        candles = get_daily_candles_naver(code, count=3)
+                        if candles and len(candles) > 0:
+                            buy_price = candles[-1].get("close", 0) or candles[-1].get("open", 0)
+                            logger.info(f"[{code}] 일봉 종가: {buy_price}원")
+
+                    # 최후 수단: 프론트 전달 가격
+                    if buy_price <= 0:
+                        buy_price = s.get("buy_price", 0) or s.get("current_price", 0)
+                        logger.warning(f"[{code}] 네이버 조회 실패 → 프론트 가격 사용: {buy_price}원")
+
+                except Exception as e:
+                    buy_price = s.get("buy_price", 0) or s.get("current_price", 0)
+                    logger.warning(f"[{code}] 가격 조회 예외: {e} → 프론트 가격: {buy_price}원")
+
+                if buy_price <= 0:
+                    logger.warning(f"[{code}] 매수가 0원 → 종목 제외")
+                    continue
+
+                logger.info(f"[{code}] ★ 최종 매수가: {buy_price}원")
+
+                # 수수료 차감 후 수량 계산
+                commission = per_stock * COMMISSION_RATE
+                actual_invest = per_stock - commission
+                qty = int(actual_invest / buy_price)
                 invest = qty * buy_price
+
+                if qty <= 0:
+                    logger.warning(f"[{code}] 수량 0 → 종목 제외 (매수가={buy_price}, 배정금={per_stock})")
+                    continue
 
                 pos_data = {
                     "portfolio_id": portfolio_id,
-                    "code": s.get("code", ""),
+                    "code": code,
                     "name": s.get("name", ""),
                     "buy_price": buy_price,
                     "current_price": buy_price,
@@ -281,9 +337,9 @@ async def realtime_start(req: RealtimeStartRequest):
                     "peak_price": buy_price,
                     "similarity": s.get("similarity", 0),
                     "signal": s.get("signal", ""),
+                    "buy_date": now_str,
                 }
                 # ★ 패턴 라이브러리 연동
-                logger.info(f"[가상투자] 종목 {s.get('name')} pattern_id={s.get('pattern_id')}, pattern_name={s.get('pattern_name')}")
                 if s.get("pattern_id"):
                     pos_data["pattern_id"] = s["pattern_id"]
                 if s.get("pattern_name"):
@@ -294,11 +350,18 @@ async def realtime_start(req: RealtimeStartRequest):
                 supabase.table("virtual_positions").insert(positions).execute()
                 logger.info(f"[가상투자] {len(positions)}개 포지션 생성 완료")
 
+                # 실제 투자금 업데이트
+                total_invest = sum(p["invest_amount"] for p in positions)
+                supabase.table("virtual_portfolios").update({
+                    "current_value": req.capital,
+                    "stock_count": len(positions),
+                }).eq("id", portfolio_id).execute()
+
             return {
                 "session_id": str(portfolio_id),
                 "portfolio_id": portfolio_id,
                 "status": "active",
-                "message": f"{len(stocks_list)}종목 가상투자 등록 완료",
+                "message": f"{len(positions)}종목 가상투자 등록 완료 (실시간 매수가 적용)",
             }
         else:
             return {"error": "포트폴리오 생성 실패", "session_id": None}
