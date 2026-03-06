@@ -67,6 +67,56 @@ def get_minute_candles(code, count=30, is_live=False):
     return []
 
 
+def get_account_balance(is_live=False):
+    """계좌 잔고 조회"""
+    auth = get_kis(is_live)
+    h = auth.get_headers()
+    h["tr_id"] = "TTTC8434R" if is_live else "VTTC8434R"
+    from app.core.config import config
+    p = {
+        "CANO": config.KIS_CANO,
+        "ACNT_PRDT_CD": config.KIS_ACNT_PRDT_CD,
+        "AFHR_FLPR_YN": "N",
+        "OFL_YN": "",
+        "INQR_DVSN": "02",
+        "UNPR_DVSN": "01",
+        "FUND_STTL_ICLD_YN": "N",
+        "FNCG_AMT_AUTO_RDPT_YN": "N",
+        "PRCS_DVSN": "01",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+    try:
+        r = requests.get(f"{auth.base_url}/uapi/domestic-stock/v1/trading/inquire-balance", headers=h, params=p, timeout=10)
+        d = r.json()
+        if d.get("rt_cd") == "0":
+            holdings = []
+            for item in d.get("output1", []):
+                if int(item.get("hldg_qty", 0)) > 0:
+                    holdings.append({
+                        "code": item.get("pdno", ""),
+                        "name": item.get("prdt_name", ""),
+                        "quantity": int(item.get("hldg_qty", 0)),
+                        "buy_price": float(item.get("pchs_avg_pric", 0)),
+                        "current_price": int(item.get("prpr", 0)),
+                        "profit_pct": float(item.get("evlu_pfls_rt", 0)),
+                        "profit_won": int(item.get("evlu_pfls_amt", 0)),
+                        "eval_amount": int(item.get("evlu_amt", 0)),
+                    })
+            output2 = d.get("output2", [{}])
+            summary = output2[0] if isinstance(output2, list) and output2 else output2
+            return {
+                "holdings": holdings,
+                "total_eval": int(summary.get("tot_evlu_amt", 0)),
+                "total_profit": int(summary.get("evlu_pfls_smtl_amt", 0)),
+                "total_deposit": int(summary.get("dnca_tot_amt", 0)),
+                "total_buy_amount": int(summary.get("pchs_amt_smtl_amt", 0)),
+            }
+    except Exception as e:
+        print(f"[계좌잔고 오류] {e}")
+    return None
+
+
 def get_orderbook(code, is_live=False):
     auth = get_kis(is_live)
     h = auth.get_headers()
