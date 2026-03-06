@@ -292,6 +292,52 @@ async def get_today_orders(is_live: bool = False):
 # 수동 매수/매도 주문
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# KIS 시세 조회 API (프론트 대시보드용)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/price/{code}")
+async def get_stock_price(code: str, is_live: bool = False):
+    """종목 현재가 시세 조회 (KIS API)"""
+    from app.services.kis_stock import get_current_price
+    result = get_current_price(code, is_live=is_live)
+    if not result:
+        raise HTTPException(404, f"시세 조회 실패: {code}")
+    return result
+
+@router.get("/orderbook/{code}")
+async def get_stock_orderbook(code: str, is_live: bool = False):
+    """종목 호가창 조회 (KIS API)"""
+    from app.services.kis_stock import get_orderbook
+    result = get_orderbook(code, is_live=is_live)
+    if not result:
+        raise HTTPException(404, f"호가 조회 실패: {code}")
+    return result
+
+@router.get("/candles/{code}")
+async def get_stock_candles(code: str, period: int = 30, period_code: str = "D", is_live: bool = False):
+    """종목 기간별 시세 조회 (D:일봉, W:주봉, M:월봉)"""
+    from app.services.kis_stock import get_period_candles
+    from datetime import datetime
+    from app.core.config import KST
+    end_date = datetime.now(KST).strftime("%Y%m%d")
+    days = {"D": period * 2, "W": period * 10, "M": period * 35, "Y": period * 400}
+    start_date = (datetime.now(KST) - timedelta(days=days.get(period_code, period * 2))).strftime("%Y%m%d")
+    result = get_period_candles(code, start_date, end_date, period_code, is_live=is_live)
+    return result
+
+@router.get("/minutes/{code}")
+async def get_stock_minutes(code: str, count: int = 30, is_live: bool = False):
+    """종목 분봉 조회 (실전계좌 전용, 모의투자는 현재가 대체)"""
+    from app.services.kis_stock import get_minute_candles
+    result = get_minute_candles(code, count=count, is_live=is_live)
+    return {"code": code, "count": len(result), "candles": result, "is_live": is_live}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 수동 매수/매도 주문
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 @router.post("/order/buy")
 async def manual_buy(req: OrderRequest):
     """수동 매수 주문"""
