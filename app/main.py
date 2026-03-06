@@ -16,6 +16,7 @@ from app.api.virtual_invest_routes import router as virtual_invest_router
 from app.api.virtual_portfolio_routes import router as virtual_portfolio_router
 from app.api.pattern_lib_routes import router as pattern_lib_router  # ★ v3: 패턴 라이브러리
 from app.api.backup_routes import router as backup_router  # ★ v9: DB 백업
+from app.api.kis_routes import router as kis_router  # ★ KIS 증권 계좌/연결 관리
 
 
 # ★ 패턴 벡터 수집기
@@ -92,6 +93,7 @@ app.include_router(virtual_invest_router)
 app.include_router(virtual_portfolio_router)
 app.include_router(pattern_lib_router)  # ★ v3: 패턴 라이브러리
 app.include_router(backup_router)  # ★ v9: DB 백업
+app.include_router(kis_router)  # ★ KIS 증권 계좌/연결 관리
 @app.get("/")
 async def root():
     now = datetime.now(KST)
