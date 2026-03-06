@@ -64,6 +64,44 @@ async def get_kis_config():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 토큰 관리
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.post("/token/revoke")
+async def revoke_token(is_live: bool = False, password: str = ""):
+    """접근토큰 폐기 — 토큰을 더 이상 사용하지 않을 때"""
+    if password != config.SITE_PASSWORD:
+        raise HTTPException(403, "비밀번호가 틀렸습니다")
+    auth = get_kis(is_live)
+    result = auth.revoke_token()
+    return {"mode": "실전" if is_live else "모의", **result}
+
+@router.get("/token/info")
+async def get_token_info(is_live: bool = False):
+    """현재 토큰 상태 확인 (발급 여부, 만료 시간)"""
+    auth = get_kis(is_live)
+    mode = "실전" if is_live else "모의"
+    return {
+        "mode": mode,
+        "has_token": bool(auth.access_token),
+        "expires_at": auth.token_expired_at.isoformat() if auth.token_expired_at else None,
+        "has_ws_key": bool(auth.websocket_approval_key),
+    }
+
+@router.post("/websocket/key")
+async def get_websocket_key(is_live: bool = False):
+    """실시간 웹소켓 접속키 발급"""
+    auth = get_kis(is_live)
+    key = auth.get_websocket_approval_key()
+    if not key:
+        raise HTTPException(500, "웹소켓 접속키 발급 실패")
+    return {
+        "mode": "실전" if is_live else "모의",
+        "approval_key": key,
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # KIS 연결 테스트
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
