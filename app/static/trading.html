@@ -210,6 +210,32 @@ input:focus,select:focus{outline:none;border-color:#3b82f6}
     </div>
   </div>
 
+  <!-- 설정 패널 -->
+  <div class="card" style="margin-bottom:20px">
+    <h2>실전투자 API 설정
+      <span style="display:flex;gap:6px;align-items:center">
+        <span class="badge badge-off" id="liveKeyBadge" style="font-size:11px">미설정</span>
+        <button class="btn btn-refresh" onclick="checkLiveKeys()">상태확인</button>
+      </span>
+    </h2>
+    <p style="font-size:12px;color:#64748b;margin-bottom:12px">실전투자 키를 입력하면 서버 재시작 없이 즉시 적용됩니다. (서버 환경변수에도 저장하려면 .env 파일을 직접 수정하세요)</p>
+    <div class="grid">
+      <div>
+        <div class="form-row"><label>App Key</label><input id="liveAppKey" placeholder="실전 App Key" type="password"></div>
+        <div class="form-row"><label>App Secret</label><input id="liveAppSecret" placeholder="실전 App Secret" type="password"></div>
+      </div>
+      <div>
+        <div class="form-row"><label>계좌번호</label><input id="liveCano" placeholder="8자리 계좌번호" maxlength="8"></div>
+        <div class="form-row"><label>상품코드</label><input id="liveProdCd" placeholder="01" value="01" maxlength="2"></div>
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:8px">
+      <button class="btn btn-create" onclick="applyLiveKeys()">실전 키 적용</button>
+      <button class="btn btn-stop" onclick="revokeLiveToken()">실전 토큰 폐기</button>
+      <button class="btn" style="background:#374151;color:#e0e0e0" onclick="revokeToken(false)">모의 토큰 폐기</button>
+    </div>
+  </div>
+
   <!-- DB 매매기록 -->
   <div class="card">
     <h2>시스템 매매 기록 (DB) <button class="btn btn-refresh" onclick="loadTrades()">새로고침</button></h2>
@@ -609,9 +635,69 @@ async function lookupPrice() {
   }
 }
 
+// ── 실전 키 설정 ──
+async function checkLiveKeys() {
+  try {
+    const r = await fetch(`${API}/api/kis/config`);
+    const d = await r.json();
+    const badge = document.getElementById('liveKeyBadge');
+    if (d.live.app_key_set) {
+      badge.textContent = '설정됨';
+      badge.className = 'badge badge-ok';
+    } else {
+      badge.textContent = '미설정';
+      badge.className = 'badge badge-off';
+    }
+  } catch(e) {}
+}
+
+async function applyLiveKeys() {
+  const pw = promptPw(); if (!pw) return;
+  const appKey = document.getElementById('liveAppKey').value.trim();
+  const appSecret = document.getElementById('liveAppSecret').value.trim();
+  const cano = document.getElementById('liveCano').value.trim();
+  const prodCd = document.getElementById('liveProdCd').value.trim() || '01';
+
+  if (!appKey || !appSecret) { showToast('App Key와 App Secret을 입력하세요', 'error'); return; }
+
+  try {
+    const r = await fetch(`${API}/api/kis/config/live`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ app_key: appKey, app_secret: appSecret, cano, acnt_prdt_cd: prodCd, password: pw })
+    });
+    const d = await r.json();
+    if (r.ok) {
+      showToast('실전 키 적용 완료!', 'success');
+      checkLiveKeys();
+      checkKisStatus();
+    } else {
+      showToast(d.detail || '적용 실패', 'error');
+    }
+  } catch(e) { showToast('서버 오류', 'error'); }
+}
+
+async function revokeLiveToken() {
+  const pw = promptPw(); if (!pw) return;
+  try {
+    const r = await fetch(`${API}/api/kis/token/revoke?is_live=true&password=${encodeURIComponent(pw)}`, {method:'POST'});
+    const d = await r.json();
+    showToast(d.message || '토큰 폐기 완료', d.success ? 'success' : 'error');
+  } catch(e) { showToast('서버 오류', 'error'); }
+}
+
+async function revokeToken(isLive) {
+  const pw = promptPw(); if (!pw) return;
+  try {
+    const r = await fetch(`${API}/api/kis/token/revoke?is_live=${isLive}&password=${encodeURIComponent(pw)}`, {method:'POST'});
+    const d = await r.json();
+    showToast(d.message || '토큰 폐기 완료', d.success ? 'success' : 'error');
+  } catch(e) { showToast('서버 오류', 'error'); }
+}
+
 // ── 초기화 ──
 async function init() {
   checkKisStatus();
+  checkLiveKeys();
   loadStrategies();
   loadTrades();
 }

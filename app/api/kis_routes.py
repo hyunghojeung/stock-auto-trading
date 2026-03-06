@@ -41,6 +41,13 @@ class OrderRequest(BaseModel):
     is_live: bool = False   # False=모의, True=실전
     password: str = ""
 
+class LiveKeyRequest(BaseModel):
+    app_key: str
+    app_secret: str
+    cano: str = ""
+    acnt_prdt_cd: str = "01"
+    password: str = ""
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # KIS 설정 상태 확인
@@ -65,6 +72,36 @@ async def get_kis_config():
             "cano_masked": f"****{config.KIS_CANO[-4:]}" if len(config.KIS_CANO) >= 4 else "",
             "acnt_prdt_cd": config.KIS_ACNT_PRDT_CD,
         },
+    }
+
+
+@router.post("/config/live")
+async def set_live_config(req: LiveKeyRequest):
+    """실전투자 API 키 동적 설정 (서버 재시작 없이 즉시 적용)"""
+    if req.password != config.SITE_PASSWORD:
+        raise HTTPException(403, "비밀번호가 틀렸습니다")
+
+    from app.services.kis_auth import kis_live
+
+    # config 객체에 반영
+    config.KIS_LIVE_APP_KEY = req.app_key
+    config.KIS_LIVE_APP_SECRET = req.app_secret
+    if req.cano:
+        config.KIS_LIVE_CANO = req.cano
+    if req.acnt_prdt_cd:
+        config.KIS_ACNT_PRDT_CD = req.acnt_prdt_cd
+
+    # kis_live 인스턴스에도 반영 + 기존 토큰 초기화
+    kis_live.app_key = req.app_key
+    kis_live.app_secret = req.app_secret
+    kis_live.access_token = None
+    kis_live.token_expired_at = None
+    kis_live.websocket_approval_key = None
+
+    logger.info(f"[KIS] 실전 API 키 동적 설정 완료 (cano: {'****' + req.cano[-4:] if len(req.cano) >= 4 else '미설정'})")
+    return {
+        "success": True,
+        "message": "실전투자 키가 적용되었습니다. 토큰은 다음 API 호출 시 자동 발급됩니다.",
     }
 
 
