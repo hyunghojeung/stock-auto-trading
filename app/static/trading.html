@@ -139,6 +139,29 @@ input:focus,select:focus{outline:none;border-color:#3b82f6}
     </div>
   </div>
 
+  <!-- 실시간 시세 모니터 -->
+  <div class="card" style="margin-bottom:20px">
+    <h2>실시간 시세 모니터 (SSE)
+      <span style="display:flex;gap:6px;align-items:center">
+        <span class="badge badge-off" id="sseBadge" style="font-size:11px">미연결</span>
+        <button class="btn btn-refresh" onclick="stopSSE()">중지</button>
+      </span>
+    </h2>
+    <div class="form-row">
+      <label>종목코드</label>
+      <input id="watchCodes" placeholder="쉼표 구분, 예: 005930,000660,035720" style="flex:3">
+      <select id="watchMode" style="flex:1"><option value="false">모의</option><option value="true">실전</option></select>
+      <button class="btn btn-start btn-sm" onclick="startSSE()">시작</button>
+    </div>
+    <div style="max-height:200px;overflow-y:auto">
+      <table>
+        <thead><tr><th>종목</th><th class="num">현재가</th><th class="num">전일비</th><th class="num">등락률</th><th class="num">거래량</th><th class="num">고가</th><th class="num">저가</th></tr></thead>
+        <tbody id="sseTable"><tr><td colspan="7" class="gray">종목코드 입력 후 시작 클릭</td></tr></tbody>
+      </table>
+    </div>
+    <div style="font-size:11px;color:#64748b;margin-top:8px" id="sseTimestamp"></div>
+  </div>
+
   <!-- 수동 주문 + 체결내역 -->
   <div class="grid">
     <!-- 수동 주문 -->
@@ -154,7 +177,9 @@ input:focus,select:focus{outline:none;border-color:#3b82f6}
       <div class="form-row">
         <label>종목코드</label>
         <input id="orderCode" placeholder="예: 005930" maxlength="6">
+        <button class="btn btn-refresh" onclick="lookupPrice()" style="white-space:nowrap">시세조회</button>
       </div>
+      <div id="orderPriceInfo" style="margin:-6px 0 6px 80px;font-size:12px;color:#64748b"></div>
       <div class="form-row">
         <label>수량</label>
         <input id="orderQty" type="number" placeholder="수량" min="1">
@@ -508,6 +533,79 @@ async function loadTrades() {
     }).join('');
   } catch(e) {
     document.getElementById('tradeList').innerHTML = '<tr><td colspan="9" class="red">로딩 실패</td></tr>';
+  }
+}
+
+// ── 실시간 시세 SSE ──
+let sseSource = null;
+
+function startSSE() {
+  stopSSE();
+  const codes = document.getElementById('watchCodes').value.trim();
+  const isLive = document.getElementById('watchMode').value;
+  if (!codes) { showToast('종목코드를 입력하세요', 'error'); return; }
+
+  const url = `${API}/api/kis/sse/price?codes=${encodeURIComponent(codes)}&is_live=${isLive}&interval=3`;
+  sseSource = new EventSource(url);
+
+  sseSource.addEventListener('connected', (e) => {
+    const badge = document.getElementById('sseBadge');
+    badge.textContent = '연결됨';
+    badge.className = 'badge badge-ok';
+    showToast('실시간 시세 연결', 'success');
+  });
+
+  sseSource.addEventListener('price', (e) => {
+    const d = JSON.parse(e.data);
+    document.getElementById('sseTimestamp').textContent = `마지막 갱신: ${d.timestamp}`;
+    const tbody = document.getElementById('sseTable');
+    if (!d.prices.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="gray">시세 없음</td></tr>';
+      return;
+    }
+    tbody.innerHTML = d.prices.map(p => {
+      const sign = p.change > 0 ? '+' : '';
+      const cls = p.change > 0 ? 'red' : p.change < 0 ? 'green' : 'gray';
+      return `<tr>
+        <td>${p.name || p.code}<br><span class="gray">${p.code}</span></td>
+        <td class="num" style="font-weight:700">${fmt(p.price)}</td>
+        <td class="num ${cls}">${sign}${fmt(p.change)}</td>
+        <td class="num ${cls}">${sign}${p.change_pct}%</td>
+        <td class="num">${fmt(p.volume)}</td>
+        <td class="num red">${fmt(p.high)}</td>
+        <td class="num green">${fmt(p.low)}</td>
+      </tr>`;
+    }).join('');
+  });
+
+  sseSource.onerror = () => {
+    const badge = document.getElementById('sseBadge');
+    badge.textContent = '연결 끊김';
+    badge.className = 'badge badge-err';
+  };
+}
+
+function stopSSE() {
+  if (sseSource) { sseSource.close(); sseSource = null; }
+  document.getElementById('sseBadge').textContent = '미연결';
+  document.getElementById('sseBadge').className = 'badge badge-off';
+}
+
+// ── 종목 시세 조회 (주문 시) ──
+async function lookupPrice() {
+  const code = document.getElementById('orderCode').value.trim();
+  if (code.length !== 6) { showToast('종목코드 6자리 입력', 'error'); return; }
+  const isLive = document.getElementById('orderMode').value;
+  try {
+    const r = await fetch(`${API}/api/kis/price/${code}?is_live=${isLive}`);
+    if (!r.ok) { document.getElementById('orderPriceInfo').textContent = '시세 조회 실패'; return; }
+    const d = await r.json();
+    const sign = d.change > 0 ? '+' : '';
+    const cls = d.change > 0 ? 'color:#ef4444' : d.change < 0 ? 'color:#3b82f6' : '';
+    document.getElementById('orderPriceInfo').innerHTML =
+      `<b>${d.name}</b> | 현재가: <b style="${cls}">${fmt(d.price)}</b> (${sign}${d.change_pct}%) | 거래량: ${fmt(d.volume)} | PER: ${d.per} | PBR: ${d.pbr}`;
+  } catch(e) {
+    document.getElementById('orderPriceInfo').textContent = '서버 오류';
   }
 }
 

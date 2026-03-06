@@ -11,11 +11,16 @@ GET  /api/kis/config         — 현재 KIS 설정 상태 (Key 유무)
 """
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
+from datetime import timedelta
+import asyncio
 import requests
 import logging
 import traceback
+import json
+import time
 
 from app.core.config import config
 from app.services.kis_auth import get_kis
@@ -427,3 +432,128 @@ async def manual_sell(req: OrderRequest):
         "order_type": order_type,
         **result,
     }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SSE 실시간 시세 스트리밍 (MCP 스타일)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/sse/price")
+async def sse_price_stream(codes: str, is_live: bool = False, interval: int = 3):
+    """실시간 시세 SSE 스트림 (MCP 호환 형식)
+
+    codes: 쉼표로 구분된 종목코드 (예: 005930,000660,035720)
+    interval: 갱신 주기 초 (기본 3초, 최소 2초)
+    """
+    code_list = [c.strip() for c in codes.split(",") if c.strip()]
+    if not code_list:
+        raise HTTPException(400, "종목코드를 입력하세요")
+    if len(code_list) > 10:
+        raise HTTPException(400, "최대 10종목까지 가능합니다")
+    interval = max(2, min(interval, 30))
+
+    async def event_generator():
+        from app.services.kis_stock import get_current_price
+        yield f"event: connected\ndata: {json.dumps({'codes': code_list, 'interval': interval})}\n\n"
+
+        while True:
+            prices = []
+            for code in code_list:
+                try:
+                    p = get_current_price(code, is_live=is_live)
+                    if p:
+                        prices.append(p)
+                except Exception:
+                    pass
+
+            payload = {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "prices": prices,
+            }
+            yield f"event: price\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            await asyncio.sleep(interval)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/sse/portfolio")
+async def sse_portfolio_stream(is_live: bool = False, interval: int = 10):
+    """계좌 잔고 SSE 실시간 스트림 — 포트폴리오 자동 갱신"""
+    interval = max(5, min(interval, 60))
+
+    async def event_generator():
+        yield f"event: connected\ndata: {json.dumps({'mode': '실전' if is_live else '모의', 'interval': interval})}\n\n"
+
+        while True:
+            try:
+                auth = get_kis(is_live)
+                headers = auth.get_headers()
+                tr_id = "TTTC8434R" if is_live else "VTTC8434R"
+                headers["tr_id"] = tr_id
+
+                params = {
+                    "CANO": config.KIS_LIVE_CANO if is_live else config.KIS_CANO,
+                    "ACNT_PRDT_CD": config.KIS_ACNT_PRDT_CD,
+                    "AFHR_FLPR_YN": "N",
+                    "OFL_YN": "",
+                    "INQR_DVSN": "02",
+                    "UNPR_DVSN": "01",
+                    "FUND_STTL_ICLD_YN": "N",
+                    "FNCG_AMT_AUTO_RDPT_YN": "N",
+                    "PRCS_DVSN": "01",
+                    "CTX_AREA_FK100": "",
+                    "CTX_AREA_NK100": "",
+                }
+
+                resp = requests.get(
+                    f"{auth.base_url}/uapi/domestic-stock/v1/trading/inquire-balance",
+                    headers=headers, params=params, timeout=10
+                )
+                data = resp.json()
+
+                if data.get("rt_cd") == "0":
+                    holdings = []
+                    for item in data.get("output1", []):
+                        qty = int(item.get("hldg_qty", 0))
+                        if qty <= 0:
+                            continue
+                        holdings.append({
+                            "code": item.get("pdno", ""),
+                            "name": item.get("prdt_name", ""),
+                            "quantity": qty,
+                            "avg_price": float(item.get("pchs_avg_pric", 0)),
+                            "current_price": int(item.get("prpr", 0)),
+                            "profit_amt": int(item.get("evlu_pfls_amt", 0)),
+                            "profit_pct": float(item.get("evlu_pfls_rt", 0)),
+                        })
+
+                    output2 = data.get("output2", [{}])
+                    summary_data = output2[0] if isinstance(output2, list) and output2 else output2
+                    summary = {
+                        "total_eval": int(summary_data.get("tot_evlu_amt", 0)),
+                        "deposit": int(summary_data.get("dnca_tot_amt", 0)),
+                        "total_profit": int(summary_data.get("evlu_pfls_smtl_amt", 0)),
+                        "total_purchase": int(summary_data.get("pchs_amt_smtl_amt", 0)),
+                    }
+                    total_purchase = summary["total_purchase"]
+                    summary["total_profit_pct"] = round(
+                        summary["total_profit"] / total_purchase * 100, 2
+                    ) if total_purchase > 0 else 0
+
+                    payload = {
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "summary": summary,
+                        "holdings": holdings,
+                    }
+                    yield f"event: portfolio\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                else:
+                    yield f"event: error\ndata: {json.dumps({'error': data.get('msg1', '조회 실패')})}\n\n"
+
+            except Exception as e:
+                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+            await asyncio.sleep(interval)
