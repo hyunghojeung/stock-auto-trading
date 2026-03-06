@@ -1,8 +1,11 @@
 """FastAPI 메인 앱"""
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic
 from contextlib import asynccontextmanager
+import os
 from app.core.config import config, KST
 from app.core.scheduler import setup_scheduler
 from app.api import stock_routes, trade_routes, portfolio_routes, watchlist_routes, strategy_routes, kakao_routes
@@ -94,6 +97,17 @@ app.include_router(virtual_portfolio_router)
 app.include_router(pattern_lib_router)  # ★ v3: 패턴 라이브러리
 app.include_router(backup_router)  # ★ v9: DB 백업
 app.include_router(kis_router)  # ★ KIS 증권 계좌/연결 관리
+
+# ★ 정적 파일 서빙 (매매 대시보드 HTML)
+_static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(_static_dir):
+    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+@app.get("/trading")
+async def trading_page():
+    """실전/모의 매매 대시보드 페이지"""
+    return FileResponse(os.path.join(_static_dir, "trading.html"))
+
 @app.get("/")
 async def root():
     now = datetime.now(KST)

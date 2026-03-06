@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>실전/모의 매매 대시보드</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e17;color:#e0e0e0;font-family:'Segoe UI',sans-serif;min-height:100vh}
+.header{background:#111827;padding:16px 24px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1e293b}
+.header h1{font-size:20px;color:#fff}
+.header .status{display:flex;gap:12px;align-items:center}
+.badge{padding:4px 12px;border-radius:12px;font-size:12px;font-weight:600}
+.badge-live{background:#dc2626;color:#fff}
+.badge-paper{background:#2563eb;color:#fff}
+.badge-off{background:#374151;color:#9ca3af}
+.badge-ok{background:#059669;color:#fff}
+.badge-err{background:#dc2626;color:#fff}
+.container{max-width:1400px;margin:0 auto;padding:20px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px}
+.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;margin-bottom:20px}
+.card{background:#111827;border:1px solid #1e293b;border-radius:12px;padding:20px}
+.card h2{font-size:16px;color:#94a3b8;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center}
+.card h2 .sub{font-size:12px;color:#64748b}
+.btn{padding:8px 16px;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;transition:all .2s}
+.btn:hover{opacity:0.85;transform:translateY(-1px)}
+.btn-start{background:#059669;color:#fff}
+.btn-stop{background:#dc2626;color:#fff}
+.btn-create{background:#2563eb;color:#fff}
+.btn-delete{background:#7f1d1d;color:#fca5a5;font-size:11px;padding:4px 10px}
+.btn-toggle{background:#7c3aed;color:#fff}
+.btn-sm{padding:5px 10px;font-size:12px}
+.btn-buy{background:#dc2626;color:#fff}
+.btn-sell{background:#2563eb;color:#fff}
+.btn-refresh{background:#374151;color:#e0e0e0;font-size:11px;padding:4px 10px}
+.btn:disabled{opacity:0.4;cursor:not-allowed;transform:none}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:8px;color:#64748b;border-bottom:1px solid #1e293b;font-weight:500}
+td{padding:8px;border-bottom:1px solid #1e293b}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.profit{color:#ef4444}.loss{color:#3b82f6}
+.green{color:#10b981}.red{color:#ef4444}.yellow{color:#eab308}.gray{color:#6b7280}
+input,select{background:#1e293b;border:1px solid #374151;color:#e0e0e0;padding:8px 12px;border-radius:6px;font-size:13px;width:100%}
+input:focus,select:focus{outline:none;border-color:#3b82f6}
+.form-row{display:flex;gap:10px;margin-bottom:10px;align-items:center}
+.form-row label{min-width:70px;font-size:13px;color:#94a3b8}
+.form-row input,.form-row select{flex:1}
+.strat-item{display:flex;justify-content:space-between;align-items:center;padding:12px;border:1px solid #1e293b;border-radius:8px;margin-bottom:8px;transition:background .2s}
+.strat-item:hover{background:#1e293b}
+.strat-info{flex:1}
+.strat-name{font-weight:600;font-size:14px}
+.strat-meta{font-size:12px;color:#64748b;margin-top:2px}
+.strat-actions{display:flex;gap:6px;align-items:center}
+.summary-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+.summary-card{background:#1e293b;border-radius:8px;padding:12px;text-align:center}
+.summary-card .label{font-size:11px;color:#64748b}
+.summary-card .value{font-size:18px;font-weight:700;margin-top:4px}
+.kis-status{display:flex;gap:16px;align-items:center;padding:12px;background:#1e293b;border-radius:8px;margin-bottom:12px}
+.kis-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.kis-dot.on{background:#10b981;box-shadow:0 0 6px #10b981}
+.kis-dot.off{background:#ef4444}
+.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:100;justify-content:center;align-items:center}
+.modal-overlay.show{display:flex}
+.modal{background:#111827;border:1px solid #1e293b;border-radius:12px;padding:24px;width:420px;max-width:90vw}
+.modal h3{margin-bottom:16px;font-size:16px}
+.modal .form-row{margin-bottom:12px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}
+.toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;font-size:13px;font-weight:600;z-index:200;transform:translateX(120%);transition:transform .3s ease}
+.toast.show{transform:translateX(0)}
+.toast-success{background:#059669;color:#fff}
+.toast-error{background:#dc2626;color:#fff}
+.toast-info{background:#2563eb;color:#fff}
+.tab-bar{display:flex;gap:4px;margin-bottom:16px;background:#1e293b;border-radius:8px;padding:4px}
+.tab{flex:1;padding:8px;text-align:center;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;color:#94a3b8;transition:all .2s}
+.tab.active{background:#2563eb;color:#fff}
+@media(max-width:768px){.grid,.grid-3{grid-template-columns:1fr}.summary-cards{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>실전/모의 매매 대시보드</h1>
+  <div class="status">
+    <span id="kisStatusBadge" class="badge badge-off">KIS 미연결</span>
+    <span id="marketBadge" class="badge badge-off">시장 확인중</span>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- KIS 연결 상태 -->
+  <div class="card" style="margin-bottom:20px">
+    <h2>KIS 증권 연결 상태 <button class="btn btn-refresh" onclick="checkKisStatus()">새로고침</button></h2>
+    <div class="grid">
+      <div class="kis-status" id="kisPaperStatus">
+        <div class="kis-dot off" id="kisPaperDot"></div>
+        <div>
+          <div style="font-weight:600;font-size:14px">모의투자</div>
+          <div style="font-size:12px;color:#64748b" id="kisPaperMsg">확인중...</div>
+        </div>
+      </div>
+      <div class="kis-status" id="kisLiveStatus">
+        <div class="kis-dot off" id="kisLiveDot"></div>
+        <div>
+          <div style="font-weight:600;font-size:14px">실전투자</div>
+          <div style="font-size:12px;color:#64748b" id="kisLiveMsg">확인중...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 전략 관리 + 계좌 잔고 -->
+  <div class="grid">
+    <!-- 전략 관리 -->
+    <div class="card">
+      <h2>매매 전략 관리 <button class="btn btn-create btn-sm" onclick="showCreateModal()">+ 전략 생성</button></h2>
+      <div id="strategyList"><div class="gray">로딩중...</div></div>
+    </div>
+
+    <!-- 계좌 잔고 -->
+    <div class="card">
+      <h2>KIS 계좌 잔고 <button class="btn btn-refresh" onclick="loadBalance()">새로고침</button></h2>
+      <div class="tab-bar">
+        <div class="tab active" onclick="switchBalanceTab(false,this)">모의투자</div>
+        <div class="tab" onclick="switchBalanceTab(true,this)">실전투자</div>
+      </div>
+      <div class="summary-cards" id="balanceSummary">
+        <div class="summary-card"><div class="label">총평가</div><div class="value" id="balTotal">-</div></div>
+        <div class="summary-card"><div class="label">예수금</div><div class="value" id="balDeposit">-</div></div>
+        <div class="summary-card"><div class="label">총손익</div><div class="value" id="balProfit">-</div></div>
+        <div class="summary-card"><div class="label">수익률</div><div class="value" id="balProfitPct">-</div></div>
+      </div>
+      <div style="max-height:250px;overflow-y:auto">
+        <table>
+          <thead><tr><th>종목</th><th class="num">현재가</th><th class="num">수량</th><th class="num">손익률</th></tr></thead>
+          <tbody id="balanceHoldings"><tr><td colspan="4" class="gray">조회 전</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 수동 주문 + 체결내역 -->
+  <div class="grid">
+    <!-- 수동 주문 -->
+    <div class="card">
+      <h2>수동 주문</h2>
+      <div class="form-row">
+        <label>모드</label>
+        <select id="orderMode">
+          <option value="false">모의투자</option>
+          <option value="true">실전투자</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>종목코드</label>
+        <input id="orderCode" placeholder="예: 005930" maxlength="6">
+      </div>
+      <div class="form-row">
+        <label>수량</label>
+        <input id="orderQty" type="number" placeholder="수량" min="1">
+      </div>
+      <div class="form-row">
+        <label>가격</label>
+        <input id="orderPrice" type="number" placeholder="0 = 시장가" min="0">
+      </div>
+      <div style="display:flex;gap:10px;margin-top:12px">
+        <button class="btn btn-buy" style="flex:1" onclick="manualOrder('buy')">매수 주문</button>
+        <button class="btn btn-sell" style="flex:1" onclick="manualOrder('sell')">매도 주문</button>
+      </div>
+    </div>
+
+    <!-- 체결내역 -->
+    <div class="card">
+      <h2>당일 체결내역 <button class="btn btn-refresh" onclick="loadOrders()">새로고침</button></h2>
+      <div class="tab-bar">
+        <div class="tab active" onclick="switchOrderTab(false,this)">모의투자</div>
+        <div class="tab" onclick="switchOrderTab(true,this)">실전투자</div>
+      </div>
+      <div style="max-height:320px;overflow-y:auto">
+        <table>
+          <thead><tr><th>시간</th><th>종목</th><th>구분</th><th class="num">체결가</th><th class="num">수량</th><th>상태</th></tr></thead>
+          <tbody id="orderList"><tr><td colspan="6" class="gray">조회 전</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- DB 매매기록 -->
+  <div class="card">
+    <h2>시스템 매매 기록 (DB) <button class="btn btn-refresh" onclick="loadTrades()">새로고침</button></h2>
+    <div style="max-height:300px;overflow-y:auto">
+      <table>
+        <thead><tr><th>시간</th><th>전략</th><th>종목</th><th>구분</th><th class="num">매수가</th><th class="num">매도가</th><th class="num">수량</th><th class="num">순수익</th><th>사유</th></tr></thead>
+        <tbody id="tradeList"><tr><td colspan="9" class="gray">로딩중...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 전략 생성 모달 -->
+<div class="modal-overlay" id="createModal">
+  <div class="modal">
+    <h3>새 전략 생성</h3>
+    <div class="form-row"><label>이름</label><input id="newName" placeholder="전략 이름"></div>
+    <div class="form-row"><label>모드</label>
+      <select id="newMode"><option value="false">모의투자</option><option value="true">실전투자</option></select>
+    </div>
+    <div class="form-row"><label>초기자금</label><input id="newCapital" type="number" value="1000000"></div>
+    <div class="form-row"><label>손절률(%)</label><input id="newStopLoss" type="number" value="-3" step="0.5"></div>
+    <div class="form-row"><label>ATR배수</label><input id="newAtr" type="number" value="2.0" step="0.5"></div>
+    <div class="form-row"><label>비밀번호</label><input id="newPw" type="password" placeholder="사이트 비밀번호"></div>
+    <div class="modal-actions">
+      <button class="btn" style="background:#374151;color:#e0e0e0" onclick="hideCreateModal()">취소</button>
+      <button class="btn btn-create" onclick="createStrategy()">생성</button>
+    </div>
+  </div>
+</div>
+
+<!-- 토스트 -->
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '';
+let currentBalanceLive = false;
+let currentOrderLive = false;
+let PW = '';
+
+function showToast(msg, type='info') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = `toast toast-${type} show`;
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+function fmt(n) {
+  if (n == null || isNaN(n)) return '-';
+  return Number(n).toLocaleString('ko-KR');
+}
+
+function promptPw() {
+  if (PW) return PW;
+  PW = prompt('비밀번호를 입력하세요') || '';
+  return PW;
+}
+
+// ── KIS 연결 상태 ──
+async function checkKisStatus() {
+  for (const live of [false, true]) {
+    const prefix = live ? 'kisLive' : 'kisPaper';
+    try {
+      const r = await fetch(`${API}/api/kis/status?is_live=${live}`);
+      const d = await r.json();
+      document.getElementById(prefix+'Dot').className = `kis-dot ${d.connected?'on':'off'}`;
+      document.getElementById(prefix+'Msg').textContent = d.connected
+        ? `연결됨 | 계좌: ${d.account}`
+        : (d.error || '연결 실패');
+    } catch(e) {
+      document.getElementById(prefix+'Dot').className = 'kis-dot off';
+      document.getElementById(prefix+'Msg').textContent = '서버 연결 실패';
+    }
+  }
+  // 전체 뱃지
+  try {
+    const r = await fetch(`${API}/api/kis/config`);
+    const d = await r.json();
+    const badge = document.getElementById('kisStatusBadge');
+    if (d.paper.app_key_set || d.live.app_key_set) {
+      badge.textContent = 'KIS 연결됨';
+      badge.className = 'badge badge-ok';
+    } else {
+      badge.textContent = 'KIS 미설정';
+      badge.className = 'badge badge-err';
+    }
+  } catch(e) {}
+  // 시장 상태
+  try {
+    const r = await fetch(`${API}/api/system/status`);
+    const d = await r.json();
+    const mb = document.getElementById('marketBadge');
+    mb.textContent = d.is_market_open ? '장중' : '장외';
+    mb.className = `badge ${d.is_market_open ? 'badge-ok' : 'badge-off'}`;
+  } catch(e) {}
+}
+
+// ── 전략 목록 ──
+async function loadStrategies() {
+  try {
+    const r = await fetch(`${API}/api/strategy/`);
+    const list = await r.json();
+    const el = document.getElementById('strategyList');
+    if (!list.length) { el.innerHTML = '<div class="gray">등록된 전략이 없습니다</div>'; return; }
+    el.innerHTML = list.map(s => `
+      <div class="strat-item">
+        <div class="strat-info">
+          <div class="strat-name">
+            ${s.name}
+            <span class="badge ${s.is_live?'badge-live':'badge-paper'}" style="font-size:11px">${s.is_live?'실전':'모의'}</span>
+            <span class="badge ${s.is_active?'badge-ok':'badge-off'}" style="font-size:11px">${s.is_active?'매매중':'중지'}</span>
+          </div>
+          <div class="strat-meta">자금 ${fmt(s.initial_capital)}원 | 손절 ${s.stop_loss_pct}% | ATR x${s.atr_multiplier}</div>
+        </div>
+        <div class="strat-actions">
+          ${s.is_active
+            ? `<button class="btn btn-stop btn-sm" onclick="stopStrategy(${s.id})">중지</button>`
+            : `<button class="btn btn-start btn-sm" onclick="startStrategy(${s.id})">시작</button>`}
+          <button class="btn btn-toggle btn-sm" onclick="toggleLive(${s.id})" ${s.is_active?'disabled':''}>${s.is_live?'모의전환':'실전전환'}</button>
+          <button class="btn btn-delete" onclick="deleteStrategy(${s.id})" ${s.is_active?'disabled':''}>삭제</button>
+        </div>
+      </div>
+    `).join('');
+  } catch(e) {
+    document.getElementById('strategyList').innerHTML = '<div class="red">로딩 실패</div>';
+  }
+}
+
+async function startStrategy(sid) {
+  const pw = promptPw(); if (!pw) return;
+  try {
+    const r = await fetch(`${API}/api/strategy/${sid}/start?password=${encodeURIComponent(pw)}`, {method:'POST'});
+    const d = await r.json();
+    if (r.ok) { showToast(d.message, 'success'); loadStrategies(); }
+    else { showToast(d.detail || '실패', 'error'); PW=''; }
+  } catch(e) { showToast('서버 오류', 'error'); }
+}
+
+async function stopStrategy(sid) {
+  const pw = promptPw(); if (!pw) return;
+  if (!confirm('매매를 중지하시겠습니까? (보유종목은 유지됩니다)')) return;
+  try {
+    const r = await fetch(`${API}/api/strategy/${sid}/stop?password=${encodeURIComponent(pw)}`, {method:'POST'});
+    const d = await r.json();
+    if (r.ok) { showToast(d.message, 'success'); loadStrategies(); }
+    else { showToast(d.detail || '실패', 'error'); PW=''; }
+  } catch(e) { showToast('서버 오류', 'error'); }
+}
+
+async function toggleLive(sid) {
+  const pw = promptPw(); if (!pw) return;
+  if (!confirm('매매 모드를 전환하시겠습니까?')) return;
+  try {
+    const r = await fetch(`${API}/api/strategy/${sid}/toggle-live?password=${encodeURIComponent(pw)}`, {method:'POST'});
+    const d = await r.json();
+    if (r.ok) { showToast(d.message, 'success'); loadStrategies(); }
+    else { showToast(d.detail || '실패', 'error'); PW=''; }
+  } catch(e) { showToast('서버 오류', 'error'); }
+}
+
+async function deleteStrategy(sid) {
+  const pw = promptPw(); if (!pw) return;
+  if (!confirm('정말 삭제하시겠습니까?')) return;
+  try {
+    const r = await fetch(`${API}/api/strategy/${sid}?password=${encodeURIComponent(pw)}`, {method:'DELETE'});
+    const d = await r.json();
+    if (r.ok) { showToast(d.message, 'success'); loadStrategies(); }
+    else { showToast(d.detail || '실패', 'error'); PW=''; }
+  } catch(e) { showToast('서버 오류', 'error'); }
+}
+
+// ── 전략 생성 ──
+function showCreateModal() { document.getElementById('createModal').classList.add('show'); }
+function hideCreateModal() { document.getElementById('createModal').classList.remove('show'); }
+
+async function createStrategy() {
+  const pw = document.getElementById('newPw').value;
+  if (!pw) { showToast('비밀번호를 입력하세요', 'error'); return; }
+  const body = {
+    name: document.getElementById('newName').value,
+    is_live: document.getElementById('newMode').value === 'true',
+    initial_capital: parseInt(document.getElementById('newCapital').value) || 1000000,
+    stop_loss_pct: parseFloat(document.getElementById('newStopLoss').value) || -3,
+    atr_multiplier: parseFloat(document.getElementById('newAtr').value) || 2,
+  };
+  if (!body.name) { showToast('전략 이름을 입력하세요', 'error'); return; }
+  try {
+    const r = await fetch(`${API}/api/strategy/?password=${encodeURIComponent(pw)}`, {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (r.ok) { showToast(`전략 '${d.name}' 생성 완료`, 'success'); PW=pw; hideCreateModal(); loadStrategies(); }
+    else { showToast(d.detail || '생성 실패', 'error'); }
+  } catch(e) { showToast('서버 오류', 'error'); }
+}
+
+// ── 계좌 잔고 ──
+function switchBalanceTab(isLive, el) {
+  currentBalanceLive = isLive;
+  el.parentElement.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  loadBalance();
+}
+
+async function loadBalance() {
+  try {
+    const r = await fetch(`${API}/api/kis/balance?is_live=${currentBalanceLive}`);
+    const d = await r.json();
+    if (!d.success) {
+      document.getElementById('balanceHoldings').innerHTML = `<tr><td colspan="4" class="red">${d.error||'조회 실패'}</td></tr>`;
+      return;
+    }
+    const s = d.summary;
+    document.getElementById('balTotal').textContent = fmt(s.total_eval);
+    document.getElementById('balDeposit').textContent = fmt(s.deposit);
+    document.getElementById('balProfit').textContent = fmt(s.total_profit);
+    document.getElementById('balProfit').className = `value ${s.total_profit>=0?'profit':'loss'}`;
+    document.getElementById('balProfitPct').textContent = `${s.total_profit_pct}%`;
+    document.getElementById('balProfitPct').className = `value ${s.total_profit_pct>=0?'profit':'loss'}`;
+
+    const tbody = document.getElementById('balanceHoldings');
+    if (!d.holdings.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="gray">보유종목 없음</td></tr>';
+    } else {
+      tbody.innerHTML = d.holdings.map(h => `
+        <tr>
+          <td>${h.name}<br><span class="gray">${h.code}</span></td>
+          <td class="num">${fmt(h.current_price)}</td>
+          <td class="num">${fmt(h.quantity)}</td>
+          <td class="num ${h.profit_pct>=0?'profit':'loss'}">${h.profit_pct}%<br><span style="font-size:11px">${fmt(h.profit_amt)}원</span></td>
+        </tr>`).join('');
+    }
+  } catch(e) {
+    document.getElementById('balanceHoldings').innerHTML = '<tr><td colspan="4" class="red">서버 연결 실패</td></tr>';
+  }
+}
+
+// ── 체결내역 ──
+function switchOrderTab(isLive, el) {
+  currentOrderLive = isLive;
+  el.parentElement.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  loadOrders();
+}
+
+async function loadOrders() {
+  try {
+    const r = await fetch(`${API}/api/kis/orders/today?is_live=${currentOrderLive}`);
+    const d = await r.json();
+    const tbody = document.getElementById('orderList');
+    if (!d.success || !d.orders.length) {
+      tbody.innerHTML = `<tr><td colspan="6" class="gray">${d.error||'체결내역 없음'}</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = d.orders.map(o => `
+      <tr>
+        <td>${o.order_time?o.order_time.substring(0,2)+':'+o.order_time.substring(2,4)+':'+o.order_time.substring(4,6):'-'}</td>
+        <td>${o.name}<br><span class="gray">${o.code}</span></td>
+        <td><span class="${o.order_type==='매수'?'red':'green'}">${o.order_type}</span></td>
+        <td class="num">${fmt(o.filled_price)}</td>
+        <td class="num">${o.filled_qty}/${o.order_qty}</td>
+        <td>${o.status}</td>
+      </tr>`).join('');
+  } catch(e) {
+    document.getElementById('orderList').innerHTML = '<tr><td colspan="6" class="red">조회 실패</td></tr>';
+  }
+}
+
+// ── 수동 주문 ──
+async function manualOrder(type) {
+  const pw = promptPw(); if (!pw) return;
+  const code = document.getElementById('orderCode').value.trim();
+  const qty = parseInt(document.getElementById('orderQty').value) || 0;
+  const price = parseInt(document.getElementById('orderPrice').value) || 0;
+  const isLive = document.getElementById('orderMode').value === 'true';
+
+  if (code.length !== 6) { showToast('종목코드 6자리를 입력하세요', 'error'); return; }
+  if (qty <= 0) { showToast('수량을 입력하세요', 'error'); return; }
+
+  const mode = isLive ? '실전' : '모의';
+  const action = type === 'buy' ? '매수' : '매도';
+  if (!confirm(`[${mode}] ${code} ${qty}주 ${action} 주문하시겠습니까?`)) return;
+
+  try {
+    const r = await fetch(`${API}/api/kis/order/${type}`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ code, quantity: qty, price, is_live: isLive, password: pw })
+    });
+    const d = await r.json();
+    if (d.success) {
+      showToast(`${action} 주문 성공!`, 'success');
+      setTimeout(loadOrders, 1000);
+    } else {
+      showToast(`${action} 실패: ${d.error || d.data?.msg1 || '알 수 없는 오류'}`, 'error');
+    }
+  } catch(e) { showToast('서버 오류', 'error'); }
+}
+
+// ── DB 매매기록 ──
+async function loadTrades() {
+  try {
+    const r = await fetch(`${API}/api/trades/?limit=30`);
+    const list = await r.json();
+    const tbody = document.getElementById('tradeList');
+    if (!list.length) { tbody.innerHTML = '<tr><td colspan="9" class="gray">매매 기록 없음</td></tr>'; return; }
+    tbody.innerHTML = list.map(t => {
+      const time = t.traded_at ? new Date(t.traded_at).toLocaleString('ko-KR',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '-';
+      const isSell = t.trade_type === 'sell';
+      return `<tr>
+        <td>${time}</td>
+        <td>${t.strategy_id||'-'}</td>
+        <td>${t.stock_name||t.stock_code}</td>
+        <td><span class="${isSell?'green':'red'}">${isSell?'매도':'매수'}</span></td>
+        <td class="num">${fmt(t.buy_price)}</td>
+        <td class="num">${isSell?fmt(t.sell_price):'-'}</td>
+        <td class="num">${fmt(t.quantity)}</td>
+        <td class="num ${(t.net_profit||0)>=0?'profit':'loss'}">${isSell?fmt(t.net_profit):'-'}</td>
+        <td style="font-size:11px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.trade_reason||'-'}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    document.getElementById('tradeList').innerHTML = '<tr><td colspan="9" class="red">로딩 실패</td></tr>';
+  }
+}
+
+// ── 초기화 ──
+async function init() {
+  checkKisStatus();
+  loadStrategies();
+  loadTrades();
+}
+
+init();
+// 30초 간격 자동 새로고침
+setInterval(() => { checkKisStatus(); loadStrategies(); }, 30000);
+</script>
+</body>
+</html>
