@@ -1,0 +1,30 @@
+--- App.jsx 수정 가이드 ---
+
+1. import 추가 (파일 상단, DatabaseBackup import 다음):
+   import TradingDashboard from "./TradingDashboard";
+
+2. MENU 배열에 추가 (virtual-portfolio 다음, backup 앞):
+   {id:"trading",icon:"💹",label:"실전매매"},
+
+3. switch(page) 에 case 추가 (settings case 다음):
+   case "trading": return <TradingDashboard/>;
+
+--- diff ---
+diff --git a/src/App.jsx b/src/App.jsx
+index 3d3027a..9d26f26 100644
+--- a/src/App.jsx
++++ b/src/App.jsx
+@@ -3,6 +3,7 @@ import SwingBacktest from "./SwingBacktest";
+ import PatternDetector from "./PatternDetector";
+ import VirtualPortfolioTracker from "./VirtualPortfolioTracker";
+ import DatabaseBackup from "./DatabaseBackup";
++import TradingDashboard from "./TradingDashboard";
+ // ============================================================
+@@ -486,6 +487,7 @@ const MENU=[
+   {id:"virtual-portfolio",icon:"📊",label:"실시간 추적"},
++  {id:"trading",icon:"💹",label:"실전매매"},
+   {id:"backup",icon:"💾",label:"DB 백업"},
+@@ -533,6 +535,7 @@ export default function App() {
+       case "settings": return <SettingsPage/>;
++      case "trading": return <TradingDashboard/>;
+       case "backup": return <DatabaseBackup/>;
