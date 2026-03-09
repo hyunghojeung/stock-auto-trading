@@ -388,6 +388,17 @@ async def gap_exit_check_job():
         logger.error(f"[갭전략 매도] 오류: {e}")
 
 
+async def kis_auto_trade_check_job():
+    """09:00~15:30: KIS 자동 손절/익절 체크 (30초 간격)"""
+    try:
+        if not is_trading_day():
+            return
+        from app.services.kis_auto_trade import check_auto_trade_rules
+        await check_auto_trade_rules()
+    except Exception as e:
+        logger.error(f"[KIS 자동매매] 오류: {e}")
+
+
 async def gap_close_job():
     """15:00: 갭전략 장마감 정리"""
     start = datetime.now()
@@ -463,6 +474,11 @@ def setup_scheduler():
     scheduler.add_job(gap_close_job,
                       CronTrigger(hour=15, minute=0, day_of_week="mon-fri"),
                       id="gap_close", name="갭전략 장마감 정리", replace_existing=True)
+
+    # ── KIS 자동 손절/익절 (30초 간격, 장중) ──
+    scheduler.add_job(kis_auto_trade_check_job,
+                      CronTrigger(second="*/30", hour="9-15", minute="*", day_of_week="mon-fri"),
+                      id="kis_auto_trade", name="KIS 자동 손절/익절 체크", replace_existing=True)
 
     scheduler.start()
     logger.info("[스케줄러] ★ 통합 스케줄러 시작 (v3: 시장지수 + 눌림목 + 갭상승 + 패턴수집 + 가상포트)")
