@@ -20,6 +20,7 @@ from app.services.stock_fetcher import (
     get_all_active_stocks,
     get_stock_stats,
 )
+from app.services.naver_stock import get_realtime_price_naver
 
 router = APIRouter(prefix="/api/stocks", tags=["종목DB"])
 
@@ -58,6 +59,59 @@ async def search_stocks(
         "count": len(results),
         "query": q,
         "source": "db",
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1-1. 실시간 시세 조회 / Realtime Price Quote
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/quote/{code}")
+async def get_stock_quote(code: str):
+    """
+    종목 실시간 시세 조회 (네이버 금융 API 기반)
+
+    GET /api/stocks/quote/005930
+    → {"price": 72000, "change": -500, "change_pct": -0.69, "name": "삼성전자", ...}
+    """
+    import requests as req
+    try:
+        api_url = f"https://m.stock.naver.com/api/stock/{code}/basic"
+        res = req.get(api_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if res.status_code == 200:
+            data = res.json()
+            price_str = data.get("stockEndPrice") or data.get("closePrice") or "0"
+            price = int(str(price_str).replace(",", ""))
+            change_str = data.get("compareToPreviousClosePrice") or "0"
+            change = int(str(change_str).replace(",", ""))
+            prev_price = price - change if price and change else 0
+            change_pct = round((change / prev_price) * 100, 2) if prev_price else 0
+            return {
+                "success": True,
+                "code": code,
+                "price": price,
+                "change": change,
+                "change_pct": change_pct,
+                "name": data.get("stockName", code),
+                "volume": int(str(data.get("accumulatedTradingVolume") or "0").replace(",", "")),
+                "high": int(str(data.get("highPrice") or "0").replace(",", "")),
+                "low": int(str(data.get("lowPrice") or "0").replace(",", "")),
+                "open": int(str(data.get("openPrice") or "0").replace(",", "")),
+            }
+    except Exception as e:
+        pass
+
+    # 폴백: 기존 함수 사용
+    result = get_realtime_price_naver(code)
+    if not result:
+        return {"error": f"종목코드 {code} 시세 조회 실패", "success": False}
+    return {
+        "success": True,
+        "code": code,
+        "price": result.get("price", 0),
+        "change": 0,
+        "change_pct": 0,
+        "name": result.get("name", code),
     }
 
 
