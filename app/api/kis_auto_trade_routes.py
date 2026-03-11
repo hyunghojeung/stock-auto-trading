@@ -169,15 +169,30 @@ async def sync_rules(req: RuleSyncRequest):
 
 @router.post("/migrate")
 async def migrate_schema():
-    """스마트형 트레일링 스탑 컬럼 마이그레이션 (1회성)
-    Supabase SQL API를 통해 직접 ALTER TABLE 실행"""
+    """스마트형 트레일링 스탑 컬럼 마이그레이션.
+    Step 1: exec_sql RPC 함수 생성 시도
+    Step 2: exec_sql로 ALTER TABLE 실행
+    """
     import requests as req
     from app.core.config import config
 
     if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_KEY:
         return {"success": False, "error": "SUPABASE_URL or SERVICE_KEY not configured"}
 
-    sql = """
+    headers = {
+        "apikey": config.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {config.SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    # Step 1: exec_sql 함수 존재 여부 확인 및 생성
+    # Supabase pg-meta API를 사용하여 SQL 직접 실행
+    # 방법: POST /pg/query (Supabase pg-meta 엔드포인트)
+    base = config.SUPABASE_URL.rstrip("/")
+
+    # 먼저 pg-meta의 /query 엔드포인트 시도
+    alter_sql = """
     ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'fixed';
     ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS trailing_stop_pct NUMERIC DEFAULT 5;
     ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS profit_activation_pct NUMERIC DEFAULT 15;
@@ -185,28 +200,44 @@ async def migrate_schema():
     ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS peak_price NUMERIC DEFAULT 0;
     """
 
-    # Supabase SQL API (pg-meta)
     results = []
-    for stmt in sql.strip().split(";"):
-        stmt = stmt.strip()
-        if not stmt:
-            continue
-        try:
-            resp = req.post(
-                f"{config.SUPABASE_URL}/rest/v1/rpc/exec_sql",
-                headers={
-                    "apikey": config.SUPABASE_SERVICE_KEY,
-                    "Authorization": f"Bearer {config.SUPABASE_SERVICE_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={"query": stmt + ";"},
-                timeout=10,
-            )
-            results.append({"sql": stmt[:60], "status": resp.status_code, "body": resp.text[:200]})
-        except Exception as e:
-            results.append({"sql": stmt[:60], "status": "error", "body": str(e)[:200]})
 
-    return {"success": True, "results": results}
+    # 방법 1: Supabase pg-meta query API
+    try:
+        resp = req.post(
+            f"{base}/pg/query",
+            headers=headers,
+            json={"query": alter_sql},
+            timeout=15,
+        )
+        results.append({"method": "pg/query", "status": resp.status_code, "body": resp.text[:300]})
+        if resp.status_code == 200:
+            return {"success": True, "method": "pg/query", "results": results}
+    except Exception as e:
+        results.append({"method": "pg/query", "error": str(e)[:200]})
+
+    # 방법 2: Supabase SQL API (/sql)
+    try:
+        resp = req.post(
+            f"{base}/rest/v1/sql",
+            headers=headers,
+            json={"query": alter_sql},
+            timeout=15,
+        )
+        results.append({"method": "rest/sql", "status": resp.status_code, "body": resp.text[:300]})
+        if resp.status_code == 200:
+            return {"success": True, "method": "rest/sql", "results": results}
+    except Exception as e:
+        results.append({"method": "rest/sql", "error": str(e)[:200]})
+
+    # 방법 3: 개별 컬럼을 PostgREST 없이 추가 시도 (더미 insert + ignore)
+    # PostgREST에서 직접 ALTER는 불가하므로, 사용자에게 Supabase Dashboard에서 수동 실행 안내
+    return {
+        "success": False,
+        "message": "exec_sql RPC 함수가 없어 자동 마이그레이션 불가. Supabase Dashboard SQL Editor에서 수동 실행 필요.",
+        "manual_sql": alter_sql.strip(),
+        "results": results,
+    }
 
 
 @router.get("/status")
