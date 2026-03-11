@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 _last_token_refresh = {}  # { "virtual": datetime, "real": datetime }
 # ★ 모니터링 로그 시각 캐시 (5분 간격으로만 DB 기록)
 _last_monitor_log = {}  # { "virtual": datetime, "real": datetime }
+# ★ 매도 실패 카운터 (연속 3회 실패 시 해당 종목 스킵)
+_sell_fail_count = {}  # { "virtual_389030": 3 }
 
 # KIS Base URLs
 VIRTUAL_BASE = "https://openapivts.koreainvestment.com:29443"
@@ -224,8 +226,11 @@ def _get_balance_with_detail(cred):
         return None
 
 
-def _sell_stock(cred, code, qty):
-    """KIS 시장가 매도"""
+def _sell_stock(cred, code, qty, current_price=0):
+    """KIS 매도 주문.
+    모의투자: 지정가(00) + 현재가 사용 (시장가 미지원)
+    실전투자: 시장가(01) 사용
+    """
     is_virtual = cred.get("is_virtual", True)
     base_url = VIRTUAL_BASE if is_virtual else REAL_BASE
     tr_id = "VTTC0801U" if is_virtual else "TTTC0801U"
@@ -233,14 +238,29 @@ def _sell_stock(cred, code, qty):
 
     headers = _make_headers(cred)
     headers["tr_id"] = tr_id
-    body = {
-        "CANO": cano,
-        "ACNT_PRDT_CD": acnt_prdt_cd,
-        "PDNO": code,
-        "ORD_DVSN": "06",  # 시장가
-        "ORD_QTY": str(qty),
-        "ORD_UNPR": "0",
-    }
+
+    if is_virtual:
+        # ★ 모의투자: 시장가(06) 미지원 → 지정가(00) + 현재가 사용
+        body = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": acnt_prdt_cd,
+            "PDNO": code,
+            "ORD_DVSN": "00",  # 지정가
+            "ORD_QTY": str(qty),
+            "ORD_UNPR": str(int(current_price)) if current_price > 0 else "0",
+        }
+    else:
+        # 실전투자: 시장가(01) 사용
+        body = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": acnt_prdt_cd,
+            "PDNO": code,
+            "ORD_DVSN": "01",  # 시장가
+            "ORD_QTY": str(qty),
+            "ORD_UNPR": "0",
+        }
+
+    logger.info(f"[자동매매] 매도 주문: {code} qty={qty} type={'지정가' if is_virtual else '시장가'} price={current_price}")
 
     try:
         r = requests.post(
@@ -249,6 +269,8 @@ def _sell_stock(cred, code, qty):
         )
         d = r.json()
         success = d.get("rt_cd") == "0"
+        if not success:
+            logger.error(f"[자동매매] 매도 응답: rt_cd={d.get('rt_cd')}, msg_cd={d.get('msg_cd')}, msg1={d.get('msg1','')}")
         return {"success": success, "data": d}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -417,12 +439,19 @@ async def check_auto_trade_rules():
                     sell_reason = f"최대보유일 ({hold_days}일 >= {max_days}일)"
 
                 if sell_reason:
+                    # ★ 매도 실패 카운터 확인 (연속 실패 시 스킵)
+                    fail_key = f"{mode}_{stock_code}"
+                    fail_cnt = _sell_fail_count.get(fail_key, 0)
+                    if fail_cnt >= 3:
+                        monitor_details.append(f"{stock_code} {sell_reason} → 매도3회실패(스킵)")
+                        continue
+
                     logger.info(
                         f"[자동매매] {mode} 매도 실행: "
                         f"{stock_name}({stock_code}) "
                         f"수량={holding['quantity']} 사유={sell_reason}"
                     )
-                    result = _sell_stock(cred, stock_code, holding["quantity"])
+                    result = _sell_stock(cred, stock_code, holding["quantity"], current_price)
 
                     if result.get("success"):
                         # ★ 매도 성공 시에만 규칙 비활성화
@@ -430,11 +459,13 @@ async def check_auto_trade_rules():
                             .update({"enabled": False, "updated_at": datetime.now(KST).isoformat()}) \
                             .eq("id", rule["id"]).execute()
                         monitor_details.append(f"{stock_code} {sell_reason} → 매도성공")
+                        _sell_fail_count.pop(fail_key, None)  # 성공 시 카운터 리셋
                     else:
-                        # ★ 매도 실패 시 규칙 유지 (다음 체크에서 재시도)
+                        # ★ 매도 실패 시 규칙 유지, 실패 카운터 증가
+                        _sell_fail_count[fail_key] = fail_cnt + 1
                         err_info = result.get("data", {}).get("msg1", "") or result.get("error", "")
-                        monitor_details.append(f"{stock_code} {sell_reason} → 매도실패({err_info[:30]})")
-                        logger.error(f"[자동매매] {mode} 매도 실패: {stock_code} → {err_info}")
+                        monitor_details.append(f"{stock_code} {sell_reason} → 매도실패({fail_cnt+1}/3, {err_info[:30]})")
+                        logger.error(f"[자동매매] {mode} 매도 실패({fail_cnt+1}/3): {stock_code} → {err_info}")
 
                     # 카카오 알림
                     _send_alert(rule, sell_reason, result)
