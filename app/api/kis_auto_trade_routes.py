@@ -183,3 +183,86 @@ async def auto_trade_status():
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+@router.get("/credentials-check")
+async def check_credentials(mode: str = "virtual"):
+    """인증정보 진단: Supabase에 저장된 KIS 인증정보 상태 확인"""
+    try:
+        r = db.table("kis_credentials").select("*").eq("mode", mode).execute()
+        if not r.data or len(r.data) == 0:
+            return {
+                "success": False,
+                "status": "NOT_FOUND",
+                "message": f"kis_credentials 테이블에 mode={mode} 레코드가 없습니다. "
+                           f"프론트엔드 KIS 페이지에서 API 설정을 저장하세요.",
+            }
+
+        cred = r.data[0]
+        issues = []
+        if not cred.get("app_key"):
+            issues.append("app_key 비어있음")
+        if not cred.get("app_secret"):
+            issues.append("app_secret 비어있음")
+        if not cred.get("access_token"):
+            issues.append("access_token 비어있음")
+        account_no = cred.get("account_no", "")
+        if not account_no:
+            issues.append("account_no 비어있음 ← INVALID_CHECK_ACNO 원인")
+        elif len(account_no) < 10:
+            issues.append(f"account_no 길이 부족 ({len(account_no)}자, 10자 이상 필요)")
+
+        return {
+            "success": len(issues) == 0,
+            "status": "OK" if len(issues) == 0 else "ISSUES_FOUND",
+            "mode": mode,
+            "app_key": f"{cred.get('app_key', '')[:8]}..." if cred.get("app_key") else "(비어있음)",
+            "app_secret": f"{cred.get('app_secret', '')[:4]}..." if cred.get("app_secret") else "(비어있음)",
+            "access_token": f"{cred.get('access_token', '')[:20]}..." if cred.get("access_token") else "(비어있음)",
+            "account_no": account_no or "(비어있음)",
+            "account_no_length": len(account_no),
+            "is_virtual": cred.get("is_virtual"),
+            "updated_at": cred.get("updated_at"),
+            "issues": issues,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+class CredentialUpdate(BaseModel):
+    mode: str = "virtual"
+    account_no: Optional[str] = None
+    app_key: Optional[str] = None
+    app_secret: Optional[str] = None
+    access_token: Optional[str] = None
+
+
+@router.post("/credentials-update")
+async def update_credentials(req: CredentialUpdate):
+    """인증정보 수동 업데이트 (계좌번호 등 누락된 필드 보정)"""
+    try:
+        now = datetime.now(KST).isoformat()
+        update_data = {"updated_at": now}
+
+        if req.account_no is not None:
+            # 하이픈 제거하고 저장
+            update_data["account_no"] = req.account_no.replace("-", "")
+        if req.app_key is not None:
+            update_data["app_key"] = req.app_key
+        if req.app_secret is not None:
+            update_data["app_secret"] = req.app_secret
+        if req.access_token is not None:
+            update_data["access_token"] = req.access_token
+
+        # 기존 레코드 확인
+        existing = db.table("kis_credentials").select("id").eq("mode", req.mode).execute()
+        if existing.data and len(existing.data) > 0:
+            db.table("kis_credentials").update(update_data).eq("mode", req.mode).execute()
+        else:
+            update_data["mode"] = req.mode
+            update_data["created_at"] = now
+            db.table("kis_credentials").insert(update_data).execute()
+
+        return {"success": True, "message": f"{req.mode} 인증정보 업데이트 완료", "updated_fields": list(update_data.keys())}
+    except Exception as e:
+        return {"success": False, "error": str(e)}

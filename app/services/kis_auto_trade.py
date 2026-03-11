@@ -302,7 +302,15 @@ async def check_auto_trade_rules():
                 _log_execution(mode, "skip", f"인증정보 없음 (kis_credentials 테이블에 mode={mode} 없음)")
                 continue
 
-            logger.info(f"[자동매매] {mode} 인증정보 로드 완료 (app_key={cred.get('app_key','')[:8]}..., account={cred.get('account_no','')[:6]}...)")
+            # ★ account_no 검증: 비어있으면 잔고조회 불가
+            account_no = cred.get("account_no", "")
+            if not account_no or len(account_no) < 10:
+                logger.error(f"[자동매매] {mode} 계좌번호 누락 또는 형식 오류 (account_no='{account_no}', 길이={len(account_no)}). "
+                             f"프론트엔드 KIS 페이지에서 API 설정을 저장하여 계좌번호를 동기화하세요.")
+                _log_execution(mode, "skip", f"계좌번호 누락/오류: account_no='{account_no}' (길이={len(account_no)}). 프론트엔드에서 API 설정 재저장 필요.")
+                continue
+
+            logger.info(f"[자동매매] {mode} 인증정보 로드 완료 (app_key={cred.get('app_key','')[:8]}..., account={account_no[:4]}****{account_no[-2:]})")
 
             # ★ 토큰 자동 갱신 (KIS 1분당 1회 제한 → 5분 간격으로만 갱신)
             now = datetime.now(KST)
