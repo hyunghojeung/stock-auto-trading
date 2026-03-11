@@ -167,6 +167,17 @@ async def sync_rules(req: RuleSyncRequest):
         return {"success": False, "error": str(e)}
 
 
+@router.post("/migrate")
+async def migrate_schema():
+    """스마트형 트레일링 스탑 컬럼 마이그레이션 (1회성)"""
+    try:
+        from app.services.kis_auto_trade import _migrate_columns
+        _migrate_columns()
+        return {"success": True, "message": "마이그레이션 완료 (strategy, trailing_stop_pct, profit_activation_pct, grace_days, peak_price)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @router.get("/status")
 async def auto_trade_status():
     """자동매매 상태 확인"""
