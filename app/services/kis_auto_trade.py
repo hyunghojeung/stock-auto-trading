@@ -259,14 +259,22 @@ async def check_auto_trade_rules():
             if not rules:
                 continue
 
+            logger.info(f"[자동매매] {mode} 활성 규칙 {len(rules)}개 확인")
+
             cred = _get_credentials(mode)
             if not cred or not cred.get("access_token"):
+                logger.warning(f"[자동매매] {mode} 인증정보 없음 — Supabase kis_credentials 테이블에 {mode} 모드 데이터가 필요합니다")
+                _log_execution(mode, "skip", f"인증정보 없음 (kis_credentials 테이블에 mode={mode} 없음)")
                 continue
 
+            logger.info(f"[자동매매] {mode} 인증정보 로드 완료, 잔고 조회 시작...")
             holdings = _get_balance(cred)
             if holdings is None:
                 logger.warning(f"[자동매매] {mode} 잔고조회 실패 — 스킵")
+                _log_execution(mode, "skip", "잔고조회 실패 (토큰 만료 또는 API 오류)")
                 continue
+
+            logger.info(f"[자동매매] {mode} 보유종목 {len(holdings)}개 조회 완료")
 
             for rule in rules:
                 stock_code = rule.get("stock_code", "")
