@@ -23,10 +23,18 @@ VIRTUAL_BASE = "https://openapivts.koreainvestment.com:29443"
 REAL_BASE = "https://openapi.koreainvestment.com:9443"
 
 
+_columns_migrated = False  # 한 번만 마이그레이션 시도
+
+
 def _ensure_table():
-    """kis_auto_trade_rules 테이블 존재 확인 (없으면 생성 시도)"""
+    """kis_auto_trade_rules 테이블 존재 확인 (없으면 생성 시도) + 컬럼 마이그레이션"""
+    global _columns_migrated
     try:
         db.table("kis_auto_trade_rules").select("id").limit(1).execute()
+        # ★ 기존 테이블에 새 컬럼 추가 (strategy, trailing 관련)
+        if not _columns_migrated:
+            _migrate_columns()
+            _columns_migrated = True
         return True
     except Exception:
         try:
@@ -44,6 +52,11 @@ def _ensure_table():
                     max_hold_days INTEGER DEFAULT 30,
                     buy_date TEXT DEFAULT '',
                     enabled BOOLEAN DEFAULT TRUE,
+                    strategy TEXT DEFAULT 'fixed',
+                    trailing_stop_pct NUMERIC DEFAULT 5,
+                    profit_activation_pct NUMERIC DEFAULT 15,
+                    grace_days INTEGER DEFAULT 7,
+                    peak_price NUMERIC DEFAULT 0,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
@@ -51,10 +64,28 @@ def _ensure_table():
                 CREATE POLICY IF NOT EXISTS "allow_all" ON kis_auto_trade_rules FOR ALL USING (true) WITH CHECK (true);
                 """
             }).execute()
+            _columns_migrated = True
             return True
         except Exception as e:
             logger.warning(f"[자동매매] 테이블 생성 실패: {e}")
             return False
+
+
+def _migrate_columns():
+    """기존 테이블에 스마트형 트레일링 스탑 컬럼 추가 (IF NOT EXISTS)"""
+    try:
+        db.postgrest.rpc("exec_sql", {
+            "query": """
+            ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'fixed';
+            ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS trailing_stop_pct NUMERIC DEFAULT 5;
+            ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS profit_activation_pct NUMERIC DEFAULT 15;
+            ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS grace_days INTEGER DEFAULT 7;
+            ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS peak_price NUMERIC DEFAULT 0;
+            """
+        }).execute()
+        logger.info("[자동매매] 스마트형 트레일링 스탑 컬럼 마이그레이션 완료")
+    except Exception as e:
+        logger.warning(f"[자동매매] 컬럼 마이그레이션 실패 (이미 존재할 수 있음): {e}")
 
 
 def _get_credentials(mode: str):
@@ -426,17 +457,58 @@ async def check_auto_trade_rules():
                     except ValueError:
                         pass
 
-                tp = float(rule.get("tp_pct", 10))
-                sl = float(rule.get("sl_pct", 5))
                 max_days = int(rule.get("max_hold_days", 30))
+                strategy = rule.get("strategy", "fixed")
+                now_iso = datetime.now(KST).isoformat()
 
                 sell_reason = None
-                if profit_pct >= tp:
-                    sell_reason = f"익절 ({profit_pct:.1f}% >= {tp}%)"
-                elif profit_pct <= -sl:
-                    sell_reason = f"손절 ({profit_pct:.1f}% <= -{sl}%)"
-                elif max_days > 0 and hold_days >= max_days:
-                    sell_reason = f"최대보유일 ({hold_days}일 >= {max_days}일)"
+
+                if strategy == "smart":
+                    # ━━━ 스마트형: 트레일링 스탑 ━━━
+                    grace = int(rule.get("grace_days", 7))
+                    sl = float(rule.get("sl_pct", 12))
+                    trailing = float(rule.get("trailing_stop_pct", 5))
+                    activation = float(rule.get("profit_activation_pct", 15))
+                    peak = float(rule.get("peak_price", 0))
+
+                    # ★ peak_price 업데이트 (현재가가 최고가보다 높으면 갱신)
+                    if current_price > peak:
+                        peak = float(current_price)
+                        try:
+                            db.table("kis_auto_trade_rules") \
+                                .update({"peak_price": peak, "updated_at": now_iso}) \
+                                .eq("id", rule["id"]).execute()
+                        except Exception:
+                            pass
+
+                    if hold_days > grace:
+                        # 1) 트레일링 스탑 (수익 활성화 후)
+                        peak_profit = ((peak - buy_price) / buy_price * 100) if buy_price > 0 else 0
+                        if peak_profit >= activation and peak > 0:
+                            drop_from_peak = ((current_price - peak) / peak * 100)
+                            if drop_from_peak <= -trailing:
+                                sell_reason = (
+                                    f"트레일링 (최고{peak_profit:.1f}%→현재{profit_pct:.1f}%, "
+                                    f"하락{drop_from_peak:.1f}%<=-{trailing}%)"
+                                )
+                        # 2) 손절 (grace 이후)
+                        if not sell_reason and profit_pct <= -sl:
+                            sell_reason = f"손절 ({profit_pct:.1f}% <= -{sl}%)"
+
+                    # 3) 만기
+                    if not sell_reason and max_days > 0 and hold_days >= max_days:
+                        sell_reason = f"최대보유일 ({hold_days}일 >= {max_days}일)"
+
+                else:
+                    # ━━━ 고정형: 기존 로직 그대로 ━━━
+                    tp = float(rule.get("tp_pct", 10))
+                    sl = float(rule.get("sl_pct", 5))
+                    if profit_pct >= tp:
+                        sell_reason = f"익절 ({profit_pct:.1f}% >= {tp}%)"
+                    elif profit_pct <= -sl:
+                        sell_reason = f"손절 ({profit_pct:.1f}% <= -{sl}%)"
+                    elif max_days > 0 and hold_days >= max_days:
+                        sell_reason = f"최대보유일 ({hold_days}일 >= {max_days}일)"
 
                 if sell_reason:
                     # ★ 매도 실패 카운터 확인 (연속 실패 시 스킵)
@@ -447,7 +519,7 @@ async def check_auto_trade_rules():
                         continue
 
                     logger.info(
-                        f"[자동매매] {mode} 매도 실행: "
+                        f"[자동매매] {mode} [{strategy}] 매도 실행: "
                         f"{stock_name}({stock_code}) "
                         f"수량={holding['quantity']} 사유={sell_reason}"
                     )
@@ -456,28 +528,39 @@ async def check_auto_trade_rules():
                     if result.get("success"):
                         # ★ 매도 성공 시에만 규칙 비활성화
                         db.table("kis_auto_trade_rules") \
-                            .update({"enabled": False, "updated_at": datetime.now(KST).isoformat()}) \
+                            .update({"enabled": False, "updated_at": now_iso}) \
                             .eq("id", rule["id"]).execute()
-                        monitor_details.append(f"{stock_code} {sell_reason} → 매도성공")
+                        monitor_details.append(f"{stock_code} [{strategy}] {sell_reason} → 매도성공")
                         _sell_fail_count.pop(fail_key, None)  # 성공 시 카운터 리셋
                     else:
                         # ★ 매도 실패 시 규칙 유지, 실패 카운터 증가
                         _sell_fail_count[fail_key] = fail_cnt + 1
                         err_info = result.get("data", {}).get("msg1", "") or result.get("error", "")
-                        monitor_details.append(f"{stock_code} {sell_reason} → 매도실패({fail_cnt+1}/3, {err_info[:30]})")
-                        logger.error(f"[자동매매] {mode} 매도 실패({fail_cnt+1}/3): {stock_code} → {err_info}")
+                        monitor_details.append(f"{stock_code} [{strategy}] {sell_reason} → 매도실패({fail_cnt+1}/3, {err_info[:30]})")
+                        logger.error(f"[자동매매] {mode} [{strategy}] 매도 실패({fail_cnt+1}/3): {stock_code} → {err_info}")
 
                     # 카카오 알림
                     _send_alert(rule, sell_reason, result)
 
                     # 로그 기록
                     _log_execution(mode, "sell" if result.get("success") else "sell_fail",
-                                   f"{stock_code} {sell_reason} → {'성공' if result.get('success') else '실패'}")
+                                   f"[{strategy}] {stock_code} {sell_reason} → {'성공' if result.get('success') else '실패'}")
                 else:
                     # ★ 매도 미충족 — 모니터링 현황 기록
-                    monitor_details.append(
-                        f"{stock_code} 수익{profit_pct:+.1f}%(TP:{tp}/SL:-{sl}) {hold_days}일차"
-                    )
+                    if strategy == "smart":
+                        peak = float(rule.get("peak_price", 0))
+                        peak_profit = ((peak - buy_price) / buy_price * 100) if buy_price > 0 and peak > 0 else 0
+                        trailing_active = hold_days > int(rule.get("grace_days", 7)) and peak_profit >= float(rule.get("profit_activation_pct", 15))
+                        monitor_details.append(
+                            f"{stock_code} [스마트] 수익{profit_pct:+.1f}% 최고{peak:,.0f}원({peak_profit:+.1f}%) "
+                            f"{'추적ON' if trailing_active else '추적OFF'} {hold_days}일차"
+                        )
+                    else:
+                        tp = float(rule.get("tp_pct", 10))
+                        sl = float(rule.get("sl_pct", 5))
+                        monitor_details.append(
+                            f"{stock_code} [고정] 수익{profit_pct:+.1f}%(TP:{tp}/SL:-{sl}) {hold_days}일차"
+                        )
 
             # ★ 모니터링 하트비트 로그 (5분마다 DB에 기록, 매도 발생 시 즉시 기록)
             now_for_log = datetime.now(KST)

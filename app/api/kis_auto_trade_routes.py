@@ -23,6 +23,12 @@ class RuleCreate(BaseModel):
     max_hold_days: int = 30
     buy_date: str = ""
     enabled: bool = True
+    # ★ 스마트형 트레일링 스탑 필드
+    strategy: str = "fixed"            # "fixed" | "smart"
+    trailing_stop_pct: float = 5.0
+    profit_activation_pct: float = 15.0
+    grace_days: int = 7
+    peak_price: float = 0
 
 
 class RuleSyncRequest(BaseModel):
@@ -67,6 +73,11 @@ async def upsert_rule(rule: RuleCreate):
             "max_hold_days": rule.max_hold_days,
             "buy_date": rule.buy_date,
             "enabled": rule.enabled,
+            "strategy": rule.strategy,
+            "trailing_stop_pct": rule.trailing_stop_pct,
+            "profit_activation_pct": rule.profit_activation_pct,
+            "grace_days": rule.grace_days,
+            "peak_price": rule.peak_price,
             "updated_at": now,
         }
 
@@ -131,6 +142,11 @@ async def sync_rules(req: RuleSyncRequest):
                 "max_hold_days": rule.max_hold_days,
                 "buy_date": rule.buy_date,
                 "enabled": True,
+                "strategy": rule.strategy,
+                "trailing_stop_pct": rule.trailing_stop_pct,
+                "profit_activation_pct": rule.profit_activation_pct,
+                "grace_days": rule.grace_days,
+                "peak_price": rule.peak_price,
                 "updated_at": now,
             }
 
