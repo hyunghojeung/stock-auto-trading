@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 # ★ 토큰 갱신 시각 캐시 (1분당 1회 제한 방지)
 _last_token_refresh = {}  # { "virtual": datetime, "real": datetime }
+# ★ 모니터링 로그 시각 캐시 (5분 간격으로만 DB 기록)
+_last_monitor_log = {}  # { "virtual": datetime, "real": datetime }
 
 # KIS Base URLs
 VIRTUAL_BASE = "https://openapivts.koreainvestment.com:29443"
@@ -368,8 +370,12 @@ async def check_auto_trade_rules():
 
             logger.info(f"[자동매매] {mode} 보유종목 {len(holdings)}개 조회 완료")
 
+            # ★ 모니터링 현황 수집 (로그용)
+            monitor_details = []
+
             for rule in rules:
                 stock_code = rule.get("stock_code", "")
+                stock_name = rule.get("stock_name", stock_code)
                 holding = next(
                     (h for h in holdings if h["code"] == stock_code), None
                 )
@@ -379,6 +385,7 @@ async def check_auto_trade_rules():
                     db.table("kis_auto_trade_rules") \
                         .update({"enabled": False, "updated_at": datetime.now(KST).isoformat()}) \
                         .eq("id", rule["id"]).execute()
+                    monitor_details.append(f"{stock_code} 보유없음(비활성화)")
                     continue
 
                 current_price = holding["current_price"]
@@ -412,21 +419,44 @@ async def check_auto_trade_rules():
                 if sell_reason:
                     logger.info(
                         f"[자동매매] {mode} 매도 실행: "
-                        f"{rule.get('stock_name', '')}({stock_code}) "
+                        f"{stock_name}({stock_code}) "
                         f"수량={holding['quantity']} 사유={sell_reason}"
                     )
                     result = _sell_stock(cred, stock_code, holding["quantity"])
 
-                    # 규칙 비활성화
-                    db.table("kis_auto_trade_rules") \
-                        .update({"enabled": False, "updated_at": datetime.now(KST).isoformat()}) \
-                        .eq("id", rule["id"]).execute()
+                    if result.get("success"):
+                        # ★ 매도 성공 시에만 규칙 비활성화
+                        db.table("kis_auto_trade_rules") \
+                            .update({"enabled": False, "updated_at": datetime.now(KST).isoformat()}) \
+                            .eq("id", rule["id"]).execute()
+                        monitor_details.append(f"{stock_code} {sell_reason} → 매도성공")
+                    else:
+                        # ★ 매도 실패 시 규칙 유지 (다음 체크에서 재시도)
+                        err_info = result.get("data", {}).get("msg1", "") or result.get("error", "")
+                        monitor_details.append(f"{stock_code} {sell_reason} → 매도실패({err_info[:30]})")
+                        logger.error(f"[자동매매] {mode} 매도 실패: {stock_code} → {err_info}")
 
                     # 카카오 알림
                     _send_alert(rule, sell_reason, result)
 
                     # 로그 기록
-                    _log_execution(mode, "sell", f"{stock_code} {sell_reason} → {'성공' if result.get('success') else '실패'}")
+                    _log_execution(mode, "sell" if result.get("success") else "sell_fail",
+                                   f"{stock_code} {sell_reason} → {'성공' if result.get('success') else '실패'}")
+                else:
+                    # ★ 매도 미충족 — 모니터링 현황 기록
+                    monitor_details.append(
+                        f"{stock_code} 수익{profit_pct:+.1f}%(TP:{tp}/SL:-{sl}) {hold_days}일차"
+                    )
+
+            # ★ 모니터링 하트비트 로그 (5분마다 DB에 기록, 매도 발생 시 즉시 기록)
+            now_for_log = datetime.now(KST)
+            last_log_time = _last_monitor_log.get(mode)
+            has_sell = any("매도" in d for d in monitor_details)
+            should_log_monitor = has_sell or last_log_time is None or (now_for_log - last_log_time).total_seconds() > 300
+            if should_log_monitor:
+                _log_execution(mode, "monitor",
+                               f"보유{len(holdings)}종목 | " + " | ".join(monitor_details) if monitor_details else "체크완료")
+                _last_monitor_log[mode] = now_for_log
 
         except Exception as e:
             logger.error(f"[자동매매] {mode} 체크 오류: {e}")
