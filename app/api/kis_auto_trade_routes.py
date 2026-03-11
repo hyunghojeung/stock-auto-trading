@@ -169,13 +169,44 @@ async def sync_rules(req: RuleSyncRequest):
 
 @router.post("/migrate")
 async def migrate_schema():
-    """스마트형 트레일링 스탑 컬럼 마이그레이션 (1회성)"""
-    try:
-        from app.services.kis_auto_trade import _migrate_columns
-        _migrate_columns()
-        return {"success": True, "message": "마이그레이션 완료 (strategy, trailing_stop_pct, profit_activation_pct, grace_days, peak_price)"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    """스마트형 트레일링 스탑 컬럼 마이그레이션 (1회성)
+    Supabase SQL API를 통해 직접 ALTER TABLE 실행"""
+    import requests as req
+    from app.core.config import config
+
+    if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_KEY:
+        return {"success": False, "error": "SUPABASE_URL or SERVICE_KEY not configured"}
+
+    sql = """
+    ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'fixed';
+    ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS trailing_stop_pct NUMERIC DEFAULT 5;
+    ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS profit_activation_pct NUMERIC DEFAULT 15;
+    ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS grace_days INTEGER DEFAULT 7;
+    ALTER TABLE kis_auto_trade_rules ADD COLUMN IF NOT EXISTS peak_price NUMERIC DEFAULT 0;
+    """
+
+    # Supabase SQL API (pg-meta)
+    results = []
+    for stmt in sql.strip().split(";"):
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        try:
+            resp = req.post(
+                f"{config.SUPABASE_URL}/rest/v1/rpc/exec_sql",
+                headers={
+                    "apikey": config.SUPABASE_SERVICE_KEY,
+                    "Authorization": f"Bearer {config.SUPABASE_SERVICE_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"query": stmt + ";"},
+                timeout=10,
+            )
+            results.append({"sql": stmt[:60], "status": resp.status_code, "body": resp.text[:200]})
+        except Exception as e:
+            results.append({"sql": stmt[:60], "status": "error", "body": str(e)[:200]})
+
+    return {"success": True, "results": results}
 
 
 @router.get("/status")
