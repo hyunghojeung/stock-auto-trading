@@ -109,14 +109,23 @@ def _make_headers(cred, token=None):
     }
 
 
+def _parse_account_no(cred):
+    """계좌번호를 CANO(8자리) + ACNT_PRDT_CD(2자리)로 분리.
+    공백, 하이픈 등을 정제한 뒤 파싱."""
+    raw = cred.get("account_no", "")
+    # 공백, 하이픈 제거
+    cleaned = raw.strip().replace("-", "").replace(" ", "")
+    cano = cleaned[:8] if len(cleaned) >= 8 else cleaned
+    acnt_prdt_cd = cleaned[8:10] if len(cleaned) > 8 else "01"
+    return cano, acnt_prdt_cd
+
+
 def _get_balance(cred):
     """KIS 잔고 조회 (inquire-balance)"""
     is_virtual = cred.get("is_virtual", True)
     base_url = VIRTUAL_BASE if is_virtual else REAL_BASE
     tr_id = "VTTC8434R" if is_virtual else "TTTC8434R"
-    account_no = cred.get("account_no", "")
-    cano = account_no[:8] if len(account_no) >= 8 else account_no
-    acnt_prdt_cd = account_no[8:] if len(account_no) > 8 else "01"
+    cano, acnt_prdt_cd = _parse_account_no(cred)
 
     headers = _make_headers(cred)
     headers["tr_id"] = tr_id
@@ -188,9 +197,7 @@ def _get_balance_with_detail(cred):
     is_virtual = cred.get("is_virtual", True)
     base_url = VIRTUAL_BASE if is_virtual else REAL_BASE
     tr_id = "VTTC8434R" if is_virtual else "TTTC8434R"
-    account_no = cred.get("account_no", "")
-    cano = account_no[:8] if len(account_no) >= 8 else account_no
-    acnt_prdt_cd = account_no[8:] if len(account_no) > 8 else "01"
+    cano, acnt_prdt_cd = _parse_account_no(cred)
 
     headers = _make_headers(cred)
     headers["tr_id"] = tr_id
@@ -220,9 +227,7 @@ def _sell_stock(cred, code, qty):
     is_virtual = cred.get("is_virtual", True)
     base_url = VIRTUAL_BASE if is_virtual else REAL_BASE
     tr_id = "VTTC0801U" if is_virtual else "TTTC0801U"
-    account_no = cred.get("account_no", "")
-    cano = account_no[:8] if len(account_no) >= 8 else account_no
-    acnt_prdt_cd = account_no[8:] if len(account_no) > 8 else "01"
+    cano, acnt_prdt_cd = _parse_account_no(cred)
 
     headers = _make_headers(cred)
     headers["tr_id"] = tr_id
@@ -303,14 +308,15 @@ async def check_auto_trade_rules():
                 continue
 
             # ★ account_no 검증: 비어있으면 잔고조회 불가
-            account_no = cred.get("account_no", "")
-            if not account_no or len(account_no) < 10:
-                logger.error(f"[자동매매] {mode} 계좌번호 누락 또는 형식 오류 (account_no='{account_no}', 길이={len(account_no)}). "
+            cano, acnt_prdt_cd = _parse_account_no(cred)
+            if not cano or len(cano) < 8:
+                raw_acct = cred.get("account_no", "")
+                logger.error(f"[자동매매] {mode} 계좌번호 누락 또는 형식 오류 (raw='{raw_acct}', parsed_cano='{cano}'). "
                              f"프론트엔드 KIS 페이지에서 API 설정을 저장하여 계좌번호를 동기화하세요.")
-                _log_execution(mode, "skip", f"계좌번호 누락/오류: account_no='{account_no}' (길이={len(account_no)}). 프론트엔드에서 API 설정 재저장 필요.")
+                _log_execution(mode, "skip", f"계좌번호 누락/오류: raw='{raw_acct}', cano='{cano}'. 프론트엔드에서 API 설정 재저장 필요.")
                 continue
 
-            logger.info(f"[자동매매] {mode} 인증정보 로드 완료 (app_key={cred.get('app_key','')[:8]}..., account={account_no[:4]}****{account_no[-2:]})")
+            logger.info(f"[자동매매] {mode} 인증정보 로드 완료 (app_key={cred.get('app_key','')[:8]}..., account={cano[:4]}****{acnt_prdt_cd})")
 
             # ★ 토큰 자동 갱신 (KIS 1분당 1회 제한 → 5분 간격으로만 갱신)
             now = datetime.now(KST)
