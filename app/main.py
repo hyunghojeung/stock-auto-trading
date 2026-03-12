@@ -18,6 +18,7 @@ from app.api.pattern_lib_routes import router as pattern_lib_router  # ★ v3: �
 from app.api.backup_routes import router as backup_router  # ★ v9: DB 백업
 from app.api.trading_page_routes import router as trading_page_router  # ★ 매매 실행 페이지
 from app.api.kis_auto_trade_routes import router as kis_auto_trade_router  # ★ KIS 자동 손절/익절
+from app.api.stock_search_routes import router as stock_search_router  # ★ 종목코드 마스터파일 검색
 
 
 # ★ 패턴 벡터 수집기
@@ -96,6 +97,7 @@ app.include_router(pattern_lib_router)  # ★ v3: 패턴 라이브러리
 app.include_router(backup_router)  # ★ v9: DB 백업
 app.include_router(trading_page_router)  # ★ 매매 실행 페이지
 app.include_router(kis_auto_trade_router)  # ★ KIS 자동 손절/익절
+app.include_router(stock_search_router)  # ★ 종목코드 마스터파일 검색
 @app.get("/")
 async def root():
     now = datetime.now(KST)
