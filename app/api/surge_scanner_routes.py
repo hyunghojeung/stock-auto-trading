@@ -7,11 +7,14 @@ All-Stock Surge Scanner — API Routes (v2 with DB persistence)
 스캔 결과를 Supabase에 저장하여 재접속 시 자동 로드합니다.
 네이버 차단 방지: batch_size=5, delay=1.0초, 재시도 3회, 차단감지 60초대기
 
-POST /api/scanner/start      — 스캔 시작 (비동기)
-GET  /api/scanner/progress    — 진행률 확인
-GET  /api/scanner/result      — 현재 스캔 결과
-GET  /api/scanner/latest      — DB에서 최근 스캔 결과 로드
-POST /api/scanner/stop        — 스캔 중지
+POST /api/scanner/start          — 스캔 시작 (비동기)
+GET  /api/scanner/progress       — 진행률 확인
+GET  /api/scanner/result         — 현재 스캔 결과
+GET  /api/scanner/latest         — DB에서 최근 스캔 결과 로드
+POST /api/scanner/stop           — 스캔 중지
+GET  /api/scanner/history        — 스캔 히스토리 목록 (최근 20개)
+GET  /api/scanner/history/{id}   — 특정 스캔 세션 상세 데이터
+POST /api/scanner/history/delete — 스캔 히스토리 삭제
 """
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -919,3 +922,122 @@ async def stop_scan():
 
     _scanner_state["stop_requested"] = True
     return {"status": "stopping", "message": "스캔 중지 요청됨. 현재 배치 완료 후 중지됩니다."}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 스캔 히스토리 / Scan History
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/history")
+async def get_scan_history():
+    """최근 스캔 히스토리 목록 (최대 20개)"""
+    try:
+        from app.core.database import db
+        resp = db.table("surge_scan_sessions") \
+            .select("id, scan_date, status, market, period_days, rise_pct, rise_window, min_volume_ratio, total_scanned, total_found, total_surges, high_manip_count, medium_manip_count") \
+            .in_("status", ["done", "stopped"]) \
+            .order("id", desc=True) \
+            .limit(20) \
+            .execute()
+        return {"status": "ok", "data": resp.data or []}
+    except Exception as e:
+        logger.error(f"히스토리 목록 조회 실패: {e}")
+        raise HTTPException(500, detail=str(e))
+
+
+@router.get("/history/{session_id}")
+async def get_scan_history_detail(session_id: int):
+    """특정 스캔 세션의 상세 데이터 (세션 정보 + 종목 목록)"""
+    try:
+        from app.core.database import db
+
+        # 1) 세션 정보
+        sess_resp = db.table("surge_scan_sessions") \
+            .select("*") \
+            .eq("id", session_id) \
+            .single() \
+            .execute()
+        if not sess_resp.data:
+            raise HTTPException(404, detail="세션을 찾을 수 없습니다")
+
+        session = sess_resp.data
+
+        # 2) 종목 데이터 (페이지네이션)
+        all_stocks = []
+        page_size = 1000
+        offset = 0
+        while True:
+            stocks_resp = db.table("surge_scan_stocks") \
+                .select("*") \
+                .eq("session_id", session_id) \
+                .order("top_manip_score", desc=True) \
+                .range(offset, offset + page_size - 1) \
+                .execute()
+            if not stocks_resp.data:
+                break
+            all_stocks.extend(stocks_resp.data)
+            if len(stocks_resp.data) < page_size:
+                break
+            offset += page_size
+
+        # 3) surges_json 파싱
+        stocks = []
+        for row in all_stocks:
+            surges = []
+            try:
+                raw = row.get("surges_json", "[]")
+                surges = json.loads(raw) if isinstance(raw, str) else (raw or [])
+            except Exception:
+                pass
+            stocks.append({
+                "code": row.get("code", ""),
+                "name": row.get("name", ""),
+                "market": row.get("market", ""),
+                "current_price": row.get("current_price", 0),
+                "last_date": row.get("last_date", ""),
+                "surge_count": row.get("surge_count", 0),
+                "top_manip_score": row.get("top_manip_score", 0),
+                "top_manip_level": row.get("top_manip_level", "low"),
+                "top_manip_label": row.get("top_manip_label", ""),
+                "latest_rise_pct": row.get("latest_rise_pct", 0),
+                "latest_surge_date": row.get("latest_surge_date", ""),
+                "latest_from_peak": row.get("latest_from_peak", 0),
+                "surges": surges,
+            })
+
+        return {
+            "status": "ok",
+            "session": session,
+            "stocks": stocks,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"히스토리 상세 조회 실패: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, detail=str(e))
+
+
+class HistoryDeleteRequest(BaseModel):
+    ids: List[int]
+
+
+@router.post("/history/delete")
+async def delete_scan_history(req: HistoryDeleteRequest):
+    """선택한 스캔 세션 및 관련 종목 데이터 삭제"""
+    try:
+        from app.core.database import db
+        if not req.ids:
+            return {"status": "ok", "deleted": 0}
+
+        # 종목 데이터 먼저 삭제 (외래키 의존)
+        for sid in req.ids:
+            db.table("surge_scan_stocks").delete().eq("session_id", sid).execute()
+
+        # 세션 삭제
+        db.table("surge_scan_sessions").delete().in_("id", req.ids).execute()
+
+        logger.info(f"히스토리 삭제 완료: {req.ids}")
+        return {"status": "ok", "deleted": len(req.ids)}
+    except Exception as e:
+        logger.error(f"히스토리 삭제 실패: {e}")
+        raise HTTPException(500, detail=str(e))
