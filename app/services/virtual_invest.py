@@ -77,7 +77,7 @@ STRATEGY_PRESETS = {
         "stop_loss_pct": 12.0,     # 종가 기준 손절 (급등 전 눌림목 보호)
         "max_hold_days": 30,       # 최대 보유일 확대 (급등 대기)
         "trailing_stop_pct": 5.0,  # 최고가 대비 -5% 하락 시 매도 (여유)
-        "grace_days": 7,           # 매수 후 7일간 손절 유예 (눌림목 보호)
+        "grace_days": 0,           # ★ 유예기간 보류 (기존 7 → 0으로 비활성화)
         "profit_activation_pct": 15.0,  # ★ 15% 수익 달성 후에만 추적손절 활성화
         "use_close_stop": True,    # 종가 기준 손절 (장중 저점 무시)
         "color": "#ff9800",
@@ -582,7 +582,7 @@ def simulate_smart_strategy(
                 # ── 1) 트레일링 스탑 체크 (★ 수익 활성화 후에만) ──
                 # 매수가 대비 profit_activation_pct 이상 상승 경험 후에만 추적손절 활성화
                 profit_from_buy = ((pos["peak_price"] - pos["buy_price"]) / pos["buy_price"]) * 100
-                trailing_active = hold_day > grace_days and profit_from_buy >= profit_activation_pct
+                trailing_active = hold_day > 0 and profit_from_buy >= profit_activation_pct  # ★ 유예기간 보류 (기존: hold_day > grace_days)
 
                 if trailing_active:
                     drop_from_peak = ((current_price - pos["peak_price"]) / pos["peak_price"]) * 100
@@ -600,8 +600,8 @@ def simulate_smart_strategy(
                             pos["status"] = "done"
                         continue
 
-                # ── 2) 종가 기준 손절 (grace period 이후) — 재진입 없음 ──
-                if hold_day > grace_days:
+                # ── 2) 종가 기준 손절 — 재진입 없음 ──
+                if hold_day > 0:  # ★ 유예기간 보류 (기존: hold_day > grace_days)
                     close_pct = ((current_price - pos["buy_price"]) / pos["buy_price"]) * 100
                     if close_pct <= -stop_loss_pct:
                         trade = _close_position(pos, current_price, hold_day, "loss", per_stock_amount, sell_date=candle.get("date", ""))

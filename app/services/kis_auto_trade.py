@@ -465,7 +465,7 @@ async def check_auto_trade_rules():
 
                 if strategy == "smart":
                     # ━━━ 스마트형: 트레일링 스탑 ━━━
-                    grace = int(rule.get("grace_days", 7))
+                    # grace = int(rule.get("grace_days", 7))  # ★ 유예기간 보류
                     sl = float(rule.get("sl_pct", 12))
                     trailing = float(rule.get("trailing_stop_pct", 5))
                     activation = float(rule.get("profit_activation_pct", 15))
@@ -481,7 +481,7 @@ async def check_auto_trade_rules():
                         except Exception:
                             pass
 
-                    if hold_days > grace:
+                    if hold_days > 0:  # ★ 유예기간 보류 (기존: hold_days > grace)
                         # 1) 트레일링 스탑 (수익 활성화 후)
                         peak_profit = ((peak - buy_price) / buy_price * 100) if buy_price > 0 else 0
                         if peak_profit >= activation and peak > 0:
@@ -491,7 +491,7 @@ async def check_auto_trade_rules():
                                     f"트레일링 (최고{peak_profit:.1f}%→현재{profit_pct:.1f}%, "
                                     f"하락{drop_from_peak:.1f}%<=-{trailing}%)"
                                 )
-                        # 2) 손절 (grace 이후)
+                        # 2) 손절
                         if not sell_reason and profit_pct <= -sl:
                             sell_reason = f"손절 ({profit_pct:.1f}% <= -{sl}%)"
 
@@ -550,7 +550,7 @@ async def check_auto_trade_rules():
                     if strategy == "smart":
                         peak = float(rule.get("peak_price", 0))
                         peak_profit = ((peak - buy_price) / buy_price * 100) if buy_price > 0 and peak > 0 else 0
-                        trailing_active = hold_days > int(rule.get("grace_days", 7)) and peak_profit >= float(rule.get("profit_activation_pct", 15))
+                        trailing_active = hold_days > 0 and peak_profit >= float(rule.get("profit_activation_pct", 15))  # ★ 유예기간 보류
                         monitor_details.append(
                             f"{stock_code} [스마트] 수익{profit_pct:+.1f}% 최고{peak:,.0f}원({peak_profit:+.1f}%) "
                             f"{'추적ON' if trailing_active else '추적OFF'} {hold_days}일차"

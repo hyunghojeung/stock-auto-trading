@@ -96,7 +96,7 @@ STRATEGY_PARAMS = {
         "stop_loss_pct": 12.0,
         "trailing_stop_pct": 5.0,
         "profit_activation_pct": 15.0,
-        "grace_days": 7,
+        "grace_days": 0,  # ★ 유예기간 보류 (기존 7 → 0으로 비활성화)
         "max_hold_days": 30,
     },
     "aggressive": {
@@ -468,7 +468,7 @@ async def update_prices(portfolio_id: int):
                 sell_reason = None
 
                 if strategy == "smart":
-                    grace_days = params.get("grace_days", 7)
+                    # grace_days = params.get("grace_days", 7)  # ★ 유예기간 보류
                     stop_loss = params.get("stop_loss_pct", 12.0)
                     trailing = params.get("trailing_stop_pct", 5.0)
                     activation = params.get("profit_activation_pct", 15.0)
@@ -477,7 +477,7 @@ async def update_prices(portfolio_id: int):
                     # 수익 활성화 체크
                     peak_pct = ((peak_price - buy_price) / buy_price) * 100
 
-                    if hold_days > grace_days:
+                    if hold_days > 0:  # ★ 유예기간 보류 (기존: hold_days > grace_days)
                         # 추적손절 (수익 활성화 후)
                         if peak_pct >= activation:
                             drop = ((current_price - peak_price) / peak_price) * 100
@@ -821,10 +821,10 @@ def _sync_update_prices(portfolio_id: int):
             # 청산 체크
             sell_reason = None
             if strategy == "smart":
-                grace_days = params.get("grace_days", 7)
+                # grace_days = params.get("grace_days", 7)  # ★ 유예기간 보류
                 peak_pct = ((peak_price - buy_price) / buy_price) * 100
 
-                if hold_days > grace_days:
+                if hold_days > 0:  # ★ 유예기간 보류 (기존: hold_days > grace_days)
                     if peak_pct >= params.get("profit_activation_pct", 15.0):
                         drop = ((current_price - peak_price) / peak_price) * 100
                         if drop <= -params.get("trailing_stop_pct", 5.0):
