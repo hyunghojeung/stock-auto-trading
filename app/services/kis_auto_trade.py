@@ -338,9 +338,24 @@ def _log_execution(mode, action, detail=""):
         pass
 
 
+def _is_market_hours():
+    """장중 시간인지 확인 (09:00~15:30 KST). 장외 시간에는 매도 주문 불가."""
+    now = datetime.now(KST)
+    hour, minute = now.hour, now.minute
+    if hour < 9 or hour > 15:
+        return False
+    if hour == 15 and minute > 30:
+        return False
+    return True
+
+
 async def check_auto_trade_rules():
     """메인 체크 함수: 양 모드(virtual/real)의 활성 규칙을 체크하고 조건 충족 시 매도"""
     if not _ensure_table():
+        return
+
+    # ★ 장중 시간 가드: 09:00~15:30 KST 외에는 매도 주문 실패하므로 스킵
+    if not _is_market_hours():
         return
 
     for mode in ["virtual", "real"]:

@@ -19,7 +19,15 @@ import traceback
 
 logger = logging.getLogger(__name__)
 
-scheduler = AsyncIOScheduler(timezone="Asia/Seoul")
+# ★ 명시적 KST 타임존 (CronTrigger에 반드시 전달해야 Railway UTC 서버에서 정확히 동작)
+try:
+    from zoneinfo import ZoneInfo
+    KST_TZ = ZoneInfo("Asia/Seoul")
+except ImportError:
+    from datetime import timezone as _tz
+    KST_TZ = _tz(timedelta(hours=9))
+
+scheduler = AsyncIOScheduler(timezone=KST_TZ)
 
 
 def now_kst():
@@ -425,63 +433,63 @@ def setup_scheduler():
 
     # ── ★ v3: 시장 지수 수집 (야간 스캔 전 실행) ──
     scheduler.add_job(market_index_job,
-                      CronTrigger(hour=17, minute=55, day_of_week="mon-fri"),
+                      CronTrigger(hour=17, minute=55, day_of_week="mon-fri", timezone=KST_TZ),
                       id="market_index", name="시장 지수 수집 (KOSPI/KOSDAQ)", replace_existing=True)
 
     # ── 눌림목전략 ──
     scheduler.add_job(night_scan_job,
-                      CronTrigger(hour=18, minute=0, day_of_week="mon-fri"),
+                      CronTrigger(hour=18, minute=0, day_of_week="mon-fri", timezone=KST_TZ),
                       id="dip_night_scan", name="눌림목 야간 전종목 스캔", replace_existing=True)
     scheduler.add_job(pre_market_job,
-                      CronTrigger(hour=8, minute=30, day_of_week="mon-fri"),
+                      CronTrigger(hour=8, minute=30, day_of_week="mon-fri", timezone=KST_TZ),
                       id="dip_pre_market", name="눌림목 장전 감시종목 확정", replace_existing=True)
     scheduler.add_job(market_scan_job,
-                      CronTrigger(minute="*/30", hour="9-15", day_of_week="mon-fri"),
+                      CronTrigger(minute="*/30", hour="9-15", day_of_week="mon-fri", timezone=KST_TZ),
                       id="dip_market_scan", name="눌림목 장중 재스캔", replace_existing=True)
     scheduler.add_job(trading_job,
-                      CronTrigger(minute="*", hour="9-15", day_of_week="mon-fri"),
+                      CronTrigger(minute="*", hour="9-15", day_of_week="mon-fri", timezone=KST_TZ),
                       id="dip_trading", name="눌림목 자동매매", replace_existing=True)
     scheduler.add_job(daily_report_job,
-                      CronTrigger(hour=16, minute=0, day_of_week="mon-fri"),
+                      CronTrigger(hour=16, minute=0, day_of_week="mon-fri", timezone=KST_TZ),
                       id="dip_daily_report", name="일일 리포트", replace_existing=True)
 
     # ── 패턴 벡터 수집 (main.py에서 이동) ──
     scheduler.add_job(pattern_collection_job,
-                      CronTrigger(hour=18, minute=30, day_of_week="mon-fri"),
+                      CronTrigger(hour=18, minute=30, day_of_week="mon-fri", timezone=KST_TZ),
                       id="pattern_collection", name="전종목 패턴 벡터 수집", replace_existing=True)
 
     # ── 가상포트 갱신 (main.py에서 이동) ──
     scheduler.add_job(virtual_portfolio_update_job,
-                      CronTrigger(hour=18, minute=35, day_of_week="mon-fri"),
+                      CronTrigger(hour=18, minute=35, day_of_week="mon-fri", timezone=KST_TZ),
                       id="virtual_portfolio_update", name="가상포트 일괄 가격 갱신", replace_existing=True)
 
     # ── 갭상승전략 ──
     scheduler.add_job(gap_night_precompute_job,
-                      CronTrigger(hour=18, minute=5, day_of_week="mon-fri"),
+                      CronTrigger(hour=18, minute=5, day_of_week="mon-fri", timezone=KST_TZ),
                       id="gap_night", name="갭전략 야간 데이터 준비", replace_existing=True)
     scheduler.add_job(gap_scan_job,
-                      CronTrigger(hour=9, minute=0, second=30, day_of_week="mon-fri"),
+                      CronTrigger(hour=9, minute=0, second=30, day_of_week="mon-fri", timezone=KST_TZ),
                       id="gap_scan", name="갭전략 09:00 스캔", replace_existing=True)
     scheduler.add_job(gap_orb_collect_job,
-                      CronTrigger(hour=9, minute="1-30", day_of_week="mon-fri"),
+                      CronTrigger(hour=9, minute="1-30", day_of_week="mon-fri", timezone=KST_TZ),
                       id="gap_orb", name="갭전략 ORB 수집", replace_existing=True)
     scheduler.add_job(gap_entry_check_job,
-                      CronTrigger(hour="9-14", minute="*", day_of_week="mon-fri"),
+                      CronTrigger(hour="9-14", minute="*", day_of_week="mon-fri", timezone=KST_TZ),
                       id="gap_entry", name="갭전략 진입 판단", replace_existing=True)
     scheduler.add_job(gap_exit_check_job,
-                      CronTrigger(hour="9-14", minute="*", day_of_week="mon-fri"),
+                      CronTrigger(hour="9-14", minute="*", day_of_week="mon-fri", timezone=KST_TZ),
                       id="gap_exit", name="갭전략 매도 관리", replace_existing=True)
     scheduler.add_job(gap_close_job,
-                      CronTrigger(hour=15, minute=0, day_of_week="mon-fri"),
+                      CronTrigger(hour=15, minute=0, day_of_week="mon-fri", timezone=KST_TZ),
                       id="gap_close", name="갭전략 장마감 정리", replace_existing=True)
 
     # ── KIS 자동 손절/익절 (30초 간격, 장중) ──
     scheduler.add_job(kis_auto_trade_check_job,
-                      CronTrigger(second="*/30", hour="9-15", minute="*", day_of_week="mon-fri"),
+                      CronTrigger(second="*/30", hour="9-15", minute="*", day_of_week="mon-fri", timezone=KST_TZ),
                       id="kis_auto_trade", name="KIS 자동 손절/익절 체크", replace_existing=True)
 
     scheduler.start()
-    logger.info("[스케줄러] ★ 통합 스케줄러 시작 (v3: 시장지수 + 눌림목 + 갭상승 + 패턴수집 + 가상포트)")
+    logger.info("[스케줄러] ★ 통합 스케줄러 시작 (v3+TZ: 모든 CronTrigger에 명시적 KST 적용)")
 
     # 등록된 job 목록 출력
     jobs = scheduler.get_jobs()

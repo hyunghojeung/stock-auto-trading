@@ -264,10 +264,27 @@ async def auto_trade_status():
             .limit(10) \
             .execute()
 
+        # ★ 스케줄러 상태 디버그 (현재 시각, 장중 여부, 다음 실행 예정)
+        from app.core.config import KST as _kst
+        now_kst = datetime.now(_kst)
+        hour, minute = now_kst.hour, now_kst.minute
+        is_market = 9 <= hour <= 15 and not (hour == 15 and minute > 30)
+
+        scheduler_info = {"now_kst": now_kst.isoformat(), "is_market_hours": is_market}
+        try:
+            from app.core.scheduler import scheduler as _sched
+            job = _sched.get_job("kis_auto_trade")
+            if job:
+                scheduler_info["next_run_time"] = str(job.next_run_time) if job.next_run_time else "None"
+                scheduler_info["trigger"] = str(job.trigger)
+        except Exception:
+            pass
+
         return {
             "success": True,
             "virtual_active_rules": virtual_rules.count or 0,
             "real_active_rules": real_rules.count or 0,
+            "scheduler": scheduler_info,
             "recent_logs": logs.data or [],
         }
     except Exception as e:
